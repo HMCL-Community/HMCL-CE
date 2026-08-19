@@ -16,7 +16,7 @@ HMCL CE 是基于 [Hello Minecraft! Launcher（HMCL）](https://github.com/HMCL-
 
 CE 目前提供：
 
-- Java、Kotlin 插件和独立进程 C# Companion 扩展；
+- Java、Kotlin 插件扩展；
 - 可配置的插件商店来源与 GitHub `hmclce` Topic 发现；
 - 插件权限、依赖、安装事务与运行时隔离；
 - 由社区完成插件审核，不以官方认证作为社区插件可用的前提；
