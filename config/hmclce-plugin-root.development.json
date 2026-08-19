@@ -1,0 +1,13 @@
+{
+  "signed": {
+    "_type": "root",
+    "schemaVersion": 1,
+    "version": 1,
+    "expires": "2036-01-01T00:00:00Z",
+    "statusUrl": "",
+    "revokedKeyIds": [],
+    "keys": {},
+    "roles": {}
+  },
+  "signatures": []
+}

@@ -1,0 +1,293 @@
+/*
+ * Hello Minecraft! Launcher
+ * Copyright (C) 2024 huangyuhui <huanghongxun2008@126.com> and contributors
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+package org.jackhuang.hmcl.util;
+
+import org.jackhuang.hmcl.game.*;
+import org.jackhuang.hmcl.addon.mod.LocalModFile;
+import org.jackhuang.hmcl.addon.mod.ModManager;
+import org.jackhuang.hmcl.setting.GameSettings;
+import org.jackhuang.hmcl.util.gson.JsonUtils;
+import org.jackhuang.hmcl.util.platform.Architecture;
+import org.jackhuang.hmcl.java.JavaRuntime;
+import org.jackhuang.hmcl.util.platform.OSVersion;
+import org.jackhuang.hmcl.util.platform.OperatingSystem;
+import org.jackhuang.hmcl.util.platform.Platform;
+import org.jackhuang.hmcl.util.versioning.GameVersionNumber;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.Reader;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.util.stream.Collectors;
+
+import static org.jackhuang.hmcl.util.gson.JsonUtils.mapTypeOf;
+import static org.jackhuang.hmcl.util.logging.Logger.LOG;
+
+/**
+ * @author Glavo
+ */
+public final class NativePatcher {
+
+    private static final Library NONEXISTENT_LIBRARY = new Library(new Artifact("com.example", "noceistent", "0.0.0"));
+
+    private static final Map<Platform, Map<String, Library>> natives = new HashMap<>();
+
+    private static Map<String, Library> getNatives(Platform platform) {
+        return natives.computeIfAbsent(platform, p -> {
+            //noinspection ConstantConditions
+            try (Reader reader = new InputStreamReader(NativePatcher.class.getResourceAsStream("/assets/natives.json"), StandardCharsets.UTF_8)) {
+                Map<String, Map<String, Library>> natives = JsonUtils.GSON.fromJson(reader, mapTypeOf(String.class, mapTypeOf(String.class, Library.class)));
+                return natives.getOrDefault(p.toString(), Collections.emptyMap());
+            } catch (IOException e) {
+                LOG.warning("Failed to load native library list", e);
+                return Collections.emptyMap();
+            }
+        });
+    }
+
+    // https://github.com/LWJGL/lwjgl3/issues/1111
+    public static boolean needPatchMemoryUtil(GameInstanceManifest manifest, int javaVersion) {
+        return javaVersion >= 25 && javaVersion <= 26 && manifest.getLibraries().stream().anyMatch(library ->
+                "org.lwjgl".equals(library.groupId())
+                        && "lwjgl".equals(library.artifactId())
+                        && "3.4.1".equals(library.version())
+                        && library.classifier() == null
+        );
+    }
+
+    public static GameInstanceManifest patchNative(DefaultGameRepository repository,
+                                                   GameInstanceManifest manifest, String gameVersion,
+                                                   JavaRuntime javaVersion,
+                                                   GameSettings.Effective settings,
+                                                   List<String> javaArguments) {
+        if (settings.getInheritable(GameSettings::useCustomNativesProperty)) {
+            if (gameVersion != null && GameVersionNumber.compare(gameVersion, "1.19") < 0)
+                return manifest;
+
+            ArrayList<Library> newLibraries = new ArrayList<>();
+            for (Library library : manifest.getLibraries()) {
+                if (!library.appliesToCurrentEnvironment())
+                    continue;
+
+                if (library.classifier() == null
+                        || !library.artifactId().startsWith("lwjgl")
+                        || !library.classifier().startsWith("natives")) {
+                    newLibraries.add(library);
+                }
+            }
+            return manifest.withLibraries(newLibraries);
+        }
+
+        final boolean useNativeGLFW = settings.getInheritable(GameSettings::useNativeGLFWProperty);
+        final boolean useNativeOpenAL = settings.getInheritable(GameSettings::useNativeOpenALProperty);
+
+        if (OperatingSystem.CURRENT_OS.isLinuxOrBSD() && (useNativeGLFW || useNativeOpenAL)
+                && gameVersion != null && GameVersionNumber.compare(gameVersion, "1.19") >= 0) {
+
+            manifest = manifest.withLibraries(manifest.getLibraries().stream()
+                    .filter(library -> {
+                        if (library.classifier() != null && library.classifier().startsWith("natives")
+                                && "org.lwjgl".equals(library.groupId())) {
+                            if ((useNativeGLFW && "lwjgl-glfw".equals(library.artifactId()))
+                                    || (useNativeOpenAL && "lwjgl-openal".equals(library.artifactId()))) {
+                                LOG.info("Filter out " + library.name());
+                                return false;
+                            }
+                        }
+
+                        return true;
+                    })
+                    .collect(Collectors.toList()));
+        }
+
+        // Try patch natives
+
+        OperatingSystem os = javaVersion.getPlatform().getOperatingSystem();
+        Architecture arch = javaVersion.getArchitecture();
+        GameVersionNumber gameVersionNumber = gameVersion != null ? GameVersionNumber.asGameVersion(gameVersion) : null;
+
+        if (settings.getInheritable(GameSettings::notPatchNativesProperty))
+            return manifest;
+
+        if (arch.isX86() && (os == OperatingSystem.WINDOWS || os == OperatingSystem.LINUX || os == OperatingSystem.MACOS))
+            return manifest;
+
+        if (arch == Architecture.ARM64 && (os == OperatingSystem.MACOS || os == OperatingSystem.WINDOWS)
+                && gameVersionNumber != null
+                && gameVersionNumber.compareTo("1.19") >= 0)
+            return manifest;
+
+        Map<String, Library> replacements = getNatives(javaVersion.getPlatform());
+        if (replacements.isEmpty()) {
+            LOG.warning("No alternative native library provided for platform " + javaVersion.getPlatform());
+            return manifest;
+        }
+
+        boolean lwjglVersionChanged = false;
+        ArrayList<Library> newLibraries = new ArrayList<>();
+        for (Library library : manifest.getLibraries()) {
+            if (!library.appliesToCurrentEnvironment())
+                continue;
+
+            if (library.isNative()) {
+                Library replacement = replacements.getOrDefault(library.name() + ":natives", NONEXISTENT_LIBRARY);
+                if (replacement == NONEXISTENT_LIBRARY) {
+                    LOG.warning("No alternative native library " + library.name() + ":natives provided for platform " + javaVersion.getPlatform());
+                    newLibraries.add(library);
+                } else if (replacement != null) {
+                    LOG.info("Replace " + library.name() + ":natives with " + replacement.name());
+                    newLibraries.add(replacement);
+                }
+            } else {
+                Library replacement = replacements.getOrDefault(library.name(), NONEXISTENT_LIBRARY);
+                if (replacement == NONEXISTENT_LIBRARY) {
+                    newLibraries.add(library);
+                } else if (replacement != null) {
+                    LOG.info("Replace " + library.name() + " with " + replacement.name());
+                    newLibraries.add(replacement);
+
+                    if ("org.lwjgl:lwjgl".equals(library.name()) && !Objects.equals(library.version(), replacement.version())) {
+                        lwjglVersionChanged = true;
+                    }
+                }
+            }
+        }
+
+        if (lwjglVersionChanged) {
+            ModManager modManager = repository.getModManager(manifest.id());
+            try {
+                for (LocalModFile mod : modManager.getLocalFiles()) {
+                    if ("sodium".equals(mod.getId())) {
+                        // https://github.com/CaffeineMC/sodium/issues/2561
+                        javaArguments.add("-Dsodium.checks.issue2561=false");
+                        break;
+                    }
+                }
+            } catch (Throwable e) {
+                LOG.warning("Failed to get mods", e);
+            }
+        }
+
+        return manifest.withLibraries(newLibraries);
+    }
+
+    /// @see <a href="https://github.com/HMCL-dev/mesa-loader-windows">Java Mesa Loader for Windows</a>
+    public static @Nullable Library getWindowsMesaLoader(@NotNull JavaRuntime java, @NotNull Renderer renderer, @NotNull OSVersion windowsVersion) {
+        if (renderer == Renderer.DEFAULT)
+            return null;
+
+        if (windowsVersion.isAtLeast(OSVersion.WINDOWS_10)) {
+            return getNatives(java.getPlatform()).get("mesa-loader");
+        } else if (windowsVersion.isAtLeast(OSVersion.WINDOWS_7)) {
+            if (renderer == Renderer.OpenGL.LLVMPIPE)
+                return getNatives(java.getPlatform()).get("software-renderer-loader");
+            else
+                return null;
+        } else {
+            return null;
+        }
+    }
+
+    public static SupportStatus checkSupportedStatus(GameVersionNumber gameVersion, Platform platform,
+                                                     OSVersion systemVersion) {
+        if (platform.equals(Platform.WINDOWS_X86_64)) {
+            if (!systemVersion.isAtLeast(OSVersion.WINDOWS_7) && gameVersion.isAtLeast("1.20.5", "24w14a"))
+                return SupportStatus.UNSUPPORTED;
+
+            return SupportStatus.OFFICIAL_SUPPORTED;
+        }
+
+        if (platform.equals(Platform.MACOS_X86_64) || platform.equals(Platform.LINUX_X86_64))
+            return SupportStatus.OFFICIAL_SUPPORTED;
+
+        if (platform.equals(Platform.WINDOWS_X86) || platform.equals(Platform.LINUX_X86)) {
+            if (gameVersion.isAtLeast("1.20.5", "24w14a"))
+                return SupportStatus.UNSUPPORTED;
+            else
+                return SupportStatus.OFFICIAL_SUPPORTED;
+        }
+
+        if (platform.equals(Platform.WINDOWS_ARM64) || platform.equals(Platform.MACOS_ARM64)) {
+            if (gameVersion.compareTo("1.19") >= 0)
+                return SupportStatus.OFFICIAL_SUPPORTED;
+
+            String minVersion = platform.getOperatingSystem() == OperatingSystem.WINDOWS
+                    ? "1.8"
+                    : "1.6";
+
+            return gameVersion.compareTo(minVersion) >= 0
+                    ? SupportStatus.LAUNCHER_SUPPORTED
+                    : SupportStatus.TRANSLATION_SUPPORTED;
+        }
+
+        String minVersion = null;
+        String maxVersion = null;
+
+        if (platform.equals(Platform.FREEBSD_X86_64)) {
+            minVersion = "1.13";
+        } else if (platform.equals(Platform.LINUX_ARM64)) {
+            minVersion = "1.6";
+        } else if (platform.equals(Platform.LINUX_RISCV64)) {
+            minVersion = "1.8";
+
+            if (gameVersion.compareTo("1.21.5") > 0 && gameVersion.compareTo("26.1-snapshot-8") < 0) {
+                // LWJGL version mismatch
+                return SupportStatus.UNSUPPORTED;
+            }
+        } else if (platform.equals(Platform.LINUX_LOONGARCH64)) {
+            minVersion = "1.6";
+        } else if (platform.equals(Platform.LINUX_LOONGARCH64_OW)) {
+            minVersion = "1.6";
+            maxVersion = "1.20.1";
+        } else if (platform.equals(Platform.LINUX_MIPS64EL) || platform.equals(Platform.LINUX_ARM32)) {
+            minVersion = "1.8";
+            maxVersion = "1.20.1";
+        }
+
+        if (minVersion != null) {
+            if (gameVersion.compareTo(minVersion) >= 0) {
+                if (maxVersion != null && gameVersion.compareTo(maxVersion) > 0)
+                    return SupportStatus.UNSUPPORTED;
+
+                String[] defaultGameVersions = GameVersionNumber.getDefaultGameVersions();
+                if (defaultGameVersions.length > 0 && gameVersion.compareTo(defaultGameVersions[0]) > 0) {
+                    return SupportStatus.UNTESTED;
+                }
+                return SupportStatus.LAUNCHER_SUPPORTED;
+            } else {
+                return SupportStatus.UNSUPPORTED;
+            }
+        }
+
+        return SupportStatus.UNTESTED;
+    }
+
+    public enum SupportStatus {
+        OFFICIAL_SUPPORTED,
+        LAUNCHER_SUPPORTED,
+        TRANSLATION_SUPPORTED,
+        UNTESTED,
+        UNSUPPORTED,
+    }
+
+    private NativePatcher() {
+    }
+}

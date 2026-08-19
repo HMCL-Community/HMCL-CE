@@ -1,0 +1,218 @@
+/*
+ * Hello Minecraft! Launcher
+ * Copyright (C) 2020  huangyuhui <huanghongxun2008@126.com> and contributors
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+package org.jackhuang.hmcl.auth.offline;
+
+import com.google.gson.JsonNull;
+import com.google.gson.JsonObject;
+import javafx.beans.binding.ObjectBinding;
+import org.glavo.uuid.UUIDs;
+import org.jackhuang.hmcl.auth.Account;
+import org.jackhuang.hmcl.auth.AccountID;
+import org.jackhuang.hmcl.auth.AuthInfo;
+import org.jackhuang.hmcl.auth.AuthenticationException;
+import org.jackhuang.hmcl.auth.authlibinjector.AuthlibInjectorArtifactInfo;
+import org.jackhuang.hmcl.auth.authlibinjector.AuthlibInjectorArtifactProvider;
+import org.jackhuang.hmcl.auth.authlibinjector.AuthlibInjectorDownloadException;
+import org.jackhuang.hmcl.auth.yggdrasil.Texture;
+import org.jackhuang.hmcl.auth.yggdrasil.TextureType;
+import org.jackhuang.hmcl.game.Arguments;
+import org.jackhuang.hmcl.game.LaunchOptions;
+import org.jackhuang.hmcl.util.StringUtils;
+import org.jackhuang.hmcl.util.ToStringBuilder;
+
+import java.io.IOException;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
+
+import static java.util.Objects.requireNonNull;
+
+/**
+ *
+ * @author huang
+ */
+public class OfflineAccount extends Account {
+
+    private final AuthlibInjectorArtifactProvider downloader;
+    private final String profileName;
+    private final UUID profileID;
+    private Skin skin;
+
+    protected OfflineAccount(
+            AccountID accountID,
+            AuthlibInjectorArtifactProvider downloader,
+            String profileName,
+            UUID profileID,
+            Skin skin) {
+        super(accountID);
+        this.downloader = requireNonNull(downloader);
+        this.profileName = requireNonNull(profileName);
+        this.profileID = requireNonNull(profileID);
+        this.skin = skin;
+
+        if (StringUtils.isBlank(profileName)) {
+            throw new IllegalArgumentException("Profile name cannot be blank");
+        }
+    }
+
+    public AuthlibInjectorArtifactProvider getDownloader() {
+        return downloader;
+    }
+
+    @Override
+    public UUID getProfileID() {
+        return profileID;
+    }
+
+    @Override
+    public String getProfileName() {
+        return profileName;
+    }
+
+    public Skin getSkin() {
+        return skin;
+    }
+
+    public void setSkin(Skin skin) {
+        this.skin = skin;
+        invalidate();
+    }
+
+    protected boolean loadAuthlibInjector(Skin skin) {
+        return skin != null && skin.type() != Skin.Type.DEFAULT;
+    }
+
+    public AuthInfo logInWithoutSkin() throws AuthenticationException {
+        // Using "legacy" user type here because "mojang" user type may cause "invalid session token" or "disconnected" when connecting to a game server.
+        return new AuthInfo(profileName, profileID, UUIDs.toCompactString(UUID.randomUUID()), AuthInfo.USER_TYPE_MSA, "{}");
+    }
+
+    @Override
+    public AuthInfo logIn() throws AuthenticationException {
+        AuthInfo authInfo = logInWithoutSkin();
+
+        if (loadAuthlibInjector(skin)) {
+            CompletableFuture<AuthlibInjectorArtifactInfo> artifactTask = CompletableFuture.supplyAsync(() -> {
+                try {
+                    return downloader.getArtifactInfo();
+                } catch (IOException e) {
+                    throw new CompletionException(new AuthlibInjectorDownloadException(e));
+                }
+            });
+
+            AuthlibInjectorArtifactInfo artifact;
+            try {
+                artifact = artifactTask.get();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new AuthenticationException(e);
+            } catch (ExecutionException e) {
+                if (e.getCause() instanceof AuthenticationException) {
+                    throw (AuthenticationException) e.getCause();
+                } else {
+                    throw new AuthenticationException(e.getCause());
+                }
+            }
+
+            try {
+                return new OfflineAuthInfo(authInfo, artifact);
+            } catch (Exception e) {
+                throw new AuthenticationException(e);
+            }
+        } else {
+            return authInfo;
+        }
+    }
+
+    private class OfflineAuthInfo extends AuthInfo {
+        private final AuthlibInjectorArtifactInfo artifact;
+        private YggdrasilServer server;
+
+        public OfflineAuthInfo(AuthInfo authInfo, AuthlibInjectorArtifactInfo artifact) {
+            super(authInfo.getUsername(), authInfo.getUUID(), authInfo.getAccessToken(), USER_TYPE_MSA, authInfo.getUserProperties());
+
+            this.artifact = artifact;
+        }
+
+        @Override
+        public Arguments getLaunchArguments(LaunchOptions options) throws IOException {
+            if (!options.isDaemon()) return null;
+
+            server = new YggdrasilServer(0);
+            server.start();
+
+            try {
+                server.addCharacter(new YggdrasilServer.Character(profileID, profileName,
+                        skin != null ? skin.load(profileName).run() : null));
+            } catch (IOException e) {
+                // ignore
+            } catch (Exception e) {
+                throw new IOException(e);
+            }
+
+            return new Arguments().addJVMArguments(
+                    "-javaagent:" + artifact.location().toString() + "=" + "http://localhost:" + server.getListeningPort(),
+                    "-Dauthlibinjector.side=client"
+            );
+        }
+
+        @Override
+        public void close() throws Exception {
+            super.close();
+
+            if (server != null)
+                server.stop();
+        }
+    }
+
+    @Override
+    public AuthInfo playOffline() throws AuthenticationException {
+        return logIn();
+    }
+
+    @Override
+    public void writeMetadata(JsonObject metadata) {
+        super.writeMetadata(metadata);
+        metadata.addProperty("profileID", profileID.toString());
+        metadata.addProperty("profileName", profileName);
+        if (skin == null) {
+            metadata.add("skin", JsonNull.INSTANCE);
+        } else {
+            JsonObject skinStorage = new JsonObject();
+            skin.writeStorage(skinStorage);
+            metadata.add("skin", skinStorage);
+        }
+    }
+
+    @Override
+    public ObjectBinding<Optional<Map<TextureType, Texture>>> getTextures() {
+        return super.getTextures();
+    }
+
+    @Override
+    public String toString() {
+        return new ToStringBuilder(this)
+                .append("accountID", getAccountID())
+                .append("profileName", profileName)
+                .append("profileID", profileID)
+                .toString();
+    }
+}

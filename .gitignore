@@ -1,0 +1,84 @@
+*.class
+
+# virtual machine crash logs, see http://www.java.com/en/download/help/error_hotspot.xml
+hs_err_pid*
+*.hprof
+
+.gradle
+gradle.properties
+
+*.lck
+*.1
+*.2
+*.log
+.mine*
+/externalgames
+NVIDIA
+minecraft-exported-crash-info*
+hmcl-exported-logs-*
+terracotta-log-*
+*.hmcl-theme
+/.java/
+/.local/
+/.cache/
+
+# IANA Language Subtag Registry
+language-subtag-registry
+
+# gradle build
+/build/
+/HMCL/build/
+/HMCLCore/build/
+/HMCLBoot/build/
+/minecraft/libraries/HMCLTransformerDiscoveryService/build/
+/minecraft/libraries/HMCLMultiMCBootstrap/build/
+/buildSrc/build/
+
+# idea
+.idea
+/out/
+/HMCL/out/
+/HMCLCore/out/
+/minecraft/libraries/HMCLTransformerDiscoveryService/out/
+/minecraft/libraries/HMCLMultiMCBootstrap/out/
+
+# eclipse
+/bin/
+/HMCL/bin/
+/HMCLBoot/bin/
+/HMCLCore/bin/
+/minecraft/libraries/HMCLTransformerDiscoveryService/bin/
+/minecraft/libraries/HMCLMultiMCBootstrap/bin/
+.classpath
+.project
+.settings
+
+# netbeans
+.nb-gradle
+
+*.exe
+
+# macos
+.DS_Store
+
+# vscode
+.vscode/
+
+# test
+/hmcl.json
+/.hmcl.json
+/.hmcl/
+/HMCL/.hmcl/
+
+# AI
+/.claude/
+/.gemini/
+!/.gemini/config.yaml
+.codex
+.omc/
+.superpowers/
+.worktrees/
+/.gradle-*/
+
+# Local launcher artifacts
+/HMCL-*.jar

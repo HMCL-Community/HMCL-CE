@@ -1,0 +1,604 @@
+/*
+ * Hello Minecraft! Launcher
+ * Copyright (C) 2021  huangyuhui <huanghongxun2008@126.com> and contributors
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+/*
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2017-2021 Matthew Coley
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining
+ * a copy of this software and associated documentation files (the
+ * "Software"), to deal in the Software without restriction, including
+ * without limitation the rights to use, copy, modify, merge, publish,
+ * distribute, sublicense, and/or sell copies of the Software, and to
+ * permit persons to whom the Software is furnished to do so, subject to
+ * the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be
+ * included in all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+ * LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+ * OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+ * WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ */
+package org.jackhuang.hmcl.util;
+
+import org.jackhuang.hmcl.EntryPoint;
+import org.jackhuang.hmcl.Metadata;
+import org.jackhuang.hmcl.util.gson.JsonUtils;
+import org.jackhuang.hmcl.util.io.ChecksumMismatchException;
+import org.jackhuang.hmcl.util.io.IOUtils;
+import org.jackhuang.hmcl.java.JavaRuntime;
+import org.jackhuang.hmcl.util.io.JarUtils;
+import org.jackhuang.hmcl.util.platform.Platform;
+import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.Unmodifiable;
+
+import javax.swing.*;
+import java.awt.*;
+import java.awt.event.WindowAdapter;
+import java.awt.event.WindowEvent;
+import java.io.*;
+import java.net.URL;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
+import java.util.List;
+import java.util.*;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.stream.Collectors.toSet;
+import static org.jackhuang.hmcl.util.gson.JsonUtils.listTypeOf;
+import static org.jackhuang.hmcl.util.gson.JsonUtils.mapTypeOf;
+import static org.jackhuang.hmcl.util.logging.Logger.LOG;
+import static org.jackhuang.hmcl.util.i18n.I18n.i18n;
+
+// From: https://github.com/Col-E/Recaf/blob/7378b397cee664ae81b7963b0355ef8ff013c3a7/src/main/java/me/coley/recaf/util/self/SelfDependencyPatcher.java
+public final class SelfDependencyPatcher {
+    /// Cached OpenJFX module JARs dynamically loaded into this process, in descriptor order.
+    private static volatile @Unmodifiable List<Path> patchedModulePath = List.of();
+
+    private final List<DependencyDescriptor> dependencies = DependencyDescriptor.readDependencies();
+    private final List<Repository> repositories;
+    private final Repository defaultRepository;
+    private final byte[] buffer = new byte[IOUtils.DEFAULT_BUFFER_SIZE];
+    private final MessageDigest digest = DigestUtils.getDigest("SHA-1");
+
+    private SelfDependencyPatcher() throws PatchException {
+        // We can only self-patch JavaFX on specific platform.
+        if (dependencies == null) {
+            throw new PatchException("Unsupported platform: operating system %s, architecture %s".formatted(
+                    System.getProperty("os.name"), System.getProperty("os.arch")));
+        }
+
+        final String customUrl = System.getProperty("hmcl.openjfx.repo");
+        if (customUrl == null) {
+            if (System.getProperty("user.country", "").equalsIgnoreCase("CN")) {
+                defaultRepository = Repository.TENCENTCLOUD_MIRROR;
+            } else {
+                defaultRepository = Repository.MAVEN_CENTRAL;
+            }
+            repositories = List.of(Repository.MAVEN_CENTRAL, Repository.TENCENTCLOUD_MIRROR);
+        } else {
+            defaultRepository = new Repository(String.format(i18n("repositories.custom"), customUrl), customUrl);
+            repositories = List.of(Repository.MAVEN_CENTRAL, Repository.TENCENTCLOUD_MIRROR, defaultRepository);
+        }
+    }
+
+    private static final class DependencyDescriptor {
+        private static final String DEPENDENCIES_LIST_FILE = "/assets/openjfx-dependencies.json";
+        private static final Path DEPENDENCIES_DIR_PATH = Metadata.DEPENDENCIES_DIRECTORY.resolve(Platform.CURRENT_PLATFORM.toString()).resolve("openjfx");
+
+        static List<DependencyDescriptor> readDependencies() {
+            //noinspection ConstantConditions
+            try (Reader reader = new InputStreamReader(SelfDependencyPatcher.class.getResourceAsStream(DEPENDENCIES_LIST_FILE), UTF_8)) {
+                Map<String, Map<String, List<DependencyDescriptor>>> allDependencies =
+                        JsonUtils.GSON.fromJson(reader, mapTypeOf(String.class, mapTypeOf(String.class, listTypeOf(DependencyDescriptor.class))));
+                Map<String, List<DependencyDescriptor>> platform = allDependencies.get(Platform.CURRENT_PLATFORM.toString());
+                if (platform == null)
+                    return null;
+
+                if (JavaRuntime.CURRENT_VERSION >= 23) {
+                    List<DependencyDescriptor> modernDependencies = platform.get("modern");
+                    if (modernDependencies != null)
+                        return modernDependencies;
+                }
+                return platform.get("classic");
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        }
+
+        public String module;
+        public String groupId;
+        public String artifactId;
+        public String version;
+        public String classifier;
+        public String sha1;
+
+        public String filename() {
+            return artifactId + "-" + version + "-" + classifier + ".jar";
+        }
+
+        public String sha1() {
+            return sha1;
+        }
+
+        public Path localPath() {
+            return DEPENDENCIES_DIR_PATH.resolve(filename());
+        }
+    }
+
+    private record Repository(String name, String url) {
+        public static final Repository MAVEN_CENTRAL = new Repository(i18n("repositories.maven_central"), "https://repo1.maven.org/maven2");
+        public static final Repository TENCENTCLOUD_MIRROR = new Repository(i18n("repositories.tencentcloud_mirror"), getTencentCloudMirrorUrl());
+
+        public String resolveDependencyURL(DependencyDescriptor descriptor) {
+            return String.format("%s/%s/%s/%s/%s",
+                    url,
+                    descriptor.groupId.replace('.', '/'),
+                    descriptor.artifactId, descriptor.version,
+                    descriptor.filename());
+        }
+    }
+
+    /// Returns the Tencent Maven mirror root used for automatic JavaFX downloads.
+    ///
+    /// @return live Tencent Maven repository root
+    static String getTencentCloudMirrorUrl() {
+        return "https://mirrors.cloud.tencent.com/nexus/repository/maven-public";
+    }
+
+    /**
+     * Patch in any missing dependencies, if any.
+     */
+    public static void patch() throws PatchException, CancellationException {
+        // Do nothing if JavaFX is detected
+        try {
+            Class.forName("javafx.application.Application");
+            return;
+        } catch (Exception ignored) {
+        }
+
+        SelfDependencyPatcher patcher = new SelfDependencyPatcher();
+
+        // Otherwise we're free to download in Java 11+
+        LOG.info("Missing JavaFX dependencies, attempting to patch in missing classes");
+
+        // Download missing dependencies
+        List<DependencyDescriptor> missingDependencies = patcher.checkMissingDependencies();
+        if (!missingDependencies.isEmpty()) {
+            try {
+                patcher.fetchDependencies(missingDependencies);
+            } catch (IOException e) {
+                throw new PatchException("Failed to download dependencies", e);
+            }
+        }
+
+        // Add the dependencies
+        try {
+            patcher.loadFromCache();
+        } catch (IOException ex) {
+            throw new PatchException("Failed to load JavaFX cache", ex);
+        } catch (ReflectiveOperationException | NoClassDefFoundError ex) {
+            throw new PatchException("Failed to add dependencies to classpath!", ex);
+        }
+        patchedModulePath = patcher.dependencies.stream()
+                .map(DependencyDescriptor::localPath)
+                .toList();
+        LOG.info(" - Done!");
+    }
+
+    /// Returns the JavaFX module path that a child JVM must inherit after runtime self-patching.
+    ///
+    /// @return immutable cached OpenJFX JAR paths, or an empty list when Java supplied JavaFX itself
+    public static @Unmodifiable List<Path> getPatchedModulePath() {
+        return patchedModulePath;
+    }
+
+    private Repository showChooseRepositoryDialog() {
+        final JPanel panel = new JPanel();
+        panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
+
+        for (String line : i18n("repositories.chooser").split("\n")) {
+            panel.add(new JLabel(line));
+        }
+
+        final ButtonGroup buttonGroup = new ButtonGroup();
+
+        for (Repository repository : repositories) {
+            final JRadioButton button = new JRadioButton(repository.name);
+            button.putClientProperty("repository", repository);
+            buttonGroup.add(button);
+            panel.add(button);
+            if (repository == defaultRepository) {
+                button.setSelected(true);
+            }
+        }
+
+        int res = JOptionPane.showConfirmDialog(null, panel, i18n("repositories.chooser.title"), JOptionPane.OK_CANCEL_OPTION);
+
+        if (res == JOptionPane.OK_OPTION) {
+            final Enumeration<AbstractButton> buttons = buttonGroup.getElements();
+            while (buttons.hasMoreElements()) {
+                final AbstractButton button = buttons.nextElement();
+                if (button.isSelected()) {
+                    return (Repository) button.getClientProperty("repository");
+                }
+            }
+        } else {
+            LOG.info("User choose not to download JavaFX");
+            EntryPoint.exit(0);
+        }
+        throw new AssertionError();
+    }
+
+    /**
+     * Inject them into the current classpath.
+     *
+     * @throws IOException                  When the locally cached dependency urls cannot be resolved.
+     * @throws ReflectiveOperationException When the call to add these urls to the system classpath failed.
+     */
+    private void loadFromCache() throws IOException, ReflectiveOperationException {
+        LOG.info(" - Loading dependencies...");
+
+        Set<String> modules = dependencies.stream()
+                .map(it -> it.module)
+                .collect(toSet());
+
+        Path[] jars = dependencies.stream()
+                .map(DependencyDescriptor::localPath)
+                .toArray(Path[]::new);
+
+        String addOpens = JarUtils.getAttribute("hmcl.add-opens", null);
+        JavaFXPatcher.patch(modules, jars, addOpens != null ? addOpens.split(" ") : new String[0]);
+    }
+
+    /**
+     * Download dependencies.
+     *
+     * @throws IOException When the files cannot be fetched or saved.
+     */
+    private void fetchDependencies(List<DependencyDescriptor> dependencies) throws IOException {
+        SwingUtils.initLookAndFeel();
+
+        boolean isFirstTime = true;
+
+        Repository repository = defaultRepository;
+
+        int count = 0;
+        while (true) {
+            AtomicBoolean isCancelled = new AtomicBoolean();
+            AtomicBoolean showDetails = new AtomicBoolean();
+
+            ProgressFrame dialog;
+            try {
+                dialog = new SwingProgressFrame(i18n("download.javafx"));
+            } catch (HeadlessException e) {
+                LOG.warning("Failed to open dialog", e);
+                dialog = new FakeProgressFrame();
+            }
+
+            dialog.setProgressMaximum(dependencies.size() + 1);
+            dialog.setProgress(count);
+            dialog.setOnCancel(() -> isCancelled.set(true));
+            dialog.setOnChangeSource(() -> {
+                isCancelled.set(true);
+                showDetails.set(true);
+            });
+            dialog.setVisible(true);
+            try {
+                if (isFirstTime) {
+                    isFirstTime = false;
+                    try {
+                        //noinspection BusyWait
+                        Thread.sleep(1000);
+                    } catch (InterruptedException ignored) {
+                    }
+                }
+                Files.createDirectories(DependencyDescriptor.DEPENDENCIES_DIR_PATH);
+                for (int i = count; i < dependencies.size(); i++) {
+                    if (isCancelled.get()) {
+                        throw new CancellationException();
+                    }
+
+                    DependencyDescriptor dependency = dependencies.get(i);
+
+                    ProgressFrame finalDialog = dialog;
+                    SwingUtilities.invokeLater(() -> {
+                        finalDialog.setCurrent(dependency.module);
+                        finalDialog.incrementProgress();
+                    });
+                    downloadDependency(dependency, repository, isCancelled);
+                    count++;
+                }
+            } catch (CancellationException e) {
+                dialog.dispose();
+                if (showDetails.get()) {
+                    repository = showChooseRepositoryDialog();
+                    continue;
+                } else {
+                    throw e;
+                }
+            }
+            dialog.dispose();
+            return;
+        }
+    }
+
+    /// Downloads one dependency from the selected repository and then every configured fallback repository.
+    ///
+    /// @param dependency dependency descriptor to download
+    /// @param selectedRepository repository selected for the current attempt
+    /// @param isCancelled cancellation flag shared with the progress dialog
+    /// @throws IOException if every configured repository fails
+    private void downloadDependency(
+            DependencyDescriptor dependency,
+            Repository selectedRepository,
+            AtomicBoolean isCancelled
+    ) throws IOException {
+        List<Repository> candidates = new ArrayList<>();
+        candidates.add(selectedRepository);
+        for (Repository candidate : repositories) {
+            if (!candidates.contains(candidate)) {
+                candidates.add(candidate);
+            }
+        }
+
+        @Nullable IOException failure = null;
+        for (Repository candidate : candidates) {
+            try {
+                downloadDependencyFromRepository(dependency, candidate, isCancelled);
+                return;
+            } catch (CancellationException exception) {
+                throw exception;
+            } catch (IOException exception) {
+                failure = exception;
+                LOG.warning("Failed to download " + dependency.module + " from " + candidate.url, exception);
+            }
+        }
+        throw new IOException("Every JavaFX repository failed for " + dependency.filename(), failure);
+    }
+
+    /// Downloads and verifies one dependency without publishing a partial cache entry.
+    ///
+    /// @param dependency dependency descriptor to download
+    /// @param repository repository used for this attempt
+    /// @param isCancelled cancellation flag shared with the progress dialog
+    /// @throws IOException if download, verification, or cache replacement fails
+    private void downloadDependencyFromRepository(
+            DependencyDescriptor dependency,
+            Repository repository,
+            AtomicBoolean isCancelled
+    ) throws IOException {
+        String url = repository.resolveDependencyURL(dependency);
+        Path target = dependency.localPath();
+        Path temporary = target.resolveSibling(target.getFileName() + ".part");
+        Files.deleteIfExists(temporary);
+        LOG.info("Downloading " + url);
+
+        try {
+            try (InputStream input = new URL(url).openStream();
+                 OutputStream output = Files.newOutputStream(temporary)) {
+                int read;
+                while ((read = input.read(buffer, 0, IOUtils.DEFAULT_BUFFER_SIZE)) >= 0) {
+                    if (isCancelled.get()) {
+                        throw new CancellationException();
+                    }
+                    output.write(buffer, 0, read);
+                }
+            }
+            verifyChecksum(dependency, temporary);
+            Files.move(temporary, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } finally {
+            Files.deleteIfExists(temporary);
+        }
+    }
+
+    private List<DependencyDescriptor> checkMissingDependencies() {
+        List<DependencyDescriptor> missing = new ArrayList<>();
+
+        for (DependencyDescriptor dependency : dependencies) {
+            if (!Files.exists(dependency.localPath())) {
+                missing.add(dependency);
+                continue;
+            }
+
+            try {
+                verifyChecksum(dependency);
+            } catch (ChecksumMismatchException e) {
+                LOG.warning("Corrupted dependency " + dependency.filename() + ": " + e.getMessage());
+                missing.add(dependency);
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        }
+
+        return missing;
+    }
+
+    /// Verifies the cached file for a dependency.
+    ///
+    /// @param dependency dependency descriptor whose cache entry is verified
+    /// @throws IOException if the cached file cannot be read
+    /// @throws ChecksumMismatchException if the cached file does not match the descriptor
+    private void verifyChecksum(DependencyDescriptor dependency) throws IOException, ChecksumMismatchException {
+        verifyChecksum(dependency, dependency.localPath());
+    }
+
+    /// Verifies a dependency file before it is published to the cache.
+    ///
+    /// @param dependency dependency descriptor containing the expected SHA-1
+    /// @param file file to verify
+    /// @throws IOException if the file cannot be read
+    /// @throws ChecksumMismatchException if the file does not match the descriptor
+    private void verifyChecksum(DependencyDescriptor dependency, Path file) throws IOException, ChecksumMismatchException {
+        digest.reset();
+        try (InputStream is = Files.newInputStream(file)) {
+            int read;
+            while ((read = is.read(buffer, 0, IOUtils.DEFAULT_BUFFER_SIZE)) > -1) {
+                digest.update(buffer, 0, read);
+            }
+        }
+
+        String sha1 = HexFormat.of().formatHex(digest.digest());
+        if (!dependency.sha1().equalsIgnoreCase(sha1))
+            throw new ChecksumMismatchException("SHA-1", dependency.sha1(), sha1);
+    }
+
+    public static class PatchException extends Exception {
+        PatchException(String message) {
+            super(message);
+        }
+
+        PatchException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+
+    public sealed interface ProgressFrame {
+        void setCurrent(String component);
+
+        void setProgressMaximum(int total);
+
+        void setProgress(int n);
+
+        void incrementProgress();
+
+        void setOnCancel(Runnable action);
+
+        void setOnChangeSource(Runnable action);
+
+        void setVisible(boolean visible);
+
+        void dispose();
+    }
+
+    public static final class SwingProgressFrame extends JDialog implements ProgressFrame {
+
+        private final JProgressBar progressBar;
+        private final JLabel progressText;
+        private final JButton btnChangeSource;
+        private final JButton btnCancel;
+
+        public SwingProgressFrame(String title) {
+            JPanel panel = new JPanel();
+
+            setResizable(false);
+            setTitle(title);
+            setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
+            setBounds(100, 100, 500, 200);
+            setContentPane(panel);
+            setLocationRelativeTo(null);
+
+            JPanel content = new JPanel();
+            content.setLayout(new BoxLayout(content, BoxLayout.Y_AXIS));
+
+            for (String note : i18n("download.javafx.notes").split("\n")) {
+                content.add(new JLabel(note));
+            }
+            content.add(new JLabel("<html><br/></html>"));
+            progressText = new JLabel(i18n("download.javafx.prepare"));
+            content.add(progressText);
+            progressBar = new JProgressBar();
+            content.add(progressBar);
+
+            final JPanel buttonBar = new JPanel();
+            btnChangeSource = new JButton(i18n("button.change_source"));
+            btnCancel = new JButton(i18n("button.cancel"));
+            buttonBar.add(btnChangeSource);
+            buttonBar.add(btnCancel);
+
+            panel.setLayout(new BorderLayout());
+            panel.setBorder(BorderFactory.createEmptyBorder(10, 5, 0, 5));
+            panel.add(content, BorderLayout.CENTER);
+            panel.add(buttonBar, BorderLayout.SOUTH);
+        }
+
+        public void setCurrent(String component) {
+            progressText.setText(i18n("download.javafx.component", component));
+        }
+
+        public void setProgressMaximum(int total) {
+            progressBar.setMaximum(total);
+        }
+
+        public void setProgress(int n) {
+            progressBar.setValue(n);
+        }
+
+        public void incrementProgress() {
+            progressBar.setValue(progressBar.getValue() + 1);
+        }
+
+        public void setOnCancel(Runnable action) {
+            btnCancel.addActionListener(e -> action.run());
+            addWindowListener(new WindowAdapter() {
+                @Override
+                public void windowClosing(WindowEvent e) {
+                    action.run();
+                }
+            });
+        }
+
+        public void setOnChangeSource(Runnable action) {
+            btnChangeSource.addActionListener(e -> action.run());
+        }
+    }
+
+    public static final class FakeProgressFrame implements ProgressFrame {
+
+        @Override
+        public void setCurrent(String component) {
+        }
+
+        @Override
+        public void setProgressMaximum(int total) {
+        }
+
+        @Override
+        public void setProgress(int n) {
+        }
+
+        @Override
+        public void incrementProgress() {
+        }
+
+        @Override
+        public void setOnCancel(Runnable action) {
+        }
+
+        @Override
+        public void setOnChangeSource(Runnable action) {
+        }
+
+        @Override
+        public void setVisible(boolean visible) {
+        }
+
+        @Override
+        public void dispose() {
+        }
+    }
+}

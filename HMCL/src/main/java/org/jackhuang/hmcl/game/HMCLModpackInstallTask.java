@@ -1,0 +1,105 @@
+/*
+ * Hello Minecraft! Launcher
+ * Copyright (C) 2020  huangyuhui <huanghongxun2008@126.com> and contributors
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+package org.jackhuang.hmcl.game;
+
+import com.google.gson.JsonParseException;
+import org.jackhuang.hmcl.download.DefaultDependencyManager;
+import org.jackhuang.hmcl.download.LibraryAnalyzer;
+import org.jackhuang.hmcl.modpack.MinecraftInstanceTask;
+import org.jackhuang.hmcl.modpack.Modpack;
+import org.jackhuang.hmcl.modpack.ModpackConfiguration;
+import org.jackhuang.hmcl.modpack.ModpackInstallTask;
+import org.jackhuang.hmcl.task.Task;
+import org.jackhuang.hmcl.util.gson.JsonUtils;
+import org.jackhuang.hmcl.util.io.CompressingUtils;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+public final class HMCLModpackInstallTask extends Task<Void> {
+    private final Path zipFile;
+    private final GameInstanceID instanceId;
+    private final HMCLGameRepository repository;
+    private final DefaultDependencyManager dependency;
+    private final Modpack modpack;
+    private final List<Task<?>> dependencies = new ArrayList<>(1);
+    private final List<Task<?>> dependents = new ArrayList<>(4);
+
+    public HMCLModpackInstallTask(HMCLGameRepository repository, Path zipFile, Modpack modpack, GameInstanceID instanceId) {
+        this.repository = repository;
+        this.dependency = repository.getDependency();
+        this.zipFile = zipFile;
+        this.instanceId = instanceId;
+        this.modpack = modpack;
+
+        Path run = repository.getRunDirectory(this.instanceId);
+        Path json = repository.getModpackConfiguration(this.instanceId);
+        if (repository.hasInstance(this.instanceId) && Files.notExists(json))
+            throw new IllegalArgumentException("Instance " + instanceId + " already exists");
+
+        dependents.add(dependency.newGameBuilder().name(this.instanceId).gameVersion(modpack.getGameVersion()).buildAsync());
+
+        onDone().register(event -> {
+            if (event.isFailed()) repository.removeInstanceFromDisk(this.instanceId);
+        });
+
+        ModpackConfiguration<Modpack> config = null;
+        try {
+            if (Files.exists(json)) {
+                config = JsonUtils.fromJsonFile(json, ModpackConfiguration.typeOf(Modpack.class));
+
+                if (!HMCLModpackProvider.INSTANCE.getName().equals(config.getType()))
+                    throw new IllegalArgumentException("Instance " + instanceId + " is not a HMCL modpack. Cannot update this instance.");
+            }
+        } catch (JsonParseException | IOException ignore) {
+        }
+        dependents.add(new ModpackInstallTask<>(zipFile, run, modpack.getEncoding(), Collections.singletonList("/minecraft"), it -> !"pack.json".equals(it), config));
+        dependents.add(new MinecraftInstanceTask<>(zipFile, modpack.getEncoding(), Collections.singletonList("/minecraft"), modpack, HMCLModpackProvider.INSTANCE, modpack.getName(), modpack.getVersion(), repository.getModpackConfiguration(this.instanceId)).withStage("hmcl.modpack"));
+    }
+
+    @Override
+    public List<Task<?>> getDependencies() {
+        return dependencies;
+    }
+
+    @Override
+    public List<Task<?>> getDependents() {
+        return dependents;
+    }
+
+    @Override
+    public void execute() throws Exception {
+        String json = CompressingUtils.readTextZipEntry(zipFile, "minecraft/pack.json");
+        GameInstanceManifest originalManifest = JsonUtils.GSON.fromJson(json, GameInstanceManifest.class).withId(instanceId).withJar(null);
+        LibraryAnalyzer analyzer = LibraryAnalyzer.analyze(originalManifest, null);
+        Task<GameInstanceManifest> libraryTask = Task.supplyAsync(() -> originalManifest);
+        // reinstall libraries
+        // libraries of Forge and OptiFine should be obtained by installation.
+        for (LibraryAnalyzer.LibraryMark mark : analyzer) {
+            if (LibraryAnalyzer.LibraryType.MINECRAFT.getPatchId().equals(mark.getLibraryId()))
+                continue;
+            libraryTask = libraryTask.thenComposeAsync(version -> dependency.installLibraryAsync(modpack.getGameVersion(), version, mark.getLibraryId(), mark.getLibraryVersion()));
+        }
+
+        dependencies.add(libraryTask.thenComposeAsync(repository::saveAsync));
+    }
+}
