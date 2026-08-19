@@ -59,8 +59,8 @@ jobs:
           test -s "$key"
           chmod 600 "$key"
           echo "HMCL_SIGNATURE_KEY=$key" >> "$GITHUB_ENV"
-      - name: Install xvfb
-        run: sudo apt-get update && sudo apt-get install -y xvfb
+      - name: Verify xvfb
+        run: command -v xvfb-run
       - name: Build release artifacts
         run: xvfb-run -a ./gradlew clean :HMCL:build --no-daemon --parallel --stacktrace
         env:
