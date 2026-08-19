@@ -59,13 +59,11 @@ HMCL CE 是一个社区驱动的开源项目，欢迎任何人参与贡献代码
 
 ## 贡献者
 
-HMCL CE 继承并尊重 HMCL 上游自 2015 年以来的贡献历史，同时记录 CE 独立开发者的后续工作，感谢每一位贡献者！
-
 [![Contributors](https://contrib.rocks/image?repo=HMCL-Community/HMCL-CE)](https://github.com/HMCL-Community/HMCL-CE/graphs/contributors)
 
 ## 致谢
 
-- [HMCL 上游项目](https://github.com/HMCL-dev/HMCL)：感谢上游项目及其维护者为 HMCL CE 提供的基础代码、设计和长期贡献历史。
+- [HMCL 上游项目](https://github.com/HMCL-dev/HMCL)：感谢上游项目及其维护者为 HMCL CE 提供的基础代码、设计和长期工作。
 
 ## 开源协议
 

@@ -45,7 +45,7 @@ See the [plugin system documentation](./PLUGIN_SYSTEM.md) for manifest format, p
 
 ## Contributing
 
-HMCL CE is a community-driven open-source project. It preserves HMCL's upstream author history while maintaining an independent release and plugin track.
+HMCL CE is a community-driven open-source project based on HMCL, with an independent release and plugin track.
 
 You can contribute to HMCL CE development in the following ways:
 
@@ -59,13 +59,11 @@ Before contributing, please read the [Contributing Guide](./Contributing.md), wh
 
 ## Contributors
 
-HMCL CE preserves and credits HMCL's upstream contribution history since 2015, alongside the developers who maintain the CE track. Thank you to every contributor!
-
 [![Contributors](https://contrib.rocks/image?repo=HMCL-Community/HMCL-CE)](https://github.com/HMCL-Community/HMCL-CE/graphs/contributors)
 
 ## Acknowledgements
 
-- [HMCL upstream project](https://github.com/HMCL-dev/HMCL): for the foundation, design, and long-standing contribution history carried forward by HMCL CE.
+- [HMCL upstream project](https://github.com/HMCL-dev/HMCL): for the foundation, design, and long-term upstream work used by HMCL CE.
 
 ## License
 

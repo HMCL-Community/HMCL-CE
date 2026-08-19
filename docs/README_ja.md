@@ -56,8 +56,6 @@ HMCL の開発には、次の方法で参加できます。
 
 ## 貢献者
 
-2015 年以来、120 人を超える貢献者が HMCL に参加しています。ご協力ありがとうございます。
-
 [![Contributors](https://contrib.rocks/image?repo=HMCL-Community/HMCL-CE)](https://github.com/HMCL-Community/HMCL-CE/graphs/contributors)
 
 ## ライセンス

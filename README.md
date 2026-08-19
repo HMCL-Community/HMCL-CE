@@ -64,9 +64,9 @@ Windows PowerShell：
 
 插件审核与生态治理由社区共同完成。插件作者可以通过公开仓库、Release 和 `hmclce` Topic 发布插件，用户可以自行添加、检查和管理插件来源。
 
-## 上游归属与贡献历史
+## 上游归属与致谢
 
-HMCL CE 由 HMCL 上游项目发展而来。项目明确保留并尊重 HMCL 自 2015 年以来的原作者、提交记录和贡献者历史，感谢 [HMCL-dev/HMCL](https://github.com/HMCL-dev/HMCL) 的维护者与所有贡献者提供的基础代码、设计和长期工作。
+HMCL CE 基于 [HMCL-dev/HMCL](https://github.com/HMCL-dev/HMCL) 的代码开发，感谢上游维护者与所有贡献者提供的基础代码、设计和长期工作。
 
 CE 的独立开发者与后续贡献记录可在 [本仓库贡献者页面](https://github.com/HMCL-Community/HMCL-CE/graphs/contributors) 查看。软件界面内保留上游作者、依赖项目及贡献者致谢信息。
 

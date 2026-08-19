@@ -56,8 +56,6 @@ HMCL — це відкритий проект, який розвиває спі�
 
 ## Учасники
 
-З 2015 року в розробці HMCL взяли участь понад 120 людей. Дякуємо за вашу працю!
-
 [![Contributors](https://contrib.rocks/image?repo=HMCL-Community/HMCL-CE)](https://github.com/HMCL-Community/HMCL-CE/graphs/contributors)
 
 ## Ліцензія
