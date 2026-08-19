@@ -95,7 +95,7 @@ HMCL 歡迎任何人參與翻譯和貢獻。但是維護更多語言的翻譯需
   我們希望能夠找到擅長該語言者幫助我們長期維護新增的在地化檔案。
   如果可能缺少長期維護者，我們會更慎重地考慮是否要加入對該語言的支援。
 
-我們建議貢獻者在提供新語言翻譯之前先透過 [Issue](https://github.com/HMCL-dev/HMCL/issues/new?template=feature.yml) 提出一個功能請求，
+我們建議貢獻者在提供新語言翻譯之前先透過 [Issue](https://github.com/HMCL-Community/HMCL-CE/issues/new?template=feature.yml) 提出一個功能請求，
 與其他貢獻者先進行討論，確定了未來的維護方式後再進行翻譯工作。
 
 ### 開始翻譯

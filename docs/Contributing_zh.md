@@ -54,10 +54,10 @@ OpenJDK 64-Bit Server VM (build 25+37-LTS, mixed mode, sharing)
 
 - 通过 [Git](https://git-scm.com/downloads) 可以获取最新源码:
   ```shell
-  git clone https://github.com/HMCL-dev/HMCL.git
-  cd HMCL
+  git clone https://github.com/HMCL-Community/HMCL-CE.git
+  cd HMCL-CE
   ```
-- 从 [GitHub Release 页面](https://github.com/HMCL-dev/HMCL/releases)可以手动下载特定版本的源码。
+- 从 [GitHub Release 页面](https://github.com/HMCL-Community/HMCL-CE/releases)可以手动下载特定版本的源码。
 
 ### 构建 HMCL
 
@@ -94,7 +94,7 @@ HMCL 提供了一系列调试选项，用于控制启动器的行为。
 |                             | `-Dhmcl.bmclapi.override=<url>`              | 指定 BMCLAPI 的 API Root          | `https://bmclapi2.bangbang93.com`                                                                           |              |
 |                             | `-Dhmcl.discoapi.override=<url>`             | 指定 foojay Disco API 的 API Root | `https://api.foojay.io/disco/v3.0`                                                                          |
 | `HMCL_FONT`                 | `-Dhmcl.font.override=<font family>`         | 指定 HMCL 默认字体                   | 使用系统默认字体                                                                                                    |              |
-|                             | `-Dhmcl.update_source.override=<url>`        | 指定 HMCL 更新源                    | `https://hmcl.huangyuhui.net/api/update_link`                                                               |              |
+|                             | `-Dhmcl.update_source.override=<url>`        | 指定 HMCL CE 更新源                 | `https://api.github.com/repos/HMCL-Community/HMCL-CE/releases`                                               |              |
 |                             | `-Dhmcl.authlibinjector.location=<path>`     | 指定 authlib-injector JAR 文件的位置  | 使用 HMCL 内嵌的 authlib-injector                                                                                |              |
 |                             | `-Dhmcl.openjfx.repo=<maven repository url>` | 添加用于下载 OpenJFX 的自定义 Maven 仓库   |                                                                                                             |              |
 |                             | `-Dhmcl.native.encoding=<encoding>`          | 指定原生编码                         | 使用系统的本机编码                                                                                                   |              |
@@ -102,4 +102,3 @@ HMCL 提供了一系列调试选项，用于控制启动器的行为。
 |                             | `-Dhmcl.curseforge.apikey=<Api Key>`         | 指定 CurseForge API 密钥           | 使用 HMCL 内置的 CurseForge API 密钥                                                                               |              |
 |                             | `-Dhmcl.native.backend=<auto/jna/none>`      | 指定HMCL使用的本机后端                  | `auto`                                                                                                      |
 |                             | `-Dhmcl.hardware.fastfetch=<true/false>`     | 指定是否使用 fastfetch 检测硬件信息        | `true`                                                                                                      |
-

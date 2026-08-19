@@ -55,10 +55,10 @@ OpenJDK 64-Bit Server VM (build 25+37-LTS, mixed mode, sharing)
 
 - You can get the latest source code via [Git](https://git-scm.com/downloads):
   ```shell
-  git clone https://github.com/HMCL-dev/HMCL.git
-  cd HMCL
+  git clone https://github.com/HMCL-Community/HMCL-CE.git
+  cd HMCL-CE
   ```
-- You can manually download a specific version of the source code from the [GitHub Release page](https://github.com/HMCL-dev/HMCL/releases).
+- You can manually download a specific version of the source code from the [GitHub Release page](https://github.com/HMCL-Community/HMCL-CE/releases).
 
 ### Build HMCL
 
@@ -95,7 +95,7 @@ These options can be specified via environment variables or JVM parameters. If b
 |                             | `-Dhmcl.bmclapi.override=<url>`              | Specifies the API Root for BMCLAPI                        | `https://bmclapi2.bangbang93.com`                                                                           |                           |
 |                             | `-Dhmcl.discoapi.override=<url>`             | Specifies the API Root for foojay Disco API               | `https://api.foojay.io/disco/v3.0`                                                                          |                           | 
 | `HMCL_FONT`                 | `-Dhmcl.font.override=<font family>`         | Specifies the default font for HMCL                       | Uses the system default font                                                                                |                           |
-|                             | `-Dhmcl.update_source.override=<url>`        | Specifies the update source for HMCL                      | `https://hmcl.huangyuhui.net/api/update_link`                                                               |                           |
+|                             | `-Dhmcl.update_source.override=<url>`        | Specifies the update source for HMCL CE                   | `https://api.github.com/repos/HMCL-Community/HMCL-CE/releases`                                               |                           |
 |                             | `-Dhmcl.authlibinjector.location=<path>`     | Specifies the location of the authlib-injector JAR file   | Uses the built-in authlib-injector                                                                          |                           |
 |                             | `-Dhmcl.openjfx.repo=<maven repository url>` | Adds a custom Maven repository for downloading OpenJFX    |                                                                                                             |                           |
 |                             | `-Dhmcl.native.encoding=<encoding>`          | Specifies the native encoding                             | Uses the system's native encoding                                                                           |                           |

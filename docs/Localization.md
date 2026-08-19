@@ -106,7 +106,7 @@ Please confirm the following requirements before contributing:
   we hope to find people proficient in the language to help us maintain the newly added localization files in the long term.
   If there may be a lack of long-term maintainers, we will be more cautious about adding support for that language.
 
-We recommend that contributors submit a [feature request](https://github.com/HMCL-dev/HMCL/issues/new?template=feature.yml) before providing a new language translation,
+We recommend that contributors submit a [feature request](https://github.com/HMCL-Community/HMCL-CE/issues/new?template=feature.yml) before providing a new language translation,
 discuss with other contributors first, and determine the future maintenance plan before starting the translation work.
 
 ### Getting Started with Translation

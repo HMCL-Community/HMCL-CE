@@ -96,8 +96,11 @@ jobs:
         env:
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
+          release_title="HMCL CE ${RELEASE_VERSION/-release./ Release }"
+          release_title="${release_title/-beta./ Beta }"
+          release_title="${release_title/-preview./ Preview }"
           {
-            echo "HMCL CE $RELEASE_VERSION"
+            echo "$release_title"
             echo
             echo "Built and verified by GitHub Actions from commit \`$GITHUB_SHA\`."
             echo
@@ -114,10 +117,13 @@ jobs:
           if [ "$PRERELEASE" = "true" ]; then
             flags+=(--prerelease)
           fi
+          release_title="HMCL CE ${RELEASE_VERSION/-release./ Release }"
+          release_title="${release_title/-beta./ Beta }"
+          release_title="${release_title/-preview./ Preview }"
           gh release create "v$RELEASE_VERSION" \
             HMCL/build/libs/HMCL-CE-$RELEASE_VERSION.{jar,exe,sh,deb} \
             HMCL/build/libs/HMCL-CE-$RELEASE_VERSION.{jar,exe,sh,deb}.sha256 \
             --target "$GITHUB_SHA" \
-            --title "HMCL CE $RELEASE_VERSION" \
+            --title "$release_title" \
             --notes-file RELEASE_NOTE.md \
             "${flags[@]}"
