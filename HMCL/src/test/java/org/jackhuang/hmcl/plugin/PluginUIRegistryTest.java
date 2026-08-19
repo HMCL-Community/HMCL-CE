@@ -19,21 +19,32 @@ package org.jackhuang.hmcl.plugin;
 
 import javafx.scene.Node;
 import javafx.scene.layout.StackPane;
+import org.jackhuang.hmcl.FXThreadTestSupport;
+import org.jetbrains.annotations.NotNullByDefault;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIf;
 
 import static org.junit.jupiter.api.Assertions.assertSame;
 
+/// Verifies plugin-owned sidebar UI registrations on the JavaFX application thread.
+@NotNullByDefault
+@EnabledIf("org.jackhuang.hmcl.JavaFXLauncher#isStarted")
 final class PluginUIRegistryTest {
+    /// Verifies a page-backed sidebar item retains its original lazy page supplier.
     @Test
     void retainsThePageSupplierForThemeOwnedSidebarRendering() {
-        Node page = new StackPane();
+        FXThreadTestSupport.runOnFxThread(() -> {
+            Node page = new StackPane();
 
-        PluginUIRegistry.registerSidebarPage("test.theme-page", "Theme page", () -> page);
+            try {
+                PluginUIRegistry.registerSidebarPage("test.theme-page", "Theme page", () -> page);
 
-        PluginUIRegistry.SidebarItem item = PluginUIRegistry.getSidebarItems()
-                .get(PluginUIRegistry.getSidebarItems().size() - 1);
-        assertSame(page, item.getPageSupplier().get());
-
-        PluginUIRegistry.unregisterAll("test.theme-page");
+                PluginUIRegistry.SidebarItem item = PluginUIRegistry.getSidebarItems()
+                        .get(PluginUIRegistry.getSidebarItems().size() - 1);
+                assertSame(page, item.getPageSupplier().get());
+            } finally {
+                PluginUIRegistry.unregisterAll("test.theme-page");
+            }
+        });
     }
 }
