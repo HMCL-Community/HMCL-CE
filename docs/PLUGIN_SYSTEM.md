@@ -1,5 +1,7 @@
 # HMCL CE 插件系统
 
+启动器与插件之间约定行为的正式契约见 [插件契约](./PLUGIN_CONTRACT.md)。
+
 HMCL CE 支持运行在 JVM 上的 Java/Kotlin 插件，以及由独立 .NET Companion Host 执行的 C# 扩展。插件包使用 `.npl`（ZIP）格式，并由启动器在安装、更新和启动时验证清单、权限、依赖和包身份。
 
 > 破坏性变更：`type: "javascript"` 已不再受支持。CE 不会下载、安装或调用 Node.js，也不会执行旧 JavaScript 插件包。

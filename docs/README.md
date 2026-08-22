@@ -41,7 +41,7 @@ The current stable release is **HMCL CE 26.8 Release 1**. Download it from:
 
 Release 1 introduces the independent CE public-key signing chain and GitHub Releases update source. Keep the SHA-256 checksum files from the release page when distributing the binaries.
 
-See the [plugin system documentation](./PLUGIN_SYSTEM.md) for manifest format, permissions, and source management.
+See the [plugin system documentation](./PLUGIN_SYSTEM.md) for manifest format, permissions, and source management, and the [plugin contract](./PLUGIN_CONTRACT.md) for the formal launcher-plugin behavioral guarantees.
 
 ## Contributing
 
