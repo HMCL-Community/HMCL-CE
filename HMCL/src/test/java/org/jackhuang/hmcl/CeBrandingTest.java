@@ -33,6 +33,12 @@ public final class CeBrandingTest {
         assertEquals("HMCL CE", Metadata.FULL_NAME);
     }
 
+    /// Ensures Windows treats HMCL CE as distinct from the upstream launcher on the taskbar.
+    @Test
+    public void exposesIndependentWindowsTaskbarIdentity() {
+        assertEquals("org.hmclcommunity.hmclce", Metadata.WINDOWS_APP_USER_MODEL_ID);
+    }
+
     /// Ensures every CE-owned launcher endpoint targets the HMCL Community repositories.
     @Test
     public void exposesHmclCommunityEndpoints() {
