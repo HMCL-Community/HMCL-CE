@@ -22,11 +22,12 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.google.gson.annotations.SerializedName;
-import org.jackhuang.hmcl.util.gson.JsonUtils;
-import org.jetbrains.annotations.NotNullByDefault;
 import org.jackhuang.hmcl.plugin.runtime.PluginAbi;
 import org.jackhuang.hmcl.plugin.runtime.PluginPlatformTarget;
 import org.jackhuang.hmcl.plugin.runtime.PluginRuntimeTypes;
+import org.jackhuang.hmcl.util.gson.JsonUtils;
+import org.jackhuang.hmcl.util.gson.LowerCaseEnumTypeAdapter;
+import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
 
@@ -779,13 +780,6 @@ public final class PluginManifest {
     public static PluginManifest fromJson(Reader reader) throws IOException, JsonParseException {
         @Nullable JsonElement json = JsonParser.parseReader(reader);
         @Nullable JsonObject root = json != null && json.isJsonObject() ? json.getAsJsonObject() : null;
-        if (root != null && root.has("abi") && root.get("abi").isJsonNull()) {
-            throw new IOException("Plugin manifest abi cannot be null");
-        }
-        if (root != null) {
-            requireKnownHookTokens(root);
-            requireKnownPatchTypeTokens(root);
-        }
         @Nullable PluginManifest manifest = JsonUtils.GSON.fromJson(json, PluginManifest.class);
         if (manifest == null) {
             throw new IOException("Plugin manifest is empty");
@@ -799,6 +793,13 @@ public final class PluginManifest {
         manifest.platformsDeclared = root != null && root.has("platforms");
         manifest.hooksDeclared = root != null && root.has("hooks");
         manifest.patchesDeclared = root != null && root.has("patches");
+        if (manifest.schemaVersion == CURRENT_SCHEMA_VERSION && root != null) {
+            if (root.has("abi") && root.get("abi").isJsonNull()) {
+                throw new IOException("Plugin manifest abi cannot be null");
+            }
+            requireKnownHookTokens(root);
+            requireKnownPatchTypeTokens(root);
+        }
         manifest.validate();
         return manifest;
     }
@@ -817,7 +818,7 @@ public final class PluginManifest {
         for (JsonElement candidate : hooksValue.getAsJsonArray()) {
             if (candidate.isJsonPrimitive() && candidate.getAsJsonPrimitive().isString()) {
                 String token = candidate.getAsString();
-                if (!isKnownEnumToken(PluginHookPoint.class, token)) {
+                if (LowerCaseEnumTypeAdapter.fromJson(PluginHookPoint.class, token) == null) {
                     throw new IOException("Unknown plugin hook point: " + token);
                 }
             }
@@ -842,25 +843,11 @@ public final class PluginManifest {
             @Nullable JsonElement typeValue = candidate.getAsJsonObject().get("type");
             if (typeValue != null && typeValue.isJsonPrimitive() && typeValue.getAsJsonPrimitive().isString()) {
                 String token = typeValue.getAsString();
-                if (!isKnownEnumToken(PluginPatchDeclaration.PatchType.class, token)) {
+                if (LowerCaseEnumTypeAdapter.fromJson(PluginPatchDeclaration.PatchType.class, token) == null) {
                     throw new IOException("Unknown plugin patch type: " + token);
                 }
             }
         }
-    }
-
-    /// Tests a raw token against the stable representation of an enum's constants.
-    ///
-    /// @param type enum class whose constants are accepted
-    /// @param token raw JSON string token
-    /// @return whether the token names a constant, ignoring case as the shared Gson adapter does
-    private static <E extends Enum<E>> boolean isKnownEnumToken(Class<E> type, String token) {
-        for (E constant : type.getEnumConstants()) {
-            if (constant.toString().equalsIgnoreCase(token)) {
-                return true;
-            }
-        }
-        return false;
     }
 
     /// Returns whether a nullable string is a structurally valid plugin ID.

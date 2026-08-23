@@ -290,6 +290,20 @@ public final class PluginManifestTest {
         assertEquals("org.example.Outer$Inner", declaration.getTarget());
     }
 
+    /// Accepts ordinary and compiler-generated Java method names containing dollar signs.
+    @Test
+    public void acceptGeneratedJavaPatchMethodNames() {
+        for (String method : List.of("launch", "access$000", "lambda$launch$0", "launch$default")) {
+            PluginPatchDeclaration declaration = new PluginPatchDeclaration(
+                    "org.example.GameLaunchService",
+                    method,
+                    PluginPatchDeclaration.PatchType.BEFORE,
+                    List.of());
+
+            assertEquals(method, declaration.getMethod());
+        }
+    }
+
     /// Rejects patch declarations with missing, null, or malformed fields.
     @Test
     public void rejectInvalidPatchDeclarationFields() {
@@ -307,6 +321,10 @@ public final class PluginManifestTest {
                 """);
         assertPatchRejected("""
                 {"target": "org.jackhuang.hmcl.Launcher", "method": "bad-method", "type": "before",
+                 "parameters": []}
+                """);
+        assertPatchRejected("""
+                {"target": "org.jackhuang.hmcl.Launcher", "method": " ", "type": "before",
                  "parameters": []}
                 """);
         assertPatchRejected("""
@@ -462,6 +480,32 @@ public final class PluginManifestTest {
                         "\"runtime\": \"java\", \"abi\": 2, \"hooks\": [\"around-launch\"]"))));
 
         assertTrue(exception.getMessage().contains("around-launch"));
+    }
+
+    /// Prioritizes unsupported schema diagnostics over raw schema-v5 capability token checks.
+    @Test
+    public void prioritizeSchemaVersionDiagnosticsBeforeCapabilityTokens() {
+        IOException schemaFour = assertThrows(IOException.class, () -> PluginManifest.fromJson(new StringReader(
+                schemaFourWithDeclarations("""
+                        "permissions": [], "requiredPermissions": [], "launcherVersion": "*",
+                        "hooks": ["around-launch"]
+                        """))));
+        IOException schemaSixHook = assertThrows(IOException.class, () -> PluginManifest.fromJson(new StringReader(
+                schemaFiveWithDeclarations(
+                        "\"runtime\": \"java\", \"abi\": 2, \"hooks\": [\"around-launch\"]")
+                        .replace("\"schemaVersion\": 5", "\"schemaVersion\": 6"))));
+        IOException schemaSixPatch = assertThrows(IOException.class, () -> PluginManifest.fromJson(new StringReader(
+                schemaFiveWithDeclarations("""
+                        "runtime": "java", "abi": 2,
+                        "patches": [{"target": "org.example.GameLaunchService", "method": "launch",
+                                     "type": "around", "parameters": []}]
+                        """).replace("\"schemaVersion\": 5", "\"schemaVersion\": 6"))));
+
+        assertAll(
+                () -> assertTrue(schemaFour.getMessage().contains("schemaVersion")
+                        && schemaFour.getMessage().contains("schema-v5")),
+                () -> assertTrue(schemaSixHook.getMessage().contains("Unsupported plugin manifest schemaVersion: 6")),
+                () -> assertTrue(schemaSixPatch.getMessage().contains("Unsupported plugin manifest schemaVersion: 6")));
     }
 
     /// Rejects null, malformed, and duplicate schema-v5 patch declarations.

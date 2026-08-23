@@ -38,7 +38,7 @@ public final class PluginPatchDeclaration {
             "[a-zA-Z_$][a-zA-Z0-9_$]*(\\.[a-zA-Z_$][a-zA-Z0-9_$]*)+");
 
     /// Pattern accepted for Java method names.
-    private static final Pattern METHOD_PATTERN = Pattern.compile("[a-zA-Z_][a-zA-Z0-9_]*");
+    private static final Pattern METHOD_PATTERN = Pattern.compile("[a-zA-Z_$][a-zA-Z0-9_$]*");
 
     /// Fully-qualified launcher class whose method is patched.
     @SerializedName("target")
@@ -76,7 +76,7 @@ public final class PluginPatchDeclaration {
 
     /// Validates the declaration, throwing on malformed entries.
     ///
-    /// @throws IllegalArgumentException when target, method, or type is missing or malformed
+    /// @throws IllegalArgumentException when target, method, type, or parameters are missing or invalid
     public void validate() {
         if (target == null || !TARGET_PATTERN.matcher(target).matches()) {
             throw new IllegalArgumentException("Invalid patch target class: " + target);
@@ -116,6 +116,7 @@ public final class PluginPatchDeclaration {
     /// Returns the ordered parameter descriptors that identify the patched overload.
     ///
     /// @return immutable ordered parameter descriptors
+    /// @throws IllegalStateException if the parameter declaration is missing from an unvalidated declaration
     public @Unmodifiable List<String> getParameters() {
         @Nullable List<@Nullable String> values = parameters;
         if (values == null) {
