@@ -170,6 +170,7 @@ public final class PluginStoreAggregator implements AutoCloseable {
                 elapsedMillis(startedAt),
                 items,
                 partialFailureCount,
+                manager.getSkippedRepositoryCount(),
                 registry,
                 manager
         );

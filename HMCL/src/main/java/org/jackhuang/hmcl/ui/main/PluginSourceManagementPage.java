@@ -572,6 +572,7 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
                 Math.max(0, (System.nanoTime() - startedAt) / 1_000_000),
                 items,
                 partialFailures,
+                manager.getSkippedRepositoryCount(),
                 registry,
                 manager
         );

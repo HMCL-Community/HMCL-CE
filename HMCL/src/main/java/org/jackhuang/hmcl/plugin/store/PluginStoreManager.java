@@ -151,6 +151,9 @@ public final class PluginStoreManager {
     /// Legacy online status cache retained only for explicit compatibility fixtures.
     private final @Nullable PluginTrustStatusCache trustStatusCache;
 
+    /// Raw-content base used for GitHub Topic repository manifests.
+    private final String githubRawBaseUrl;
+
     /// README cache retained only for the historical explicit-manifest API before a source has loaded.
     private final Map<String, String> unloadedReadmeCache = new ConcurrentHashMap<>();
 
@@ -172,6 +175,9 @@ public final class PluginStoreManager {
         /// Externally established GitHub identities by manifest URL.
         private final Map<String, String> repositoryIdentities = new ConcurrentHashMap<>();
 
+        /// Topic repositories excluded before they could become registry entries.
+        private final int skippedRepositoryCount;
+
         /// Trust results bound to manifests in this source generation.
         private final Map<String, PluginTrustResult> manifestTrust = new ConcurrentHashMap<>();
 
@@ -188,26 +194,49 @@ public final class PluginStoreManager {
         ///
         /// @param source immutable source configuration
         /// @param registry validated registry
+        /// @param registryTrust trust result for the registry document
+        /// @param prefetchedManifestContents raw manifests prefetched during Topic discovery
+        /// @param repositoryIdentities externally established repository identities by manifest URL
+        /// @param skippedRepositoryCount Topic repositories excluded before registry publication
         private SourceContext(
                 PluginSource source,
                 PluginStoreRegistry registry,
                 PluginTrustResult registryTrust,
                 Map<String, String> prefetchedManifestContents,
-                Map<String, String> repositoryIdentities
+                Map<String, String> repositoryIdentities,
+                int skippedRepositoryCount
         ) {
+            if (skippedRepositoryCount < 0) {
+                throw new IllegalArgumentException("skippedRepositoryCount must not be negative");
+            }
             this.source = source;
             this.registry = registry;
             this.registryTrust = registryTrust;
             this.prefetchedManifestContents.putAll(prefetchedManifestContents);
             this.repositoryIdentities.putAll(repositoryIdentities);
+            this.skippedRepositoryCount = skippedRepositoryCount;
         }
     }
 
     /// Creates an unloaded source-scoped store client.
     public PluginStoreManager() {
+        this(loadDefaultTrustVerifier(), null, GITHUB_RAW_BASE_URL);
+    }
+
+    /// Creates an unloaded client with an explicit GitHub raw-content base for package-local tests.
+    ///
+    /// @param githubRawBaseUrl raw-content base used for Topic repository manifests
+    PluginStoreManager(String githubRawBaseUrl) {
+        this(loadDefaultTrustVerifier(), null, githubRawBaseUrl);
+    }
+
+    /// Loads the embedded plugin trust root for a new store manager.
+    ///
+    /// @return configured trust verifier
+    /// @throws IllegalStateException if the embedded trust root cannot be loaded
+    private static PluginTrustVerifier loadDefaultTrustVerifier() {
         try {
-            trustVerifier = PluginTrustVerifier.loadDefault();
-            trustStatusCache = null;
+            return PluginTrustVerifier.loadDefault();
         } catch (IOException exception) {
             throw new IllegalStateException("Failed to load HMCL CE plugin trust root", exception);
         }
@@ -215,7 +244,7 @@ public final class PluginStoreManager {
 
     /// Creates a store manager with an explicit verifier for package-local tests.
     PluginStoreManager(PluginTrustVerifier trustVerifier) {
-        this(trustVerifier, null);
+        this(trustVerifier, null, GITHUB_RAW_BASE_URL);
     }
 
     /// Creates a store manager with explicit trust and status services for package-local tests.
@@ -223,8 +252,22 @@ public final class PluginStoreManager {
     /// @param trustVerifier role-separated signature verifier
     /// @param trustStatusCache legacy authenticated status cache, or `null` under the current policy
     PluginStoreManager(PluginTrustVerifier trustVerifier, @Nullable PluginTrustStatusCache trustStatusCache) {
+        this(trustVerifier, trustStatusCache, GITHUB_RAW_BASE_URL);
+    }
+
+    /// Creates a store manager with explicit trust, status, and Topic transport dependencies.
+    ///
+    /// @param trustVerifier role-separated signature verifier
+    /// @param trustStatusCache legacy authenticated status cache, or `null` under the current policy
+    /// @param githubRawBaseUrl raw-content base used for Topic repository manifests
+    private PluginStoreManager(
+            PluginTrustVerifier trustVerifier,
+            @Nullable PluginTrustStatusCache trustStatusCache,
+            String githubRawBaseUrl
+    ) {
         this.trustVerifier = Objects.requireNonNull(trustVerifier, "trustVerifier");
         this.trustStatusCache = trustStatusCache;
+        this.githubRawBaseUrl = Objects.requireNonNull(githubRawBaseUrl, "githubRawBaseUrl");
     }
 
     /// Loads and validates one plugin source without persisting user configuration.
@@ -236,7 +279,7 @@ public final class PluginStoreManager {
         if (source.isGitHubTopic()) {
             GitHubTopicDiscovery.Result discovery = new GitHubTopicDiscovery(
                     source.getUrl(),
-                    GITHUB_RAW_BASE_URL,
+                    githubRawBaseUrl,
                     "hmclce",
                     System.getProperty("hmcl.plugin_store.github_token"),
                     10
@@ -246,7 +289,8 @@ public final class PluginStoreManager {
                     discovery.registry(),
                     PluginTrustResult.community(),
                     discovery.manifestContents(),
-                    discovery.repositoryIdentities()
+                    discovery.repositoryIdentities(),
+                    discovery.skippedRepositoryCount()
             );
             return;
         }
@@ -261,7 +305,7 @@ public final class PluginStoreManager {
                 }
             }
         }
-        context = new SourceContext(source, loaded.registry(), loaded.trust(), Map.of(), identities);
+        context = new SourceContext(source, loaded.registry(), loaded.trust(), Map.of(), identities, 0);
     }
 
     /// Attempts a due root-controlled status refresh without making an offline source load fail.
@@ -283,6 +327,14 @@ public final class PluginStoreManager {
     /// @throws IllegalStateException if no source has loaded successfully
     public PluginSource getSource() {
         return requireContext().source;
+    }
+
+    /// Returns Topic repositories excluded before they could become source items.
+    ///
+    /// @return skipped repository count, or zero before loading and for ordinary registry sources
+    public int getSkippedRepositoryCount() {
+        @Nullable SourceContext currentContext = context;
+        return currentContext == null ? 0 : currentContext.skippedRepositoryCount;
     }
 
     /// Returns the current source context or rejects operations before a successful source load.

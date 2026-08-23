@@ -504,6 +504,11 @@ public final class PluginStoreManifest {
             if (version == null || version.isBlank()) {
                 throw new IOException("Plugin version entry has no version");
             }
+            try {
+                PluginVersion.compare(version, version);
+            } catch (IllegalArgumentException exception) {
+                throw new IOException("Plugin version entry has an invalid version", exception);
+            }
             if (packageUrl == null || packageUrl.isBlank()) {
                 throw new IOException("Plugin version " + version + " has no packageUrl");
             }

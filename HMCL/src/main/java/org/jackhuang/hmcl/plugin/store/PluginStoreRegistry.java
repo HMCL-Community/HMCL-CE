@@ -208,6 +208,8 @@ public final class PluginStoreRegistry {
         }
 
         /// Creates one synthetic entry whose repository identity came from GitHub API discovery.
+        ///
+        /// @throws IOException if the discovered entry metadata is invalid
         static PluginStoreEntry discovered(
                 String id,
                 String name,
@@ -215,7 +217,7 @@ public final class PluginStoreRegistry {
                 String description,
                 String manifestUrl,
                 String repository
-        ) {
+        ) throws IOException {
             PluginStoreEntry entry = new PluginStoreEntry();
             entry.id = id;
             entry.name = name;
@@ -225,6 +227,7 @@ public final class PluginStoreRegistry {
             entry.repository = repository;
             entry.tags = List.of("hmclce");
             entry.capabilities = List.of();
+            entry.validate();
             return entry;
         }
 

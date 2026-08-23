@@ -35,11 +35,15 @@ import java.net.URI;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+
+import static org.jackhuang.hmcl.util.logging.Logger.LOG;
 
 /// Discovers bounded plugin manifests from repositories carrying one GitHub Topic.
 @NotNullByDefault
@@ -86,11 +90,12 @@ public final class GitHubTopicDiscovery {
         this.maxPages = maxPages;
     }
 
-    /// Discovers repositories, fetches their default-branch manifests, and builds one synthetic registry.
+    /// Discovers repositories, logs and skips invalid or ambiguous candidates, and builds one synthetic registry.
     public Result discover() throws IOException {
-        List<PluginStoreRegistry.PluginStoreEntry> entries = new ArrayList<>();
-        Map<String, String> manifests = new LinkedHashMap<>();
-        Map<String, String> identities = new LinkedHashMap<>();
+        Map<String, DiscoveredRepository> candidatesByPluginId = new LinkedHashMap<>();
+        Set<String> conflictingPluginIds = new HashSet<>();
+        Set<String> seenRepositoryIdentities = new HashSet<>();
+        int skippedRepositoryCount = 0;
         for (int page = 1; page <= maxPages; page++) {
             String separator = searchUrl.contains("?") ? "&" : "?";
             String requestUrl = searchUrl + separator
@@ -99,35 +104,78 @@ public final class GitHubTopicDiscovery {
             JsonObject response = parseObject(fetch(requestUrl, MAX_API_BYTES, true), "GitHub Topic response");
             JsonArray repositories = requiredArray(response, "items");
             for (JsonElement repositoryElement : repositories) {
-                if (repositoryElement.isJsonObject()) {
-                    discoverRepository(repositoryElement.getAsJsonObject(), entries, manifests, identities);
+                if (!repositoryElement.isJsonObject()) {
+                    skippedRepositoryCount++;
+                    LOG.warning("Skipping a malformed repository result returned by GitHub Topic discovery");
+                    continue;
+                }
+                JsonObject repositoryObject = repositoryElement.getAsJsonObject();
+                String repositoryLabel = repositoryLabel(repositoryObject);
+                final @Nullable DiscoveredRepository repository;
+                try {
+                    repository = discoverRepository(repositoryObject);
+                } catch (IOException | IllegalArgumentException exception) {
+                    skippedRepositoryCount++;
+                    LOG.warning("Skipping invalid or unavailable GitHub Topic repository " + repositoryLabel);
+                    continue;
+                }
+                if (repository == null || !seenRepositoryIdentities.add(repository.repositoryIdentity())) {
+                    continue;
+                }
+                String pluginId = repository.entry().getId();
+                if (conflictingPluginIds.contains(pluginId)) {
+                    skippedRepositoryCount++;
+                    LOG.warning("Excluding another GitHub Topic repository claiming ambiguous plugin ID "
+                            + pluginId + ": " + repository.repositoryIdentity());
+                    continue;
+                }
+                @Nullable DiscoveredRepository previous = candidatesByPluginId.putIfAbsent(pluginId, repository);
+                if (previous != null) {
+                    candidatesByPluginId.remove(pluginId);
+                    conflictingPluginIds.add(pluginId);
+                    skippedRepositoryCount += 2;
+                    LOG.warning("Excluding ambiguous GitHub Topic plugin ID " + pluginId + " claimed by "
+                            + previous.repositoryIdentity() + " and " + repository.repositoryIdentity());
                 }
             }
             if (repositories.size() < 100) {
                 break;
             }
         }
+        List<PluginStoreRegistry.PluginStoreEntry> entries = new ArrayList<>();
+        Map<String, String> manifests = new LinkedHashMap<>();
+        Map<String, String> identities = new LinkedHashMap<>();
+        for (DiscoveredRepository repository : candidatesByPluginId.values()) {
+            entries.add(repository.entry());
+            manifests.put(repository.manifestUrl(), repository.manifestContent());
+            identities.put(repository.manifestUrl(), repository.repositoryIdentity());
+        }
         PluginStoreRegistry registry = PluginStoreRegistry.discovered("GitHub Topic: " + topic, entries);
         registry.validate();
-        return new Result(registry, manifests, identities);
+        return new Result(registry, manifests, identities, skippedRepositoryCount);
     }
 
-    /// Loads one eligible repository manifest and appends its synthetic store entry.
-    private void discoverRepository(
-            JsonObject repository,
-            List<PluginStoreRegistry.PluginStoreEntry> entries,
-            Map<String, String> manifests,
-            Map<String, String> identities
-    ) throws IOException {
+    /// Resolves one eligible repository without publishing partial state.
+    ///
+    /// @param repository GitHub repository search result
+    /// @return fully resolved candidate, or `null` when the repository is excluded
+    /// @throws IOException if repository metadata or its manifest cannot be loaded
+    private @Nullable DiscoveredRepository discoverRepository(JsonObject repository) throws IOException {
         if (optionalBoolean(repository, "archived")
                 || optionalBoolean(repository, "disabled")
                 || optionalBoolean(repository, "fork")) {
-            return;
+            return null;
         }
         String fullName = requiredString(repository, "full_name");
         String[] identityParts = fullName.split("/", -1);
         if (identityParts.length != 2 || identityParts[0].isBlank() || identityParts[1].isBlank()) {
             throw new IOException("GitHub Topic result contains an invalid full_name");
+        }
+        String expectedRepositoryIdentity = PluginTrustVerifier.normalizeRepository("github.com/" + fullName);
+        String repositoryUrl = requiredString(repository, "html_url");
+        String repositoryIdentity = PluginTrustVerifier.normalizeRepository(repositoryUrl);
+        if (!expectedRepositoryIdentity.equals(repositoryIdentity)) {
+            throw new IOException("GitHub Topic result has mismatched repository identities");
         }
         String defaultBranch = requiredString(repository, "default_branch");
         String manifestUrl = rawBaseUrl + "/" + encodePath(identityParts[0]) + "/" + encodePath(identityParts[1])
@@ -138,19 +186,44 @@ public final class GitHubTopicDiscovery {
                 ? manifestDocument.getAsJsonObject("signed")
                 : manifestDocument;
         String pluginId = requiredString(payload, "id");
-        String repositoryUrl = requiredString(repository, "html_url");
         String displayName = optionalString(repository, "name", pluginId);
         String description = optionalString(repository, "description", "");
-        entries.add(PluginStoreRegistry.PluginStoreEntry.discovered(
+        PluginStoreRegistry.PluginStoreEntry entry = PluginStoreRegistry.PluginStoreEntry.discovered(
                 pluginId,
                 displayName,
                 identityParts[0],
                 description,
                 manifestUrl,
                 repositoryUrl
-        ));
-        manifests.put(manifestUrl, manifestContent);
-        identities.put(manifestUrl, PluginTrustVerifier.normalizeRepository(repositoryUrl));
+        );
+        return new DiscoveredRepository(entry, manifestUrl, manifestContent, repositoryIdentity);
+    }
+
+    /// Returns a safe normalized repository label for diagnostics without trusting descriptive API metadata.
+    ///
+    /// @param repository GitHub repository search result
+    /// @return normalized repository identity, or a generic label when `full_name` is invalid
+    private static String repositoryLabel(JsonObject repository) {
+        try {
+            return PluginTrustVerifier.normalizeRepository("github.com/" + requiredString(repository, "full_name"));
+        } catch (IOException | IllegalArgumentException exception) {
+            return "unknown GitHub repository";
+        }
+    }
+
+    /// Fully resolved repository candidate ready for atomic publication.
+    ///
+    /// @param entry synthetic registry entry
+    /// @param manifestUrl raw default-branch manifest URL
+    /// @param manifestContent exact fetched manifest content
+    /// @param repositoryIdentity normalized GitHub repository identity
+    @NotNullByDefault
+    private record DiscoveredRepository(
+            PluginStoreRegistry.PluginStoreEntry entry,
+            String manifestUrl,
+            String manifestContent,
+            String repositoryIdentity
+    ) {
     }
 
     /// Fetches one bounded UTF-8 response and sends the token only for explicit API requests.
@@ -264,16 +337,25 @@ public final class GitHubTopicDiscovery {
     }
 
     /// Immutable synthetic registry plus source-bound fetched manifest state.
+    ///
+    /// @param registry validated synthetic Topic registry
+    /// @param manifestContents prefetched manifests by raw URL
+    /// @param repositoryIdentities normalized GitHub identities by raw manifest URL
+    /// @param skippedRepositoryCount invalid, unavailable, or ambiguous repositories excluded from the registry
     public record Result(
             PluginStoreRegistry registry,
             @Unmodifiable Map<String, String> manifestContents,
-            @Unmodifiable Map<String, String> repositoryIdentities
+            @Unmodifiable Map<String, String> repositoryIdentities,
+            int skippedRepositoryCount
     ) {
         /// Defensively copies one discovery result.
         public Result {
             Objects.requireNonNull(registry, "registry");
             manifestContents = Map.copyOf(manifestContents);
             repositoryIdentities = Map.copyOf(repositoryIdentities);
+            if (skippedRepositoryCount < 0) {
+                throw new IllegalArgumentException("skippedRepositoryCount must not be negative");
+            }
         }
     }
 }
