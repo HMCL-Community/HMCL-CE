@@ -480,7 +480,7 @@
     -fx-padding: 0;
 }
 
-.launch-pane > .jfx-button, .jfx-button * {
+.launch-pane > .jfx-button, .launch-pane > .jfx-button * {
     -fx-text-fill: -monet-on-primary-container;
     -fx-font-size: 14px;
 }
@@ -858,6 +858,11 @@
 .jfx-button {
     -jfx-disable-visual-focus: true;
     -fx-cursor: hand;
+    -fx-text-fill: -monet-on-surface;
+}
+
+.jfx-button * {
+    -fx-text-fill: -monet-on-surface;
 }
 
 .jfx-button .jfx-rippler {
