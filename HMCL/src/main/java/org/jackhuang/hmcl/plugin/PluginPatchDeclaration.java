@@ -34,7 +34,8 @@ import java.util.regex.Pattern;
 @NotNullByDefault
 public final class PluginPatchDeclaration {
     /// Pattern accepted for fully-qualified binary class names such as org.hmcl.core.GameLaunchService.
-    private static final Pattern TARGET_PATTERN = Pattern.compile("[a-zA-Z_][a-zA-Z0-9_]*(\\.[a-zA-Z_][a-zA-Z0-9_]*)+");
+    private static final Pattern TARGET_PATTERN = Pattern.compile(
+            "[a-zA-Z_$][a-zA-Z0-9_$]*(\\.[a-zA-Z_$][a-zA-Z0-9_$]*)+");
 
     /// Pattern accepted for Java method names.
     private static final Pattern METHOD_PATTERN = Pattern.compile("[a-zA-Z_][a-zA-Z0-9_]*");
@@ -117,7 +118,10 @@ public final class PluginPatchDeclaration {
     /// @return immutable ordered parameter descriptors
     public @Unmodifiable List<String> getParameters() {
         @Nullable List<@Nullable String> values = parameters;
-        if (values == null || values.isEmpty()) {
+        if (values == null) {
+            throw new IllegalStateException("Patch declaration has no parameters");
+        }
+        if (values.isEmpty()) {
             return List.of();
         }
         return values.stream().map(Objects::requireNonNull).toList();

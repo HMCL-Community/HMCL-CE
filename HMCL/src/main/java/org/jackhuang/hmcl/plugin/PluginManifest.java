@@ -470,13 +470,13 @@ public final class PluginManifest {
         return platforms != null && !platforms.isEmpty();
     }
 
-    /// Returns an immutable snapshot of canonical schema-v5 platform target identifiers.
+    /// Returns a sorted immutable snapshot of canonical schema-v5 platform target identifiers.
     public @Unmodifiable List<String> getPlatforms() {
         @Nullable List<@Nullable String> values = platforms;
         if (values == null || values.isEmpty()) {
             return List.of();
         }
-        return values.stream().map(Objects::requireNonNull).toList();
+        return values.stream().map(Objects::requireNonNull).sorted().toList();
     }
 
     /// Returns an immutable snapshot of declared lifecycle hook points.
@@ -635,7 +635,7 @@ public final class PluginManifest {
                 try {
                     patch.validate();
                 } catch (IllegalArgumentException exception) {
-                    throw new IOException("Invalid plugin patch declaration", exception);
+                    throw new IOException("Invalid plugin patch declaration: " + exception.getMessage(), exception);
                 }
                 if (!seenPatches.add(patch)) {
                     throw new IOException("Duplicate plugin patch declaration: "
@@ -782,6 +782,10 @@ public final class PluginManifest {
         if (root != null && root.has("abi") && root.get("abi").isJsonNull()) {
             throw new IOException("Plugin manifest abi cannot be null");
         }
+        if (root != null) {
+            requireKnownHookTokens(root);
+            requireKnownPatchTypeTokens(root);
+        }
         @Nullable PluginManifest manifest = JsonUtils.GSON.fromJson(json, PluginManifest.class);
         if (manifest == null) {
             throw new IOException("Plugin manifest is empty");
@@ -797,6 +801,66 @@ public final class PluginManifest {
         manifest.patchesDeclared = root != null && root.has("patches");
         manifest.validate();
         return manifest;
+    }
+
+    /// Rejects unknown string hook identifiers before enum deserialization loses the source token.
+    ///
+    /// Other malformed hook representations remain the responsibility of normal manifest validation.
+    ///
+    /// @param root parsed manifest root
+    /// @throws IOException if a hook string does not identify a supported lifecycle point
+    private static void requireKnownHookTokens(JsonObject root) throws IOException {
+        @Nullable JsonElement hooksValue = root.get("hooks");
+        if (hooksValue == null || !hooksValue.isJsonArray()) {
+            return;
+        }
+        for (JsonElement candidate : hooksValue.getAsJsonArray()) {
+            if (candidate.isJsonPrimitive() && candidate.getAsJsonPrimitive().isString()) {
+                String token = candidate.getAsString();
+                if (!isKnownEnumToken(PluginHookPoint.class, token)) {
+                    throw new IOException("Unknown plugin hook point: " + token);
+                }
+            }
+        }
+    }
+
+    /// Rejects unknown string patch types before enum deserialization loses the source token.
+    ///
+    /// Other malformed patch representations remain the responsibility of normal manifest validation.
+    ///
+    /// @param root parsed manifest root
+    /// @throws IOException if a patch type string does not identify a supported callback position
+    private static void requireKnownPatchTypeTokens(JsonObject root) throws IOException {
+        @Nullable JsonElement patchesValue = root.get("patches");
+        if (patchesValue == null || !patchesValue.isJsonArray()) {
+            return;
+        }
+        for (JsonElement candidate : patchesValue.getAsJsonArray()) {
+            if (!candidate.isJsonObject()) {
+                continue;
+            }
+            @Nullable JsonElement typeValue = candidate.getAsJsonObject().get("type");
+            if (typeValue != null && typeValue.isJsonPrimitive() && typeValue.getAsJsonPrimitive().isString()) {
+                String token = typeValue.getAsString();
+                if (!isKnownEnumToken(PluginPatchDeclaration.PatchType.class, token)) {
+                    throw new IOException("Unknown plugin patch type: " + token);
+                }
+            }
+        }
+    }
+
+    /// Tests a raw token against the stable representation of an enum's constants.
+    ///
+    /// @param type enum class whose constants are accepted
+    /// @param token raw JSON string token
+    /// @return whether the token names a constant, ignoring case as the shared Gson adapter does
+    private static <E extends Enum<E>> boolean isKnownEnumToken(Class<E> type, String token) {
+        for (E constant : type.getEnumConstants()) {
+            if (constant.toString().equalsIgnoreCase(token)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /// Returns whether a nullable string is a structurally valid plugin ID.

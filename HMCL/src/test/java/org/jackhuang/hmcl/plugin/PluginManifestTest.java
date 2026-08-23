@@ -28,6 +28,7 @@ import java.io.StringReader;
 import java.util.ArrayList;
 import java.util.List;
 
+import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -234,6 +235,20 @@ public final class PluginManifestTest {
         assertThrows(UnsupportedOperationException.class, () -> restricted.getPlatforms().add("macos"));
     }
 
+    /// Normalizes platform declaration order for deterministic manifest value identity.
+    @Test
+    public void comparePlatformSetsIndependentOfDeclarationOrder() throws IOException {
+        PluginManifest first = PluginManifest.fromJson(new StringReader(schemaFiveWithDeclarations(
+                "\"runtime\": \"java\", \"abi\": 2, \"platforms\": [\"linux\", \"windows-x64\"]")));
+        PluginManifest reversed = PluginManifest.fromJson(new StringReader(schemaFiveWithDeclarations(
+                "\"runtime\": \"java\", \"abi\": 2, \"platforms\": [\"windows-x64\", \"linux\"]")));
+
+        assertEquals(List.of("linux", "windows-x64"), first.getPlatforms());
+        assertEquals(first.getPlatforms(), reversed.getPlatforms());
+        assertEquals(first, reversed);
+        assertEquals(first.hashCode(), reversed.hashCode());
+    }
+
     /// Requires every patch declaration to contain an explicit ordered parameter array.
     @Test
     public void requirePatchParameters() {
@@ -246,6 +261,33 @@ public final class PluginManifestTest {
                 """, PluginPatchDeclaration.class);
 
         assertThrows(IllegalArgumentException.class, declaration::validate);
+    }
+
+    /// Distinguishes a missing parameter declaration from an explicit no-argument overload.
+    @Test
+    public void distinguishMissingFromEmptyPatchParameters() {
+        PluginPatchDeclaration missing = new PluginPatchDeclaration();
+        PluginPatchDeclaration noArguments = new PluginPatchDeclaration(
+                "org.example.GameLaunchService",
+                "launch",
+                PluginPatchDeclaration.PatchType.BEFORE,
+                List.of());
+
+        assertThrows(IllegalStateException.class, missing::getParameters);
+        assertEquals(List.of(), noArguments.getParameters());
+        assertThrows(UnsupportedOperationException.class, () -> noArguments.getParameters().add("int"));
+    }
+
+    /// Accepts Java binary names for nested classes as patch targets.
+    @Test
+    public void acceptNestedClassBinaryPatchTarget() {
+        PluginPatchDeclaration declaration = new PluginPatchDeclaration(
+                "org.example.Outer$Inner",
+                "launch",
+                PluginPatchDeclaration.PatchType.BEFORE,
+                List.of());
+
+        assertEquals("org.example.Outer$Inner", declaration.getTarget());
     }
 
     /// Rejects patch declarations with missing, null, or malformed fields.
@@ -412,6 +454,16 @@ public final class PluginManifestTest {
                         + "\"hooks\": [\"before-download\", \"before-download\"]"));
     }
 
+    /// Identifies an unknown lifecycle hook token in manifest diagnostics.
+    @Test
+    public void reportUnknownManifestHookToken() {
+        IOException exception = assertThrows(IOException.class, () -> PluginManifest.fromJson(new StringReader(
+                schemaFiveWithDeclarations(
+                        "\"runtime\": \"java\", \"abi\": 2, \"hooks\": [\"around-launch\"]"))));
+
+        assertTrue(exception.getMessage().contains("around-launch"));
+    }
+
     /// Rejects null, malformed, and duplicate schema-v5 patch declarations.
     @Test
     public void rejectInvalidManifestPatches() {
@@ -433,6 +485,40 @@ public final class PluginManifestTest {
                    "type": "before", "parameters": ["java.lang.String"]}
                 ]
                 """));
+    }
+
+    /// Identifies an unknown patch type token in manifest diagnostics.
+    @Test
+    public void reportUnknownManifestPatchTypeToken() {
+        IOException exception = assertThrows(IOException.class, () -> PluginManifest.fromJson(new StringReader(
+                schemaFiveWithDeclarations("""
+                        "runtime": "java", "abi": 2,
+                        "patches": [{"target": "org.example.GameLaunchService", "method": "launch",
+                                     "type": "around", "parameters": []}]
+                        """))));
+
+        assertTrue(exception.getMessage().contains("around"));
+    }
+
+    /// Reports malformed patch member values while retaining their validation causes.
+    @Test
+    public void reportMalformedManifestPatchMembers() {
+        IOException targetException = assertThrows(IOException.class, () -> PluginManifest.fromJson(new StringReader(
+                schemaFiveWithCapabilities("[\"launcher-patch\"]", "[\"launcher-patch\"]", """
+                        "patches": [{"target": "GameLaunchService", "method": "launch",
+                                     "type": "before", "parameters": []}]
+                        """))));
+        IOException methodException = assertThrows(IOException.class, () -> PluginManifest.fromJson(new StringReader(
+                schemaFiveWithCapabilities("[\"launcher-patch\"]", "[\"launcher-patch\"]", """
+                        "patches": [{"target": "org.example.GameLaunchService", "method": "bad-method",
+                                     "type": "before", "parameters": []}]
+                        """))));
+
+        assertAll(
+                () -> assertTrue(targetException.getMessage().contains("GameLaunchService")),
+                () -> assertTrue(targetException.getCause() instanceof IllegalArgumentException),
+                () -> assertTrue(methodException.getMessage().contains("bad-method")),
+                () -> assertTrue(methodException.getCause() instanceof IllegalArgumentException));
     }
 
     /// Requires hook and patch permissions to be both declared and required.
