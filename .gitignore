@@ -82,3 +82,6 @@ language-subtag-registry
 
 # Local launcher artifacts
 /HMCL-*.jar
+
+# Bundled CE launcher header
+!HMCL/launcher/HMCLauncher.exe

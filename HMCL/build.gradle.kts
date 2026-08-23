@@ -38,7 +38,9 @@ val buildVersion = System.getenv("BUILD_VERSION")?.takeIf(String::isNotBlank)
 val microsoftAuthId = System.getenv("MICROSOFT_AUTH_ID") ?: ""
 val curseForgeApiKey = System.getenv("CURSEFORGE_API_KEY") ?: ""
 
-val launcherExe = System.getenv("HMCL_LAUNCHER_EXE") ?: ""
+val launcherExe = System.getenv("HMCL_LAUNCHER_EXE")
+    ?.takeIf(String::isNotBlank)
+    ?: layout.projectDirectory.file("launcher/HMCLauncher.exe").asFile.path
 
 if (buildVersion != null) {
     version = buildVersion
@@ -72,10 +74,6 @@ dependencies {
     implementation(libs.asm.util)
 
     testImplementation(libs.jimfs)
-
-    if (launcherExe.isBlank()) {
-        implementation(libs.hmclauncher)
-    }
 
     embedResources(libs.authlib.injector)
     embedResources(libs.lwjgl.unsafe.agent)
