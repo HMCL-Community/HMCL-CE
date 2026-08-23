@@ -252,6 +252,47 @@ public final class PluginStoreManifestTest {
         assertNull(manifest.getVersion("1.10"));
     }
 
+    /// Rejects a version string that cannot participate in plugin version ordering.
+    @Test
+    public void rejectUnsortablePluginVersion() {
+        assertThrows(IOException.class, () -> parseManifest("dev.hmclce.test.invalid-version", """
+                {
+                  "schemaVersion": 2,
+                  "id": "dev.hmclce.test.invalid-version",
+                  "versions": [{
+                    "version": "garbage",
+                    "packageUrl": "https://example.com/plugin.npl",
+                    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "pluginApiVersion": 2,
+                    "size": 1024
+                  }]
+                }
+                """));
+    }
+
+    /// Accepts a comparable semantic plugin version during manifest validation.
+    @Test
+    public void acceptComparablePluginVersion() throws IOException {
+        PluginStoreManifest manifest = parseManifest("dev.hmclce.test.valid-version", """
+                {
+                  "schemaVersion": 2,
+                  "id": "dev.hmclce.test.valid-version",
+                  "versions": [{
+                    "version": "1.2.3-beta.1+build.5",
+                    "packageUrl": "https://example.com/plugin.npl",
+                    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "pluginApiVersion": 2,
+                    "size": 1024
+                  }]
+                }
+                """);
+
+        assertEquals(
+                "1.2.3-beta.1+build.5",
+                Objects.requireNonNull(manifest.getLatestVersion()).getVersion()
+        );
+    }
+
     /// Rejects missing, unknown, and duplicate permission declarations for API-v3 packages.
     @Test
     public void rejectInvalidPermissionDeclarations() {

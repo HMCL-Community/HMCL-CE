@@ -572,6 +572,7 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
                 Math.max(0, (System.nanoTime() - startedAt) / 1_000_000),
                 items,
                 partialFailures,
+                manager.getSkippedRepositoryCount(),
                 registry,
                 manager
         );
@@ -1117,7 +1118,7 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
         /// Elapsed latest source request duration.
         private final long durationMillis;
 
-        /// Number of repository manifests that failed in an otherwise successful source result.
+        /// Number of unavailable repository candidates or plugin entries in an otherwise successful source result.
         private final int partialManifestFailures;
 
         /// Number of aggregate winner conflicts involving this source.
@@ -1138,7 +1139,7 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
         /// @param failureMessage optional sanitized source failure reason
         /// @param pluginCount number of source items in the latest result
         /// @param durationMillis elapsed latest source request duration
-        /// @param partialManifestFailures number of partial manifest failures
+        /// @param partialManifestFailures number of unavailable repository candidates or plugin entries
         /// @param conflicts number of aggregate winner conflicts involving this source
         private SourceDetails(
                 String title,

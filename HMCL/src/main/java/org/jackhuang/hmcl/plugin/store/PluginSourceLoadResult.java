@@ -48,7 +48,7 @@ public final class PluginSourceLoadResult {
     /// Source-bound items published by a successfully loaded registry.
     private final @Unmodifiable List<PluginStoreItem> items;
 
-    /// Number of registry items whose repository manifests could not be resolved.
+    /// Total repository candidates or registry items unavailable from an otherwise loaded source.
     private final int partialManifestFailureCount;
 
     /// Validated source registry when the registry request succeeded.
@@ -69,7 +69,7 @@ public final class PluginSourceLoadResult {
     /// @param status source result status
     /// @param durationMillis elapsed load duration in milliseconds
     /// @param items source-bound loaded items
-    /// @param partialManifestFailureCount failed repository manifest count
+    /// @param partialManifestFailureCount total unavailable repository count
     /// @param registry validated source registry, when present
     /// @param manager source-scoped item manager, when present
     /// @param failure full source failure, when present
@@ -125,21 +125,60 @@ public final class PluginSourceLoadResult {
             PluginStoreRegistry registry,
             PluginStoreManager manager
     ) {
+        return success(
+                source,
+                durationMillis,
+                items,
+                partialManifestFailureCount,
+                0,
+                registry,
+                manager
+        );
+    }
+
+    /// Returns a full or partial successful load result including repositories skipped before registry publication.
+    ///
+    /// @param source loaded source configuration
+    /// @param durationMillis elapsed load duration in milliseconds
+    /// @param items source-bound loaded items
+    /// @param unresolvedItemCount published registry items whose manifests are unavailable
+    /// @param skippedRepositoryCount repositories excluded before they could become registry items
+    /// @param registry validated source registry
+    /// @param manager source-scoped manager bound to the returned items
+    /// @return successful source result
+    public static PluginSourceLoadResult success(
+            PluginSource source,
+            long durationMillis,
+            @Unmodifiable List<PluginStoreItem> items,
+            int unresolvedItemCount,
+            int skippedRepositoryCount,
+            PluginStoreRegistry registry,
+            PluginStoreManager manager
+    ) {
         Objects.requireNonNull(registry, "registry");
         Objects.requireNonNull(manager, "manager");
         long actualPartialManifestFailureCount = items.stream().filter(item -> item.getManifest() == null).count();
-        if (partialManifestFailureCount != actualPartialManifestFailureCount) {
+        if (unresolvedItemCount != actualPartialManifestFailureCount) {
             throw new IllegalArgumentException(
-                    "partialManifestFailureCount does not match items with unavailable manifests"
+                    "unresolvedItemCount does not match items with unavailable manifests"
             );
         }
-        Status status = partialManifestFailureCount == 0 ? Status.SUCCESS : Status.PARTIAL_FAILURE;
+        if (skippedRepositoryCount < 0) {
+            throw new IllegalArgumentException("skippedRepositoryCount must not be negative");
+        }
+        final int partialFailureCount;
+        try {
+            partialFailureCount = Math.addExact(unresolvedItemCount, skippedRepositoryCount);
+        } catch (ArithmeticException exception) {
+            throw new IllegalArgumentException("partial repository failure count overflow", exception);
+        }
+        Status status = partialFailureCount == 0 ? Status.SUCCESS : Status.PARTIAL_FAILURE;
         return new PluginSourceLoadResult(
                 source,
                 status,
                 durationMillis,
                 items,
-                partialManifestFailureCount,
+                partialFailureCount,
                 registry,
                 manager,
                 null
@@ -193,9 +232,9 @@ public final class PluginSourceLoadResult {
         return items;
     }
 
-    /// Returns the number of registry items without a resolved repository manifest.
+    /// Returns the total number of unavailable repositories, including candidates skipped before publication.
     ///
-    /// @return partial repository manifest failure count
+    /// @return total partial repository failure count
     public int getPartialManifestFailureCount() {
         return partialManifestFailureCount;
     }
@@ -266,10 +305,10 @@ public final class PluginSourceLoadResult {
         /// The configured source was disabled and made no request.
         DISABLED,
 
-        /// The registry and every repository manifest loaded successfully.
+        /// The registry and every repository candidate loaded successfully.
         SUCCESS,
 
-        /// The registry loaded but at least one repository manifest did not.
+        /// The registry loaded but at least one repository candidate or manifest did not.
         PARTIAL_FAILURE,
 
         /// The registry could not be loaded or validated.

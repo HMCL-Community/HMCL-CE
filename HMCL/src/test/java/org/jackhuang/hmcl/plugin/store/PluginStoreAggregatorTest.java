@@ -340,6 +340,96 @@ public final class PluginStoreAggregatorTest {
         }
     }
 
+    /// Isolates an unparseable repository version while retaining later valid items from the same source.
+    @Test
+    public void malformedVersionManifestDoesNotDiscardOtherSourceItems() throws Exception {
+        try (RegistryFixture fixture = RegistryFixture.startMalformedVersionWithValidRepository();
+             PluginStoreAggregator aggregator = new PluginStoreAggregator()) {
+            PluginStoreSnapshot snapshot = aggregator.refresh(List.of(
+                    source("mixed-manifests", fixture.registryUrl(), true)
+            )).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            PluginSourceLoadResult result = snapshot.getSourceResults().get(0);
+
+            assertEquals(PluginSourceLoadResult.Status.PARTIAL_FAILURE, result.getStatus());
+            assertEquals(1, result.getPartialManifestFailureCount());
+            assertEquals(2, result.getItems().size());
+            assertEquals("dev.test.malformed-version", result.getItems().get(0).getEntry().getId());
+            assertEquals(null, result.getItems().get(0).getManifest());
+            assertEquals("dev.test.valid-version", result.getItems().get(1).getEntry().getId());
+            assertEquals(
+                    "1.0.0",
+                    Objects.requireNonNull(result.getItems().get(1).getLatestVersion()).getVersion()
+            );
+            assertEquals(2, snapshot.getWinningItems().size());
+            assertTrue(snapshot.getFailures().isEmpty());
+        }
+    }
+
+    /// Keeps a Topic source usable when discovery and manifest resolution each reject one repository.
+    @Test
+    public void topicRepositoryFailuresRemainPartialAcrossTheFullSourcePipeline() throws Exception {
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/search/repositories", exchange -> respond(exchange, """
+                {
+                  "total_count": 3,
+                  "items": [{
+                    "full_name": "Example/Missing",
+                    "name": "Missing",
+                    "html_url": "https://github.com/Example/Missing",
+                    "default_branch": "main"
+                  }, {
+                    "full_name": "Example/Malformed",
+                    "name": "Malformed",
+                    "html_url": "https://github.com/Example/Malformed",
+                    "default_branch": "main"
+                  }, {
+                    "full_name": "Example/Available",
+                    "name": "Available",
+                    "html_url": "https://github.com/Example/Available",
+                    "default_branch": "main"
+                  }]
+                }
+                """.getBytes(StandardCharsets.UTF_8)));
+        server.createContext("/raw/Example/Malformed/main/manifest.json", exchange -> respond(
+                exchange,
+                RegistryFixture.manifestWithVersions("dev.test.malformed-topic", "garbage", "1.0.0")
+        ));
+        server.createContext("/raw/Example/Available/main/manifest.json", exchange -> respond(
+                exchange,
+                RegistryFixture.manifest("dev.test.available-topic", "1.0.0")
+        ));
+        server.start();
+        try {
+            String baseUrl = "http://127.0.0.1:" + server.getAddress().getPort();
+            PluginSource source = new PluginSource(
+                    PluginSource.HMCLCE_TOPIC_ID,
+                    baseUrl + "/search/repositories",
+                    null,
+                    true,
+                    false
+            );
+            try (PluginStoreAggregator aggregator = new PluginStoreAggregator(
+                    1,
+                    ignored -> new PluginStoreManager(baseUrl + "/raw")
+            )) {
+                PluginStoreSnapshot snapshot = aggregator.refresh(List.of(source))
+                        .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                PluginSourceLoadResult result = snapshot.getSourceResults().get(0);
+
+                assertEquals(PluginSourceLoadResult.Status.PARTIAL_FAILURE, result.getStatus());
+                assertEquals(2, result.getPartialManifestFailureCount());
+                assertEquals(2, result.getItems().size());
+                assertEquals(null, result.getItems().get(0).getManifest());
+                assertEquals("dev.test.available-topic", result.getItems().get(1).getEntry().getId());
+                assertEquals("1.0.0", Objects.requireNonNull(result.getItems().get(1).getLatestVersion()).getVersion());
+                assertTrue(snapshot.getWinningItems().containsKey("dev.test.available-topic"));
+                assertTrue(snapshot.getFailures().isEmpty());
+            }
+        } finally {
+            server.stop(0);
+        }
+    }
+
     /// Requires a snapshot's sources to exactly match the current persisted source configuration in order.
     @Test
     public void snapshotFreshnessIncludesEveryBehaviorRelevantSourceFieldAndOrder() {
@@ -468,6 +558,29 @@ public final class PluginStoreAggregatorTest {
             assertThrows(
                     IllegalArgumentException.class,
                     () -> PluginSourceLoadResult.success(source, 0, List.of(unresolved), 0, registry, manager)
+            );
+        }
+    }
+
+    /// Includes Topic repositories skipped before registry publication in the partial-failure status and count.
+    @Test
+    public void sourceResultCountsSkippedRepositoriesAsPartialFailures() throws Exception {
+        try (RegistryFixture fixture = RegistryFixture.start("Result", "dev.test.result", "1.0.0")) {
+            PluginSource source = source("result", fixture.registryUrl(), true);
+            PluginStoreManager manager = new PluginStoreManager();
+            manager.loadSource(source);
+            PluginStoreRegistry registry = Objects.requireNonNull(manager.getRegistry());
+            PluginStoreItem resolved = manager.getStoreItems().get(0);
+
+            PluginSourceLoadResult result = PluginSourceLoadResult.success(
+                    source, 0, List.of(resolved), 0, 1, registry, manager
+            );
+
+            assertEquals(PluginSourceLoadResult.Status.PARTIAL_FAILURE, result.getStatus());
+            assertEquals(1, result.getPartialManifestFailureCount());
+            assertThrows(
+                    IllegalArgumentException.class,
+                    () -> PluginSourceLoadResult.success(source, 0, List.of(resolved), 0, -1, registry, manager)
             );
         }
     }
@@ -855,6 +968,30 @@ public final class PluginStoreAggregatorTest {
             return new RegistryFixture(server, registryRequests);
         }
 
+        /// Starts one source with an unparseable-version manifest followed by a valid repository manifest.
+        ///
+        /// @return started mixed-validity fixture
+        /// @throws IOException if the local server cannot be created
+        private static RegistryFixture startMalformedVersionWithValidRepository() throws IOException {
+            HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            AtomicInteger registryRequests = new AtomicInteger();
+            String baseUrl = "http://127.0.0.1:" + server.getAddress().getPort();
+            server.createContext("/plugins.json", exchange -> {
+                registryRequests.incrementAndGet();
+                respond(exchange, registryWithMixedManifestValidity(baseUrl));
+            });
+            server.createContext("/malformed-manifest.json", exchange -> respond(
+                    exchange,
+                    manifestWithVersions("dev.test.malformed-version", "garbage", "1.0.0")
+            ));
+            server.createContext("/valid-manifest.json", exchange -> respond(
+                    exchange,
+                    manifest("dev.test.valid-version", "1.0.0")
+            ));
+            server.start();
+            return new RegistryFixture(server, registryRequests);
+        }
+
         /// Starts a registry request that waits until the test releases its shared request gate.
         ///
         /// @param registryName source-visible registry name
@@ -936,6 +1073,31 @@ public final class PluginStoreAggregatorTest {
                     """.formatted(name, pluginId, manifestUrl).getBytes(StandardCharsets.UTF_8);
         }
 
+        /// Serializes two repository entries whose manifests have different version validity.
+        ///
+        /// @param baseUrl local fixture origin
+        /// @return registry JSON bytes
+        private static byte @Unmodifiable [] registryWithMixedManifestValidity(String baseUrl) {
+            return """
+                    {
+                      "schemaVersion": 1,
+                      "name": "Mixed manifests",
+                      "plugins": [
+                        {
+                          "id": "dev.test.malformed-version",
+                          "name": "Malformed version",
+                          "manifestUrl": "%s/malformed-manifest.json"
+                        },
+                        {
+                          "id": "dev.test.valid-version",
+                          "name": "Valid version",
+                          "manifestUrl": "%s/valid-manifest.json"
+                        }
+                      ]
+                    }
+                    """.formatted(baseUrl, baseUrl).getBytes(StandardCharsets.UTF_8);
+        }
+
         /// Serializes an empty registry for request-concurrency tests.
         ///
         /// @param name registry display name
@@ -956,25 +1118,48 @@ public final class PluginStoreAggregatorTest {
         /// @param version repository version
         /// @return manifest JSON bytes
         private static byte @Unmodifiable [] manifest(String pluginId, String version) {
+            return manifestWithVersions(pluginId, version);
+        }
+
+        /// Serializes one source-bound repository manifest containing every supplied version string.
+        ///
+        /// @param pluginId registry entry ID
+        /// @param versions repository versions in publication order
+        /// @return manifest JSON bytes
+        private static byte @Unmodifiable [] manifestWithVersions(
+                String pluginId,
+                String @Unmodifiable ... versions
+        ) {
+            String entries = java.util.Arrays.stream(versions)
+                    .map(RegistryFixture::manifestVersion)
+                    .collect(java.util.stream.Collectors.joining(","));
             return """
                     {
                       "schemaVersion": 2,
                       "id": "%s",
-                      "versions": [
-                        {
-                          "version": "%s",
-                          "packageUrl": "https://example.com/plugin.npl",
-                          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-                          "pluginApiVersion": 4,
-                          "permissions": [],
-                          "requiredPermissions": [],
-                          "launcherVersion": "*",
-                          "dependencies": [],
-                          "size": 1
-                        }
-                      ]
+                      "versions": [%s]
                     }
-                    """.formatted(pluginId, version).getBytes(StandardCharsets.UTF_8);
+                    """.formatted(pluginId, entries).getBytes(StandardCharsets.UTF_8);
+        }
+
+        /// Serializes one version object for a repository manifest fixture.
+        ///
+        /// @param version repository version string
+        /// @return version object JSON
+        private static String manifestVersion(String version) {
+            return """
+                    {
+                      "version": "%s",
+                      "packageUrl": "https://example.com/plugin.npl",
+                      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                      "pluginApiVersion": 4,
+                      "permissions": [],
+                      "requiredPermissions": [],
+                      "launcherVersion": "*",
+                      "dependencies": [],
+                      "size": 1
+                    }
+                    """.formatted(version);
         }
     }
 }
