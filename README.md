@@ -23,7 +23,7 @@ CE 目前提供：
 - GitHub Releases 自动更新、SHA-256 完整性校验和 CE 独立发布签名；
 - Windows、Linux、macOS、FreeBSD，以及 x86、ARM、RISC-V、MIPS、LoongArch 等平台支持。
 
-平台兼容详情见 [支持平台](docs/PLATFORM_zh.md)，插件格式与开发约定见 [插件系统文档](docs/PLUGIN_SYSTEM.md)。
+平台兼容详情见 [支持平台](docs/PLATFORM_zh.md)，插件格式与开发约定见 [插件系统文档](docs/PLUGIN_SYSTEM.md)，插件开发 SDK 与示例见 [Plugin SDK](https://github.com/HMCL-Community/HMCL-CE-Plugin-SDK)。
 
 ## 下载与运行
 
