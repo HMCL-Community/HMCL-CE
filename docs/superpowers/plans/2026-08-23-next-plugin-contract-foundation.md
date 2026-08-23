@@ -153,7 +153,7 @@ Add a test that parses this exact contract and asserts normalized runtime, ABI, 
   "launcherVersion": "*",
   "runtime": "java",
   "abi": 2,
-  "platforms": ["Windows-X64", "linux"],
+  "platforms": ["windows-x64", "linux"],
   "hooks": ["before-game-launch"],
   "patches": [{
     "target": "org.jackhuang.hmcl.game.GameLaunchService",
@@ -208,7 +208,7 @@ schema 5 missing runtime
 schema 5 runtime explicitly null
 schema 5 missing abi
 schema 5 abi explicitly null or unsupported
-schema 5 null/unknown/duplicate platform targets
+schema 5 null/noncanonical/unknown/duplicate platform targets
 schema 5 null/unknown/duplicate Hook points
 schema 5 Patch missing target, method, type, or parameters
 schema 5 Patch with null or blank parameter name
