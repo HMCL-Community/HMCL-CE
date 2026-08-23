@@ -19,6 +19,7 @@ package org.jackhuang.hmcl.plugin;
 
 import com.google.gson.JsonParseException;
 import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.google.gson.annotations.SerializedName;
 import org.jackhuang.hmcl.util.gson.JsonUtils;
@@ -130,9 +131,15 @@ public final class PluginManifest {
     @SerializedName("runtime")
     private @Nullable String runtime;
 
+    /// Whether the source JSON explicitly contained the schema-v5 `runtime` property.
+    private transient boolean runtimeDeclared;
+
     /// Schema-v5 HMCL Plugin ABI generation required by this package; ABI 1 when omitted.
     @SerializedName("abi")
     private int abi = PluginAbi.ABI_1;
+
+    /// Whether the source JSON explicitly contained the schema-v5 `abi` property.
+    private transient boolean abiDeclared;
 
     /// Schema-v5 platform targets; null means platform independent.
     @SerializedName("platforms")
@@ -140,6 +147,20 @@ public final class PluginManifest {
 
     /// Whether the source JSON explicitly contained the schema-v5 `platforms` property.
     private transient boolean platformsDeclared;
+
+    /// Optional schema-v5 launcher lifecycle hook subscriptions.
+    @SerializedName("hooks")
+    private @Nullable List<@Nullable PluginHookPoint> hooks = List.of();
+
+    /// Whether the source JSON explicitly contained the schema-v5 `hooks` property.
+    private transient boolean hooksDeclared;
+
+    /// Optional schema-v5 declarative method patches.
+    @SerializedName("patches")
+    private @Nullable List<@Nullable PluginPatchDeclaration> patches = List.of();
+
+    /// Whether the source JSON explicitly contained the schema-v5 `patches` property.
+    private transient boolean patchesDeclared;
 
     /// Mixin configuration resources contributed by Java or Kotlin plugins.
     @SerializedName("mixins")
@@ -167,6 +188,10 @@ public final class PluginManifest {
         this.requiredPermissionsDeclared = true;
         this.launcherVersion = PluginVersionConstraint.ANY.getExpression();
         this.launcherVersionDeclared = true;
+        this.runtime = PluginRuntimeTypes.JAVA;
+        this.runtimeDeclared = true;
+        this.abi = PluginAbi.ABI_2;
+        this.abiDeclared = true;
     }
 
     /// Returns the manifest schema version.
@@ -394,6 +419,11 @@ public final class PluginManifest {
                 && getPermissions().equals(manifest.getPermissions())
                 && getRequiredPermissions().equals(manifest.getRequiredPermissions())
                 && getLauncherVersion().equals(manifest.getLauncherVersion())
+                && getRuntime().equals(manifest.getRuntime())
+                && getAbi() == manifest.getAbi()
+                && getPlatforms().equals(manifest.getPlatforms())
+                && getHooks().equals(manifest.getHooks())
+                && getPatches().equals(manifest.getPatches())
                 && getMixins().equals(manifest.getMixins());
     }
 
@@ -416,6 +446,11 @@ public final class PluginManifest {
                 getPermissions(),
                 getRequiredPermissions(),
                 getLauncherVersion(),
+                getRuntime(),
+                getAbi(),
+                getPlatforms(),
+                getHooks(),
+                getPatches(),
                 getMixins()
         );
     }
@@ -430,14 +465,61 @@ public final class PluginManifest {
         return abi;
     }
 
-    /// Returns whether the source JSON explicitly declared platform targets.
+    /// Returns whether this package is restricted to at least one declared platform target.
     public boolean isPlatformRestricted() {
-        return platformsDeclared;
+        return platforms != null && !platforms.isEmpty();
     }
 
-    /// Returns the raw schema-v5 platform target identifiers, or null when platform independent.
-    public @Nullable List<@Nullable String> getPlatforms() {
-        return platforms;
+    /// Returns an immutable snapshot of canonical schema-v5 platform target identifiers.
+    public @Unmodifiable List<String> getPlatforms() {
+        @Nullable List<@Nullable String> values = platforms;
+        if (values == null || values.isEmpty()) {
+            return List.of();
+        }
+        return values.stream().map(Objects::requireNonNull).toList();
+    }
+
+    /// Returns an immutable snapshot of declared lifecycle hook points.
+    ///
+    /// @return lifecycle hook points in declaration order
+    public @Unmodifiable List<PluginHookPoint> getHooks() {
+        @Nullable List<@Nullable PluginHookPoint> values = hooks;
+        if (values == null || values.isEmpty()) {
+            return List.of();
+        }
+        return values.stream().map(Objects::requireNonNull).toList();
+    }
+
+    /// Returns an immutable snapshot of declared method patches.
+    ///
+    /// @return method patches in declaration order
+    public @Unmodifiable List<PluginPatchDeclaration> getPatches() {
+        @Nullable List<@Nullable PluginPatchDeclaration> values = patches;
+        if (values == null || values.isEmpty()) {
+            return List.of();
+        }
+        return values.stream().map(Objects::requireNonNull).toList();
+    }
+
+    /// Returns whether this manifest subscribes to at least one lifecycle hook.
+    ///
+    /// @return whether hooks are declared
+    public boolean hasHooks() {
+        return hooks != null && !hooks.isEmpty();
+    }
+
+    /// Returns whether this manifest declares at least one method patch.
+    ///
+    /// @return whether patches are declared
+    public boolean hasPatches() {
+        return patches != null && !patches.isEmpty();
+    }
+
+    /// Returns the highest capability tier enabled by hook and patch declarations.
+    ///
+    /// @return derived plugin capability tier
+    public PluginCapabilityLevel getCapabilityLevel() {
+        return PluginCapabilityLevel.of(hasHooks(), hasPatches());
     }
 
     /// Validates all fields used by discovery, dependency resolution, lifecycle loading, and Mixin bootstrap.
@@ -458,14 +540,25 @@ public final class PluginManifest {
         requireNonBlank(entrypoint, "entrypoint");
         requireValidIconResource(icon);
 
+        if (schemaVersion < 5
+                && (runtimeDeclared || abiDeclared || platformsDeclared || hooksDeclared || patchesDeclared)) {
+            throw new IOException("Plugin manifest schemaVersion " + schemaVersion
+                    + " cannot declare schema-v5 runtime capabilities");
+        }
         if (schemaVersion >= 5) {
-            if (runtime == null || runtime.isBlank()) {
+            if (!runtimeDeclared || runtime == null || runtime.isBlank()) {
                 throw new IOException("Schema-v5 plugin manifest must declare runtime");
             }
             try {
-                PluginRuntimeTypes.requireValid(runtime);
+                String canonicalRuntime = PluginRuntimeTypes.requireValid(runtime);
+                if (!runtime.equals(canonicalRuntime)) {
+                    throw new IOException("Plugin runtime identifier must be canonical: " + runtime);
+                }
             } catch (IllegalArgumentException exception) {
                 throw new IOException("Invalid plugin runtime identifier: " + runtime, exception);
+            }
+            if (!abiDeclared) {
+                throw new IOException("Schema-v5 plugin manifest must declare abi");
             }
             try {
                 PluginAbi.requireValid(abi);
@@ -484,17 +577,69 @@ public final class PluginManifest {
             if (platforms == null) {
                 throw new IOException("Plugin platforms cannot be null");
             }
-            java.util.Set<String> seenPlatforms = new java.util.HashSet<>();
+            Set<String> seenPlatforms = new HashSet<>();
             for (@Nullable String platform : platforms) {
                 if (platform == null) {
                     throw new IOException("Plugin platform target cannot be null");
                 }
                 try {
-                    if (!seenPlatforms.add(PluginPlatformTarget.parse(platform).getId())) {
+                    String canonicalPlatform = PluginPlatformTarget.parse(platform).getId();
+                    if (!canonicalPlatform.equals(platform)) {
+                        throw new IOException("Plugin platform target must be canonical: " + platform);
+                    }
+                    if (!seenPlatforms.add(canonicalPlatform)) {
                         throw new IOException("Duplicate plugin platform target: " + platform);
                     }
                 } catch (IllegalArgumentException exception) {
                     throw new IOException("Invalid plugin platform target: " + platform, exception);
+                }
+            }
+        }
+
+        if (hooksDeclared) {
+            if (schemaVersion < 5) {
+                throw new IOException("Plugin manifest schemaVersion " + schemaVersion
+                        + " cannot declare hooks");
+            }
+            if (hooks == null) {
+                throw new IOException("Plugin hooks cannot be null");
+            }
+        }
+        Set<PluginHookPoint> seenHooks = EnumSet.noneOf(PluginHookPoint.class);
+        if (hooks != null) {
+            for (@Nullable PluginHookPoint hook : hooks) {
+                if (hook == null) {
+                    throw new IOException("Plugin hook point cannot be null or unknown");
+                }
+                if (!seenHooks.add(hook)) {
+                    throw new IOException("Duplicate plugin hook point: " + hook.getId());
+                }
+            }
+        }
+
+        if (patchesDeclared) {
+            if (schemaVersion < 5) {
+                throw new IOException("Plugin manifest schemaVersion " + schemaVersion
+                        + " cannot declare patches");
+            }
+            if (patches == null) {
+                throw new IOException("Plugin patches cannot be null");
+            }
+        }
+        Set<PluginPatchDeclaration> seenPatches = new HashSet<>();
+        if (patches != null) {
+            for (@Nullable PluginPatchDeclaration patch : patches) {
+                if (patch == null) {
+                    throw new IOException("Plugin patch declaration cannot be null");
+                }
+                try {
+                    patch.validate();
+                } catch (IllegalArgumentException exception) {
+                    throw new IOException("Invalid plugin patch declaration", exception);
+                }
+                if (!seenPatches.add(patch)) {
+                    throw new IOException("Duplicate plugin patch declaration: "
+                            + patch.getTarget() + "." + patch.getMethod());
                 }
             }
         }
@@ -518,6 +663,12 @@ public final class PluginManifest {
                 throw new IOException("Duplicate plugin permission: " + permission.getId());
             }
         }
+        if (schemaVersion < 5
+                && (declaredPermissions.contains(PluginPermission.LAUNCHER_HOOK)
+                || declaredPermissions.contains(PluginPermission.LAUNCHER_PATCH))) {
+            throw new IOException("Plugin manifest schemaVersion " + schemaVersion
+                    + " cannot declare schema-v5 launcher permissions");
+        }
 
         if (schemaVersion >= 4 && !requiredPermissionsDeclared) {
             throw new IOException("Schema-v4 plugin manifest must declare requiredPermissions");
@@ -540,6 +691,17 @@ public final class PluginManifest {
             if (!declaredPermissions.contains(permission)) {
                 throw new IOException("Required plugin permission is not declared: " + permission.getId());
             }
+        }
+
+        if (hasHooks()
+                && (!declaredPermissions.contains(PluginPermission.LAUNCHER_HOOK)
+                || !required.contains(PluginPermission.LAUNCHER_HOOK))) {
+            throw new IOException("Plugin hooks require launcher-hook in permissions and requiredPermissions");
+        }
+        if (hasPatches()
+                && (!declaredPermissions.contains(PluginPermission.LAUNCHER_PATCH)
+                || !required.contains(PluginPermission.LAUNCHER_PATCH))) {
+            throw new IOException("Plugin patches require launcher-patch in permissions and requiredPermissions");
         }
 
         if (schemaVersion >= 4) {
@@ -616,25 +778,23 @@ public final class PluginManifest {
     /// @throws JsonParseException if Gson rejects the JSON representation
     public static PluginManifest fromJson(Reader reader) throws IOException, JsonParseException {
         @Nullable JsonElement json = JsonParser.parseReader(reader);
+        @Nullable JsonObject root = json != null && json.isJsonObject() ? json.getAsJsonObject() : null;
+        if (root != null && root.has("abi") && root.get("abi").isJsonNull()) {
+            throw new IOException("Plugin manifest abi cannot be null");
+        }
         @Nullable PluginManifest manifest = JsonUtils.GSON.fromJson(json, PluginManifest.class);
         if (manifest == null) {
             throw new IOException("Plugin manifest is empty");
         }
-        manifest.permissionsDeclared = json != null
-                && json.isJsonObject()
-                && json.getAsJsonObject().has("permissions");
-        manifest.requiredPermissionsDeclared = json != null
-                && json.isJsonObject()
-                && json.getAsJsonObject().has("requiredPermissions");
-        manifest.minLauncherVersionDeclared = json != null
-                && json.isJsonObject()
-                && json.getAsJsonObject().has("minLauncherVersion");
-        manifest.platformsDeclared = json != null
-                && json.isJsonObject()
-                && json.getAsJsonObject().has("platforms");
-        manifest.launcherVersionDeclared = json != null
-                && json.isJsonObject()
-                && json.getAsJsonObject().has("launcherVersion");
+        manifest.permissionsDeclared = root != null && root.has("permissions");
+        manifest.requiredPermissionsDeclared = root != null && root.has("requiredPermissions");
+        manifest.minLauncherVersionDeclared = root != null && root.has("minLauncherVersion");
+        manifest.launcherVersionDeclared = root != null && root.has("launcherVersion");
+        manifest.runtimeDeclared = root != null && root.has("runtime");
+        manifest.abiDeclared = root != null && root.has("abi");
+        manifest.platformsDeclared = root != null && root.has("platforms");
+        manifest.hooksDeclared = root != null && root.has("hooks");
+        manifest.patchesDeclared = root != null && root.has("patches");
         manifest.validate();
         return manifest;
     }

@@ -57,7 +57,15 @@ public enum PluginPermission {
 
     /// Loads native libraries or invokes native code.
     @SerializedName("native-code")
-    NATIVE_CODE("native-code");
+    NATIVE_CODE("native-code"),
+
+    /// Subscribes to launcher lifecycle hook points such as download, login, or game launch.
+    @SerializedName("launcher-hook")
+    LAUNCHER_HOOK("launcher-hook"),
+
+    /// Applies declarative before, after, or replace patches to launcher core methods.
+    @SerializedName("launcher-patch")
+    LAUNCHER_PATCH("launcher-patch");
 
     /// Stable kebab-case identifier used in `plugin.json`.
     private final String id;

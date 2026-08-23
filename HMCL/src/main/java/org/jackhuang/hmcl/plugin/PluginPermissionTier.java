@@ -51,6 +51,8 @@ public enum PluginPermissionTier {
                 return ADVANCED;
             case MIXIN:
             case NATIVE_CODE:
+            case LAUNCHER_HOOK:
+            case LAUNCHER_PATCH:
             default:
                 return DANGEROUS;
         }

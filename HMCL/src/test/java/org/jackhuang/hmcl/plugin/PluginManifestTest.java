@@ -17,13 +17,18 @@
  */
 package org.jackhuang.hmcl.plugin;
 
+import org.jackhuang.hmcl.plugin.runtime.PluginAbi;
+import org.jackhuang.hmcl.plugin.runtime.PluginRuntimeTypes;
+import org.jackhuang.hmcl.util.gson.JsonUtils;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.io.StringReader;
+import java.util.ArrayList;
 import java.util.List;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertIterableEquals;
@@ -132,7 +137,7 @@ public final class PluginManifestTest {
                 }
                 """));
 
-        assertEquals(PluginManifest.CURRENT_SCHEMA_VERSION, manifest.getSchemaVersion());
+        assertEquals(4, manifest.getSchemaVersion());
         assertEquals(
                 List.of(PluginPermission.FILESYSTEM, PluginPermission.LAUNCHER_UI),
                 manifest.getRequiredPermissions()
@@ -143,6 +148,382 @@ public final class PluginManifestTest {
         assertEquals(">=26.8-beta.1, <27.0", manifest.getLauncherVersion());
         assertTrue(manifest.matchesLauncherVersion("26.8-beta.3"));
         assertFalse(manifest.matchesLauncherVersion("27.0"));
+        assertEquals(PluginRuntimeTypes.JAVA, manifest.getRuntime());
+        assertEquals(PluginAbi.ABI_1, manifest.getAbi());
+        assertEquals(List.of(), manifest.getPlatforms());
+        assertFalse(manifest.isPlatformRestricted());
+    }
+
+    /// Parses a valid schema-v5 manifest whose empty platform list leaves it unrestricted.
+    @Test
+    public void parseValidSchemaVersionFiveManifest() throws IOException {
+        PluginManifest manifest = PluginManifest.fromJson(new StringReader("""
+                {
+                  "schemaVersion": 5,
+                  "id": "dev.hmclce.test.schema-five",
+                  "name": "Schema Five",
+                  "version": "5.0.0",
+                  "type": "java",
+                  "entrypoint": "dev.hmclce.test.Plugin",
+                  "permissions": [],
+                  "requiredPermissions": [],
+                  "launcherVersion": "*",
+                  "runtime": "java",
+                  "abi": 2,
+                  "platforms": []
+                }
+                """));
+
+        assertEquals(5, manifest.getSchemaVersion());
+        assertEquals(PluginRuntimeTypes.JAVA, manifest.getRuntime());
+        assertEquals(PluginAbi.ABI_2, manifest.getAbi());
+        assertEquals(List.of(), manifest.getPlatforms());
+        assertFalse(manifest.isPlatformRestricted());
+    }
+
+    /// Rejects missing, null, blank, and non-canonical schema-v5 runtime identifiers.
+    @Test
+    public void rejectInvalidSchemaVersionFiveRuntime() {
+        assertManifestRejected(schemaFiveWithDeclarations("\"abi\": 2"));
+        assertManifestRejected(schemaFiveWithDeclarations("\"runtime\": null, \"abi\": 2"));
+        assertManifestRejected(schemaFiveWithDeclarations("\"runtime\": \" \", \"abi\": 2"));
+        assertManifestRejected(schemaFiveWithDeclarations("\"runtime\": \"Java\", \"abi\": 2"));
+        assertManifestRejected(schemaFiveWithDeclarations("\"runtime\": \" java \", \"abi\": 2"));
+    }
+
+    /// Rejects missing, null, and unsupported schema-v5 ABI declarations.
+    @Test
+    public void rejectInvalidSchemaVersionFiveAbi() {
+        assertManifestRejected(schemaFiveWithDeclarations("\"runtime\": \"java\""));
+        assertManifestRejected(schemaFiveWithDeclarations("\"runtime\": \"java\", \"abi\": null"));
+        assertManifestRejected(schemaFiveWithDeclarations("\"runtime\": \"java\", \"abi\": 0"));
+        assertManifestRejected(schemaFiveWithDeclarations("\"runtime\": \"java\", \"abi\": 3"));
+    }
+
+    /// Rejects null, non-canonical, unknown, and normalized-duplicate platform targets.
+    @Test
+    public void rejectInvalidSchemaVersionFivePlatforms() {
+        assertManifestRejected(schemaFiveWithDeclarations(
+                "\"runtime\": \"java\", \"abi\": 2, \"platforms\": null"));
+        assertManifestRejected(schemaFiveWithDeclarations(
+                "\"runtime\": \"java\", \"abi\": 2, \"platforms\": [null]"));
+        assertManifestRejected(schemaFiveWithDeclarations(
+                "\"runtime\": \"java\", \"abi\": 2, \"platforms\": [\"Windows-X64\"]"));
+        assertManifestRejected(schemaFiveWithDeclarations(
+                "\"runtime\": \"java\", \"abi\": 2, \"platforms\": [\" windows\"]"));
+        assertManifestRejected(schemaFiveWithDeclarations(
+                "\"runtime\": \"java\", \"abi\": 2, \"platforms\": [\"os2-x64\"]"));
+        assertManifestRejected(schemaFiveWithDeclarations(
+                "\"runtime\": \"java\", \"abi\": 2, \"platforms\": [\"windows-x64\", \"Windows-X64\"]"));
+    }
+
+    /// Parses absent, operating-system-only, and operating-system/architecture platform declarations.
+    @Test
+    public void parseSchemaVersionFivePlatformVariants() throws IOException {
+        PluginManifest unrestricted = PluginManifest.fromJson(new StringReader(
+                schemaFiveWithDeclarations("\"runtime\": \"java\", \"abi\": 2")));
+        PluginManifest restricted = PluginManifest.fromJson(new StringReader(schemaFiveWithDeclarations(
+                "\"runtime\": \"java\", \"abi\": 2, \"platforms\": [\"linux\", \"windows-x64\"]")));
+
+        assertEquals(List.of(), unrestricted.getPlatforms());
+        assertFalse(unrestricted.isPlatformRestricted());
+        assertEquals(List.of("linux", "windows-x64"), restricted.getPlatforms());
+        assertTrue(restricted.isPlatformRestricted());
+        assertThrows(UnsupportedOperationException.class, () -> restricted.getPlatforms().add("macos"));
+    }
+
+    /// Requires every patch declaration to contain an explicit ordered parameter array.
+    @Test
+    public void requirePatchParameters() {
+        PluginPatchDeclaration declaration = JsonUtils.GSON.fromJson("""
+                {
+                  "target": "org.jackhuang.hmcl.Launcher",
+                  "method": "launch",
+                  "type": "before"
+                }
+                """, PluginPatchDeclaration.class);
+
+        assertThrows(IllegalArgumentException.class, declaration::validate);
+    }
+
+    /// Rejects patch declarations with a missing field, null parameter, or blank parameter string.
+    @Test
+    public void rejectInvalidPatchDeclarationFields() {
+        assertPatchRejected("""
+                {"method": "launch", "type": "before", "parameters": []}
+                """);
+        assertPatchRejected("""
+                {"target": "org.jackhuang.hmcl.Launcher", "type": "before", "parameters": []}
+                """);
+        assertPatchRejected("""
+                {"target": "org.jackhuang.hmcl.Launcher", "method": "launch", "parameters": []}
+                """);
+        assertPatchRejected("""
+                {"target": "org.jackhuang.hmcl.Launcher", "method": "launch", "type": "unknown",
+                 "parameters": []}
+                """);
+        assertPatchRejected("""
+                {"target": "org.jackhuang.hmcl.Launcher", "method": "launch", "type": "before",
+                 "parameters": [null]}
+                """);
+        assertPatchRejected("""
+                {"target": "org.jackhuang.hmcl.Launcher", "method": "launch", "type": "before",
+                 "parameters": [" "]}
+                """);
+    }
+
+    /// Defensively copies constructor parameters and exposes them through an immutable ordered list.
+    @Test
+    public void constructImmutablePatchParameters() {
+        List<String> source = new ArrayList<>(List.of("java.lang.String", "int"));
+        PluginPatchDeclaration declaration = assertDoesNotThrow(() ->
+                PluginPatchDeclaration.class
+                        .getConstructor(String.class, String.class,
+                                PluginPatchDeclaration.PatchType.class, List.class)
+                        .newInstance("org.jackhuang.hmcl.Launcher", "launch",
+                                PluginPatchDeclaration.PatchType.BEFORE, source));
+        source.set(0, "changed");
+        Object parameters = assertDoesNotThrow(() ->
+                PluginPatchDeclaration.class.getMethod("getParameters").invoke(declaration));
+
+        assertEquals(List.of("java.lang.String", "int"), parameters);
+        assertThrows(UnsupportedOperationException.class, () -> ((List<?>) parameters).clear());
+    }
+
+    /// Includes target, method, type, and ordered parameters in patch value identity.
+    @Test
+    public void comparePatchDeclarationIdentity() {
+        PluginPatchDeclaration base = new PluginPatchDeclaration(
+                "org.jackhuang.hmcl.Launcher", "launch", PluginPatchDeclaration.PatchType.BEFORE,
+                List.of("java.lang.String", "int"));
+        PluginPatchDeclaration identical = new PluginPatchDeclaration(
+                "org.jackhuang.hmcl.Launcher", "launch", PluginPatchDeclaration.PatchType.BEFORE,
+                List.of("java.lang.String", "int"));
+
+        assertEquals(base, identical);
+        assertEquals(base.hashCode(), identical.hashCode());
+        assertNotEquals(base, new PluginPatchDeclaration(
+                "org.jackhuang.hmcl.Other", "launch", PluginPatchDeclaration.PatchType.BEFORE,
+                List.of("java.lang.String", "int")));
+        assertNotEquals(base, new PluginPatchDeclaration(
+                "org.jackhuang.hmcl.Launcher", "start", PluginPatchDeclaration.PatchType.BEFORE,
+                List.of("java.lang.String", "int")));
+        assertNotEquals(base, new PluginPatchDeclaration(
+                "org.jackhuang.hmcl.Launcher", "launch", PluginPatchDeclaration.PatchType.AFTER,
+                List.of("java.lang.String", "int")));
+        assertNotEquals(base, new PluginPatchDeclaration(
+                "org.jackhuang.hmcl.Launcher", "launch", PluginPatchDeclaration.PatchType.BEFORE,
+                List.of("int", "java.lang.String")));
+    }
+
+    /// Parses schema-v5 hook and patch declarations through the immutable manifest capability API.
+    @Test
+    public void parseSchemaVersionFiveCapabilities() throws IOException {
+        PluginManifest manifest = PluginManifest.fromJson(new StringReader("""
+                {
+                  "schemaVersion": 5,
+                  "id": "dev.hmclce.test.capabilities",
+                  "name": "Capabilities",
+                  "version": "5.0.0",
+                  "type": "java",
+                  "entrypoint": "dev.hmclce.test.Plugin",
+                  "permissions": ["launcher-hook", "launcher-patch"],
+                  "requiredPermissions": ["launcher-hook", "launcher-patch"],
+                  "launcherVersion": "*",
+                  "runtime": "java",
+                  "abi": 2,
+                  "hooks": ["before-download"],
+                  "patches": [{
+                    "target": "org.jackhuang.hmcl.Launcher",
+                    "method": "launch",
+                    "type": "before",
+                    "parameters": ["java.lang.String"]
+                  }]
+                }
+                """));
+
+        List<PluginHookPoint> hooks = manifest.getHooks();
+        List<PluginPatchDeclaration> patches = manifest.getPatches();
+        assertEquals(List.of(PluginHookPoint.BEFORE_DOWNLOAD), hooks);
+        assertEquals(List.of(new PluginPatchDeclaration(
+                "org.jackhuang.hmcl.Launcher", "launch", PluginPatchDeclaration.PatchType.BEFORE,
+                List.of("java.lang.String"))), patches);
+        assertTrue(manifest.hasHooks());
+        assertTrue(manifest.hasPatches());
+        assertEquals(PluginCapabilityLevel.PATCH, manifest.getCapabilityLevel());
+        assertThrows(UnsupportedOperationException.class, hooks::clear);
+        assertThrows(UnsupportedOperationException.class, patches::clear);
+    }
+
+    /// Derives HOOK capability for a manifest without patches.
+    @Test
+    public void deriveHookOnlyManifestCapability() throws IOException {
+        PluginManifest manifest = PluginManifest.fromJson(new StringReader(schemaFiveWithCapabilities(
+                "[\"launcher-hook\"]", "[\"launcher-hook\"]",
+                "\"hooks\": [\"before-login\"]")));
+
+        assertEquals(PluginCapabilityLevel.HOOK, manifest.getCapabilityLevel());
+        assertTrue(manifest.hasHooks());
+        assertFalse(manifest.hasPatches());
+    }
+
+    /// Treats differently ordered patch parameter lists as distinct overload identities.
+    @Test
+    public void parseOrderedPatchOverloads() throws IOException {
+        PluginManifest manifest = PluginManifest.fromJson(new StringReader(schemaFiveWithCapabilities(
+                "[\"launcher-patch\"]", "[\"launcher-patch\"]", """
+                "patches": [
+                  {"target": "org.jackhuang.hmcl.Launcher", "method": "launch", "type": "before",
+                   "parameters": []},
+                  {"target": "org.jackhuang.hmcl.Launcher", "method": "launch", "type": "before",
+                   "parameters": ["java.lang.String", "int"]},
+                  {"target": "org.jackhuang.hmcl.Launcher", "method": "launch", "type": "before",
+                   "parameters": ["int", "java.lang.String"]}
+                ]
+                """)));
+
+        assertEquals(3, manifest.getPatches().size());
+        assertEquals(List.of(), manifest.getPatches().get(0).getParameters());
+        assertNotEquals(manifest.getPatches().get(1), manifest.getPatches().get(2));
+    }
+
+    /// Rejects null, unknown, and duplicate schema-v5 lifecycle hook declarations.
+    @Test
+    public void rejectInvalidManifestHooks() {
+        assertManifestRejected(schemaFiveWithDeclarations(
+                "\"runtime\": \"java\", \"abi\": 2, \"hooks\": null"));
+        assertManifestRejected(schemaFiveWithDeclarations(
+                "\"runtime\": \"java\", \"abi\": 2, \"hooks\": [\"unknown-hook\"]"));
+        assertManifestRejected(schemaFiveWithDeclarations(
+                "\"runtime\": \"java\", \"abi\": 2, "
+                        + "\"hooks\": [\"before-download\", \"before-download\"]"));
+    }
+
+    /// Rejects null, malformed, and duplicate schema-v5 patch declarations.
+    @Test
+    public void rejectInvalidManifestPatches() {
+        assertManifestRejected(schemaFiveWithDeclarations(
+                "\"runtime\": \"java\", \"abi\": 2, \"patches\": null"));
+        assertManifestRejected(schemaFiveWithDeclarations(
+                "\"runtime\": \"java\", \"abi\": 2, \"patches\": [null]"));
+        assertManifestRejected(schemaFiveWithDeclarations("""
+                "runtime": "java", "abi": 2,
+                "patches": [{"target": "org.jackhuang.hmcl.Launcher", "method": "launch",
+                             "type": "before", "parameters": [" "]}]
+                """));
+        assertManifestRejected(schemaFiveWithDeclarations("""
+                "runtime": "java", "abi": 2,
+                "patches": [
+                  {"target": "org.jackhuang.hmcl.Launcher", "method": "launch",
+                   "type": "before", "parameters": ["java.lang.String"]},
+                  {"target": "org.jackhuang.hmcl.Launcher", "method": "launch",
+                   "type": "before", "parameters": ["java.lang.String"]}
+                ]
+                """));
+    }
+
+    /// Requires hook and patch permissions to be both declared and required.
+    @Test
+    public void requireCapabilityPermissions() {
+        assertManifestRejected(schemaFiveWithCapabilities("[]", "[]",
+                "\"hooks\": [\"before-download\"]"));
+        assertManifestRejected(schemaFiveWithCapabilities("[\"launcher-hook\"]", "[]",
+                "\"hooks\": [\"before-download\"]"));
+        assertManifestRejected(schemaFiveWithCapabilities("[]", "[]", """
+                "patches": [{"target": "org.jackhuang.hmcl.Launcher", "method": "launch",
+                             "type": "before", "parameters": []}]
+                """));
+        assertManifestRejected(schemaFiveWithCapabilities("[\"launcher-patch\"]", "[]", """
+                "patches": [{"target": "org.jackhuang.hmcl.Launcher", "method": "launch",
+                             "type": "before", "parameters": []}]
+                """));
+    }
+
+    /// Rejects every schema-v5 contract property and permission from earlier schemas.
+    @Test
+    public void rejectSchemaVersionFiveDeclarationsInEarlierSchemas() {
+        assertManifestRejected(schemaFourWithDeclarations("""
+                "permissions": [], "requiredPermissions": [], "launcherVersion": "*", "runtime": null
+                """));
+        assertManifestRejected(schemaFourWithDeclarations("""
+                "permissions": [], "requiredPermissions": [], "launcherVersion": "*", "abi": 1
+                """));
+        assertManifestRejected(schemaFourWithDeclarations("""
+                "permissions": [], "requiredPermissions": [], "launcherVersion": "*", "platforms": []
+                """));
+        assertManifestRejected(schemaFourWithDeclarations("""
+                "permissions": [], "requiredPermissions": [], "launcherVersion": "*", "hooks": []
+                """));
+        assertManifestRejected(schemaFourWithDeclarations("""
+                "permissions": [], "requiredPermissions": [], "launcherVersion": "*", "patches": []
+                """));
+        assertManifestRejected(schemaFourWithDeclarations("""
+                "permissions": ["launcher-hook"], "requiredPermissions": ["launcher-hook"],
+                "launcherVersion": "*"
+                """));
+        assertManifestRejected(schemaFourWithDeclarations("""
+                "permissions": ["launcher-patch"], "requiredPermissions": ["launcher-patch"],
+                "launcherVersion": "*"
+                """));
+    }
+
+    /// Creates a valid schema-v5 Java ABI-2 API manifest programmatically.
+    @Test
+    public void constructValidSchemaVersionFiveManifest() {
+        PluginManifest manifest = new PluginManifest(
+                "dev.hmclce.test.programmatic",
+                "Programmatic",
+                "5.0.0",
+                PluginManifest.PluginType.JAVA,
+                "dev.hmclce.test.Plugin");
+
+        assertEquals(5, manifest.getSchemaVersion());
+        assertEquals(PluginRuntimeTypes.JAVA, manifest.getRuntime());
+        assertEquals(PluginAbi.ABI_2, manifest.getAbi());
+        assertEquals(List.of(), manifest.getPlatforms());
+        assertEquals(List.of(), manifest.getHooks());
+        assertEquals(List.of(), manifest.getPatches());
+        assertEquals(PluginCapabilityLevel.API, manifest.getCapabilityLevel());
+        assertDoesNotThrow(manifest::validate);
+    }
+
+    /// Includes every schema-v5 runtime capability field in manifest value identity.
+    @Test
+    public void compareSchemaVersionFiveManifestIdentity() throws IOException {
+        String baseJson = """
+                {
+                  "schemaVersion": 5,
+                  "id": "dev.hmclce.test.identity-five",
+                  "name": "Identity Five",
+                  "version": "5.0.0",
+                  "type": "java",
+                  "entrypoint": "dev.hmclce.test.Plugin",
+                  "permissions": ["launcher-hook", "launcher-patch"],
+                  "requiredPermissions": ["launcher-hook", "launcher-patch"],
+                  "launcherVersion": "*",
+                  "runtime": "java",
+                  "abi": 2,
+                  "platforms": ["windows-x64"],
+                  "hooks": ["before-download"],
+                  "patches": [{"target": "org.jackhuang.hmcl.Launcher", "method": "launch",
+                               "type": "before", "parameters": ["java.lang.String"]}]
+                }
+                """;
+        PluginManifest base = PluginManifest.fromJson(new StringReader(baseJson));
+        PluginManifest identical = PluginManifest.fromJson(new StringReader(baseJson));
+
+        assertEquals(base, identical);
+        assertEquals(base.hashCode(), identical.hashCode());
+        assertNotEquals(base, PluginManifest.fromJson(new StringReader(
+                baseJson.replace("\"runtime\": \"java\"", "\"runtime\": \"dotnet\""))));
+        assertNotEquals(base, PluginManifest.fromJson(new StringReader(
+                baseJson.replace("\"abi\": 2", "\"abi\": 1"))));
+        assertNotEquals(base, PluginManifest.fromJson(new StringReader(
+                baseJson.replace("\"windows-x64\"", "\"linux-arm64\""))));
+        assertNotEquals(base, PluginManifest.fromJson(new StringReader(
+                baseJson.replace("\"before-download\"", "\"after-download\""))));
+        assertNotEquals(base, PluginManifest.fromJson(new StringReader(
+                baseJson.replace("\"method\": \"launch\"", "\"method\": \"start\""))));
     }
 
     /// Rejects detached C# package manifests while HMCL CE ships only JVM plugin runtimes.
@@ -450,6 +831,55 @@ public final class PluginManifestTest {
                 """.formatted(declarationsJson);
     }
 
+    /// Builds a schema-v5 manifest with caller-provided runtime contract declarations.
+    ///
+    /// @param declarationsJson root declarations appended after the launcher version
+    /// @return complete manifest JSON
+    private static String schemaFiveWithDeclarations(String declarationsJson) {
+        return """
+                {
+                  "schemaVersion": 5,
+                  "id": "dev.hmclce.test.invalid-schema-five",
+                  "name": "Invalid Schema Five",
+                  "version": "5.0.0",
+                  "type": "java",
+                  "entrypoint": "dev.hmclce.test.Plugin",
+                  "permissions": [],
+                  "requiredPermissions": [],
+                  "launcherVersion": "*",
+                  %s
+                }
+                """.formatted(declarationsJson);
+    }
+
+    /// Builds a schema-v5 manifest with caller-provided permissions and capability declarations.
+    ///
+    /// @param permissionsJson declared permission array
+    /// @param requiredPermissionsJson required permission array
+    /// @param capabilitiesJson hook or patch declarations
+    /// @return complete manifest JSON
+    private static String schemaFiveWithCapabilities(
+            String permissionsJson,
+            String requiredPermissionsJson,
+            String capabilitiesJson) {
+        return """
+                {
+                  "schemaVersion": 5,
+                  "id": "dev.hmclce.test.capability-permissions",
+                  "name": "Capability Permissions",
+                  "version": "5.0.0",
+                  "type": "java",
+                  "entrypoint": "dev.hmclce.test.Plugin",
+                  "permissions": %s,
+                  "requiredPermissions": %s,
+                  "launcherVersion": "*",
+                  "runtime": "java",
+                  "abi": 2,
+                  %s
+                }
+                """.formatted(permissionsJson, requiredPermissionsJson, capabilitiesJson);
+    }
+
     /// Builds a valid schema-v3 manifest with a caller-provided dependency JSON array.
     ///
     /// @param dependenciesJson raw dependency JSON array
@@ -481,5 +911,13 @@ public final class PluginManifestTest {
     /// @param reader manifest JSON reader
     private static void assertManifestRejected(StringReader reader) {
         assertThrows(IOException.class, () -> PluginManifest.fromJson(reader));
+    }
+
+    /// Asserts that a malformed patch declaration fails semantic validation.
+    ///
+    /// @param json patch declaration JSON
+    private static void assertPatchRejected(String json) {
+        PluginPatchDeclaration declaration = JsonUtils.GSON.fromJson(json, PluginPatchDeclaration.class);
+        assertThrows(IllegalArgumentException.class, declaration::validate);
     }
 }

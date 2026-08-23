@@ -123,5 +123,16 @@ public final class NextPluginRuntimeTest {
         assertEquals(PluginPermissionTier.ADVANCED, PluginPermissionTier.tierOf(PluginPermission.ACCOUNT));
         assertEquals(PluginPermissionTier.DANGEROUS, PluginPermissionTier.tierOf(PluginPermission.MIXIN));
         assertEquals(PluginPermissionTier.DANGEROUS, PluginPermissionTier.tierOf(PluginPermission.NATIVE_CODE));
+        assertEquals(PluginPermissionTier.DANGEROUS, PluginPermissionTier.tierOf(PluginPermission.LAUNCHER_HOOK));
+        assertEquals(PluginPermissionTier.DANGEROUS, PluginPermissionTier.tierOf(PluginPermission.LAUNCHER_PATCH));
+    }
+
+    /// Derives the highest capability tier from hook and patch declarations.
+    @Test
+    public void capabilityLevelDerivation() {
+        assertEquals(PluginCapabilityLevel.API, PluginCapabilityLevel.of(false, false));
+        assertEquals(PluginCapabilityLevel.HOOK, PluginCapabilityLevel.of(true, false));
+        assertEquals(PluginCapabilityLevel.PATCH, PluginCapabilityLevel.of(false, true));
+        assertEquals(PluginCapabilityLevel.PATCH, PluginCapabilityLevel.of(true, true));
     }
 }
