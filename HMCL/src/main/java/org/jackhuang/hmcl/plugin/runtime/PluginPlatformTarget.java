@@ -28,8 +28,8 @@ import java.util.Set;
 /// Immutable operating-system and CPU-architecture identifier pair used by schema-v5 plugin manifests.
 ///
 /// A target is written as `os` or `os-arch`, for example `windows-x64`, `linux-arm64`, or `macos` for an
-/// architecture-independent package. Platform differences become a first-class packaging concept: stores
-/// pick the artifact for the current target and reject installation up front instead of failing at load time.
+/// architecture-independent package. HMCL currently uses targets to reject incompatible manifests and store
+/// entries. Store artifact matrices and automatic per-platform artifact selection are not yet implemented.
 @NotNullByDefault
 public final class PluginPlatformTarget {
     /// Canonical operating-system identifiers accepted in manifests and store indexes.

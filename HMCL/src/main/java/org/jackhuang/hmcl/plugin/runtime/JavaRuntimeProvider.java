@@ -33,6 +33,9 @@ public final class JavaRuntimeProvider implements RuntimeProvider {
         return PluginRuntimeTypes.JAVA;
     }
 
+    /// Returns the Plugin ABI generations recognized for in-process Java and Kotlin packages.
+    ///
+    /// @return immutable set of supported ABI generations
     @Override
     public @Unmodifiable Set<Integer> implementedPluginAbis() {
         return Set.of(PluginAbi.ABI_1, PluginAbi.ABI_2);

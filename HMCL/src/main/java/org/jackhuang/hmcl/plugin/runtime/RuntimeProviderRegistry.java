@@ -28,9 +28,9 @@ import java.util.stream.Collectors;
 
 /// Process-wide registry of available plugin runtime providers.
 ///
-/// The Java provider is registered eagerly. Runtime plugins register additional providers (dotnet,
-/// python, javascript, native) once their host artifacts are installed, and the plugin manager consults
-/// the registry both when resolving install plans and when a package without a matching provider loads.
+/// The Java provider is registered eagerly, and compatibility checks consult the providers currently present.
+/// The registration API is the boundary reserved for future external providers; automatic provider discovery,
+/// external-runtime lifecycle management, and integration with store install plans are not yet implemented.
 @NotNullByDefault
 public final class RuntimeProviderRegistry {
     /// Registry shared by production plugin compatibility consumers.

@@ -25,8 +25,9 @@ import java.util.Set;
 
 /// Canonical runtime identifiers shared by plugin manifests and the official runtime repository.
 ///
-/// The launcher itself only ships the Java runtime. Every other runtime (dotnet, python,
-/// javascript, native) is an ordinary plugin installed on demand through the plugin store.
+/// The launcher currently registers only the built-in Java runtime. Other reserved identifiers describe the
+/// future external-runtime contract; provider discovery, lifecycle management, and on-demand store installation
+/// are not yet implemented.
 @NotNullByDefault
 public final class PluginRuntimeTypes {
     /// Built-in JVM runtime loaded directly by the launcher; never provided by an external plugin.

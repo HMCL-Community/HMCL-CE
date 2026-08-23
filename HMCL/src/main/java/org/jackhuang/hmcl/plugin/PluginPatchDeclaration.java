@@ -28,9 +28,8 @@ import java.util.regex.Pattern;
 
 /// One declarative method patch contributed by a schema-v5 plugin.
 ///
-/// Plugins describe what to change while the JVM-side patch engine performs the bytecode transformation; no
-/// plugin language ever manipulates JVM internals itself. Declarations are validated when the manifest loads so
-/// a malformed patch fails installation instead of failing at instrumentation time.
+/// These declarations define the schema-v5 patch contract. HMCL currently parses and validates them when the
+/// manifest loads, but the JVM-side engine that would apply their bytecode transformations is not implemented.
 @NotNullByDefault
 public final class PluginPatchDeclaration {
     /// Pattern accepted for fully-qualified binary class names such as org.hmcl.core.GameLaunchService.
@@ -153,15 +152,15 @@ public final class PluginPatchDeclaration {
     /// Callback position of a patch relative to the original method body.
     @NotNullByDefault
     public enum PatchType {
-        /// Runs before the original body and may adjust the invocation context.
+        /// Requests a callback before the original body with access to the invocation context.
         @SerializedName("before")
         BEFORE,
 
-        /// Runs after the original body and may observe or replace the result.
+        /// Requests a callback after the original body with access to the result.
         @SerializedName("after")
         AFTER,
 
-        /// Replaces the original body entirely; the strongest form of patch.
+        /// Requests replacement of the original body; the strongest form of patch declaration.
         @SerializedName("replace")
         REPLACE
     }

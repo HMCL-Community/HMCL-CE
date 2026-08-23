@@ -24,9 +24,9 @@ import java.util.Set;
 
 /// SPI implemented by every plugin runtime provider.
 ///
-/// The launcher ships exactly one provider (Java) in-process; additional providers are contributed by
-/// runtime plugins installed from the plugin store, following the Fabric-Loader style split between a
-/// runtime provider and the language plugins that depend on it.
+/// The launcher currently ships one in-process Java provider. This interface defines the registration and
+/// compatibility boundary for future external providers; runtime-plugin discovery, lifecycle management, and
+/// store installation are not yet connected to it.
 @NotNullByDefault
 public interface RuntimeProvider {
     /// Canonical runtime identifier this provider serves, such as java or dotnet.

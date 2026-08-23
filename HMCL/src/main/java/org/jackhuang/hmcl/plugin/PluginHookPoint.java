@@ -22,56 +22,56 @@ import org.jetbrains.annotations.NotNullByDefault;
 
 /// Launcher lifecycle hook points a schema-v5 plugin may subscribe to.
 ///
-/// Hook plugins receive an ABI context object before or after core operations such as downloads, login, or game
-/// launch and may adjust arguments or observe results. They never touch JVM classes directly: the launcher
-/// marshals the operation into a Plugin ABI object, applies plugin adjustments, and only then continues.
+/// These identifiers define the schema-v5 hook contract and are parsed, validated, and exposed through plugin
+/// manifests. The launcher does not yet dispatch these hooks, marshal ABI context objects, or apply plugin
+/// adjustments to the corresponding operations.
 @NotNullByDefault
 public enum PluginHookPoint {
-    /// Raised before a file download queue starts; the context exposes the target list.
+    /// Contract point before a file download queue starts; its future context will expose the target list.
     @SerializedName("before-download")
     BEFORE_DOWNLOAD("before-download"),
 
-    /// Raised after a file download queue finishes; the context exposes per-file results.
+    /// Contract point after a file download queue finishes; its future context will expose per-file results.
     @SerializedName("after-download")
     AFTER_DOWNLOAD("after-download"),
 
-    /// Raised before the Minecraft process starts; the context exposes JVM and game arguments.
+    /// Contract point before the Minecraft process starts; its future context will expose JVM and game arguments.
     @SerializedName("before-game-launch")
     BEFORE_GAME_LAUNCH("before-game-launch"),
 
-    /// Raised after the Minecraft process exits; the context exposes the exit code.
+    /// Contract point after the Minecraft process exits; its future context will expose the exit code.
     @SerializedName("after-game-launch")
     AFTER_GAME_LAUNCH("after-game-launch"),
 
-    /// Raised before an account login attempt; the context exposes the account and auth mode.
+    /// Contract point before an account login attempt; its future context will expose the account and auth mode.
     @SerializedName("before-login")
     BEFORE_LOGIN("before-login"),
 
-    /// Raised after an account login attempt; the context exposes the resulting profile.
+    /// Contract point after an account login attempt; its future context will expose the resulting profile.
     @SerializedName("after-login")
     AFTER_LOGIN("after-login"),
 
-    /// Raised before a new instance is created; the context exposes the template and name.
+    /// Contract point before a new instance is created; its future context will expose the template and name.
     @SerializedName("before-instance-create")
     BEFORE_INSTANCE_CREATE("before-instance-create"),
 
-    /// Raised after a new instance is created; the context exposes the instance id.
+    /// Contract point after a new instance is created; its future context will expose the instance id.
     @SerializedName("after-instance-create")
     AFTER_INSTANCE_CREATE("after-instance-create"),
 
-    /// Raised before a mod is installed into an instance; the context exposes the mod file.
+    /// Contract point before a mod is installed into an instance; its future context will expose the mod file.
     @SerializedName("before-mod-install")
     BEFORE_MOD_INSTALL("before-mod-install"),
 
-    /// Raised after a mod is installed into an instance; the context exposes the mod entry.
+    /// Contract point after a mod is installed into an instance; its future context will expose the mod entry.
     @SerializedName("after-mod-install")
     AFTER_MOD_INSTALL("after-mod-install"),
 
-    /// Raised before launcher settings are read; the context exposes the settings source.
+    /// Contract point before launcher settings are read; its future context will expose the settings source.
     @SerializedName("before-settings-load")
     BEFORE_SETTINGS_LOAD("before-settings-load"),
 
-    /// Raised after launcher settings are read; the context exposes the loaded values.
+    /// Contract point after launcher settings are read; its future context will expose the loaded values.
     @SerializedName("after-settings-load")
     AFTER_SETTINGS_LOAD("after-settings-load");
 
