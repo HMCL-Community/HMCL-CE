@@ -215,6 +215,8 @@ public final class PluginManifestTest {
                 "\"runtime\": \"java\", \"abi\": 2, \"platforms\": [\"os2-x64\"]"));
         assertManifestRejected(schemaFiveWithDeclarations(
                 "\"runtime\": \"java\", \"abi\": 2, \"platforms\": [\"windows-x64\", \"Windows-X64\"]"));
+        assertManifestRejected(schemaFiveWithDeclarations(
+                "\"runtime\": \"java\", \"abi\": 2, \"platforms\": [\"windows-x64\", \"windows-x64\"]"));
     }
 
     /// Parses absent, operating-system-only, and operating-system/architecture platform declarations.
@@ -246,7 +248,7 @@ public final class PluginManifestTest {
         assertThrows(IllegalArgumentException.class, declaration::validate);
     }
 
-    /// Rejects patch declarations with a missing field, null parameter, or blank parameter string.
+    /// Rejects patch declarations with missing, null, or malformed fields.
     @Test
     public void rejectInvalidPatchDeclarationFields() {
         assertPatchRejected("""
@@ -259,8 +261,19 @@ public final class PluginManifestTest {
                 {"target": "org.jackhuang.hmcl.Launcher", "method": "launch", "parameters": []}
                 """);
         assertPatchRejected("""
+                {"target": "GameLaunchService", "method": "launch", "type": "before", "parameters": []}
+                """);
+        assertPatchRejected("""
+                {"target": "org.jackhuang.hmcl.Launcher", "method": "bad-method", "type": "before",
+                 "parameters": []}
+                """);
+        assertPatchRejected("""
                 {"target": "org.jackhuang.hmcl.Launcher", "method": "launch", "type": "unknown",
                  "parameters": []}
+                """);
+        assertPatchRejected("""
+                {"target": "org.jackhuang.hmcl.Launcher", "method": "launch", "type": "before",
+                 "parameters": null}
                 """);
         assertPatchRejected("""
                 {"target": "org.jackhuang.hmcl.Launcher", "method": "launch", "type": "before",
