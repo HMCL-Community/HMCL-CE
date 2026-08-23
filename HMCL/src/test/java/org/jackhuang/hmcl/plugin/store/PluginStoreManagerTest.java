@@ -17,9 +17,14 @@
  */
 package org.jackhuang.hmcl.plugin.store;
 
+import com.google.gson.JsonParser;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
-import org.jackhuang.hmcl.util.gson.JsonUtils;
+import org.jackhuang.hmcl.Metadata;
+import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityEvaluator;
+import org.jackhuang.hmcl.plugin.runtime.PluginPlatformTarget;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeProvider;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderRegistry;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
@@ -532,9 +537,91 @@ public final class PluginStoreManagerTest {
         assertTrue(manager.getCompatibleVersions(manifest).isEmpty());
         for (PluginStoreManifest.PluginVersionEntry version : manifest.getVersions()) {
             IOException exception = assertThrows(IOException.class, () -> manager.validateCompatibility(version));
-            assertTrue(exception.toString().contains("only supports plugin API 4"));
+            assertTrue(exception.getMessage().contains("schema " + version.getPluginApiVersion()));
+            assertTrue(exception.getMessage().contains("4..5"));
             assertFalse(manager.isCompatible(version));
         }
+    }
+
+    /// Applies shared launcher, platform, runtime, and ABI compatibility rules to store entries.
+    @Test
+    public void evaluateStoreCompatibilityWithSharedRuntimeContract() throws IOException {
+        RuntimeProviderRegistry runtimeProviders = new RuntimeProviderRegistry();
+        runtimeProviders.register(new RuntimeProvider() {
+            /// Returns the test runtime identifier.
+            @Override
+            public String runtimeType() {
+                return "limited";
+            }
+
+            /// Restricts this test provider to ABI 1.
+            @Override
+            public @Unmodifiable Set<Integer> implementedPluginAbis() {
+                return Set.of(1);
+            }
+
+            /// Describes the deliberately ABI-limited test provider.
+            @Override
+            public String describe() {
+                return "ABI-limited test runtime";
+            }
+        });
+        PluginStoreManager manager = new PluginStoreManager(new PluginCompatibilityEvaluator(
+                runtimeProviders,
+                PluginPlatformTarget.parse("windows-x64")
+        ));
+
+        PluginStoreManifest.PluginVersionEntry schemaFour = compatibilityVersion(4, """
+                "permissions": [],
+                "requiredPermissions": [],
+                "launcherVersion": "*",
+                "dependencies": []
+                """);
+        PluginStoreManifest.PluginVersionEntry schemaFive = compatibilityVersion(5, """
+                "permissions": [],
+                "requiredPermissions": [],
+                "launcherVersion": "*",
+                "runtime": "java",
+                "abi": 2,
+                "platforms": ["windows"],
+                "dependencies": []
+                """);
+        assertDoesNotThrow(() -> manager.validateCompatibility(schemaFour));
+        assertDoesNotThrow(() -> manager.validateCompatibility(schemaFive));
+        assertTrue(manager.isCompatible(schemaFour));
+        assertTrue(manager.isCompatible(schemaFive));
+
+        assertCompatibilityRejected(manager, compatibilityVersion(4, """
+                "permissions": [],
+                "requiredPermissions": [],
+                "launcherVersion": ">=9999",
+                "dependencies": []
+                """), Metadata.VERSION, ">=9999");
+        assertCompatibilityRejected(manager, compatibilityVersion(5, """
+                "permissions": [],
+                "requiredPermissions": [],
+                "launcherVersion": "*",
+                "runtime": "java",
+                "abi": 2,
+                "platforms": ["linux"],
+                "dependencies": []
+                """), "linux", "windows-x64");
+        assertCompatibilityRejected(manager, compatibilityVersion(5, """
+                "permissions": [],
+                "requiredPermissions": [],
+                "launcherVersion": "*",
+                "runtime": "dotnet",
+                "abi": 2,
+                "dependencies": []
+                """), "dotnet");
+        assertCompatibilityRejected(manager, compatibilityVersion(5, """
+                "permissions": [],
+                "requiredPermissions": [],
+                "launcherVersion": "*",
+                "runtime": "limited",
+                "abi": 2,
+                "dependencies": []
+                """), "limited", "ABI 2", "[1]");
     }
 
     /// Persists favorite changes across repository instances and rejects IDs that cannot be stored safely.
@@ -722,7 +809,10 @@ public final class PluginStoreManagerTest {
             Files.createDirectories(installedPackage.getParent());
             byte @Unmodifiable [] existingPackage = "existing verified package".getBytes(StandardCharsets.UTF_8);
             Files.write(installedPackage, existingPackage);
-            PluginStoreManager manager = new PluginStoreManager();
+            PluginStoreManager manager = new PluginStoreManager(new PluginCompatibilityEvaluator(
+                    new RuntimeProviderRegistry(),
+                    PluginPlatformTarget.parse("windows-x64")
+            ));
 
             assertMetadataMismatchPreservesTarget(
                     manager,
@@ -843,6 +933,104 @@ public final class PluginStoreManagerTest {
                     ),
                     "launcherVersion does not match"
             );
+            byte @Unmodifiable [] runtimeMismatch = createPluginPackageFive(
+                    pluginId, selectedVersion, "dotnet", 2, "[]"
+            );
+            assertMetadataMismatchPreservesTarget(
+                    manager,
+                    responseBody,
+                    packageUrl,
+                    pluginId,
+                    selectedVersion,
+                    installedPackage,
+                    existingPackage,
+                    runtimeMismatch,
+                    repositoryVersionFive(
+                            selectedVersion, packageUrl, runtimeMismatch, "java", 2, "[]"
+                    ),
+                    "runtime does not match"
+            );
+            byte @Unmodifiable [] abiMismatch = createPluginPackageFive(
+                    pluginId, selectedVersion, "java", 2, "[]"
+            );
+            assertMetadataMismatchPreservesTarget(
+                    manager,
+                    responseBody,
+                    packageUrl,
+                    pluginId,
+                    selectedVersion,
+                    installedPackage,
+                    existingPackage,
+                    abiMismatch,
+                    repositoryVersionFive(
+                            selectedVersion, packageUrl, abiMismatch, "java", 1, "[]"
+                    ),
+                    "ABI does not match"
+            );
+            byte @Unmodifiable [] platformMismatch = createPluginPackageFive(
+                    pluginId, selectedVersion, "java", 2, "[\"linux\"]"
+            );
+            assertMetadataMismatchPreservesTarget(
+                    manager,
+                    responseBody,
+                    packageUrl,
+                    pluginId,
+                    selectedVersion,
+                    installedPackage,
+                    existingPackage,
+                    platformMismatch,
+                    repositoryVersionFive(
+                            selectedVersion, packageUrl, platformMismatch, "java", 2, "[\"windows\"]"
+                    ),
+                    "platforms do not match"
+            );
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    /// Accepts equivalent canonical platform sets regardless of their serialized input order.
+    @Test
+    public void reconcileNormalizedPlatformOrder(@TempDir Path temporaryDirectory) throws Exception {
+        String pluginId = "dev.hmclce.test.platform-order";
+        String selectedVersion = "1.0.0";
+        byte @Unmodifiable [] packageBytes = createPluginPackageFive(
+                pluginId,
+                selectedVersion,
+                "java",
+                2,
+                "[\"linux\", \"windows-x64\"]"
+        );
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/package", exchange -> respond(exchange, packageBytes));
+        server.start();
+
+        try {
+            String packageUrl = "http://127.0.0.1:" + server.getAddress().getPort() + "/package";
+            PluginStoreManifest manifest = parseManifest(pluginId, repositoryManifest(
+                    pluginId,
+                    repositoryVersionFive(
+                            selectedVersion,
+                            packageUrl,
+                            packageBytes,
+                            "java",
+                            2,
+                            "[\"windows-x64\", \"linux\"]"
+                    )
+            ));
+            PluginStoreManager manager = new PluginStoreManager(new PluginCompatibilityEvaluator(
+                    new RuntimeProviderRegistry(),
+                    PluginPlatformTarget.parse("windows-x64")
+            ));
+            PluginStoreManifest.PluginVersionEntry version = Objects.requireNonNull(manifest.getLatestVersion());
+
+            Path installed = manager.downloadPlugin(
+                    pluginId,
+                    version,
+                    temporaryDirectory.resolve("plugins")
+            );
+
+            assertArrayEquals(packageBytes, Files.readAllBytes(installed));
         } finally {
             server.stop(0);
         }
@@ -1253,6 +1441,95 @@ public final class PluginStoreManagerTest {
         );
     }
 
+    /// Creates one API-v5 repository version entry with exact runtime compatibility metadata.
+    ///
+    /// @param version selected version string
+    /// @param packageUrl package endpoint
+    /// @param packageBytes exact package body
+    /// @param runtime canonical runtime identifier
+    /// @param abi required HMCL Plugin ABI generation
+    /// @param platformsJson platform target array JSON
+    /// @return serialized repository version entry
+    /// @throws NoSuchAlgorithmException if SHA-256 is unavailable
+    private static String repositoryVersionFive(
+            String version,
+            String packageUrl,
+            byte @Unmodifiable [] packageBytes,
+            String runtime,
+            int abi,
+            String platformsJson
+    ) throws NoSuchAlgorithmException {
+        return """
+                {
+                  "version": "%s",
+                  "packageUrl": "%s",
+                  "sha256": "%s",
+                  "pluginApiVersion": 5,
+                  "permissions": [],
+                  "requiredPermissions": [],
+                  "launcherVersion": "*",
+                  "runtime": "%s",
+                  "abi": %d,
+                  "platforms": %s,
+                  "dependencies": [],
+                  "size": %d
+                }
+                """.formatted(
+                version,
+                packageUrl,
+                sha256(packageBytes),
+                runtime,
+                abi,
+                platformsJson,
+                packageBytes.length
+        );
+    }
+
+    /// Creates one validated store entry with caller-selected compatibility declarations.
+    ///
+    /// @param pluginApiVersion package manifest schema version
+    /// @param declarationsJson launcher, runtime, ABI, platform, permission, and dependency declarations
+    /// @return validated store version entry
+    /// @throws IOException if the generated declaration is invalid
+    private static PluginStoreManifest.PluginVersionEntry compatibilityVersion(
+            int pluginApiVersion,
+            String declarationsJson
+    ) throws IOException {
+        String pluginId = "dev.hmclce.test.compatibility";
+        PluginStoreManifest manifest = parseManifest(pluginId, """
+                {
+                  "schemaVersion": 2,
+                  "id": "%s",
+                  "versions": [{
+                    "version": "1.0.0",
+                    "packageUrl": "https://example.com/plugin.npl",
+                    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "pluginApiVersion": %d,
+                    "size": 1,
+                    %s
+                  }]
+                }
+                """.formatted(pluginId, pluginApiVersion, declarationsJson));
+        return Objects.requireNonNull(manifest.getLatestVersion());
+    }
+
+    /// Asserts that shared compatibility diagnostics retain every relevant rejected value.
+    ///
+    /// @param manager store manager using a deterministic runtime registry and host target
+    /// @param version incompatible store version
+    /// @param expectedDetails values that must appear in the compatibility detail
+    private static void assertCompatibilityRejected(
+            PluginStoreManager manager,
+            PluginStoreManifest.PluginVersionEntry version,
+            String @Unmodifiable ... expectedDetails
+    ) {
+        IOException exception = assertThrows(IOException.class, () -> manager.validateCompatibility(version));
+        for (String expectedDetail : expectedDetails) {
+            assertTrue(exception.getMessage().contains(expectedDetail), exception.getMessage());
+        }
+        assertFalse(manager.isCompatible(version));
+    }
+
     /// Parses and validates one repository manifest fixture.
     ///
     /// @param expectedPluginId plugin ID bound to the repository
@@ -1260,12 +1537,7 @@ public final class PluginStoreManagerTest {
     /// @return validated repository manifest
     /// @throws IOException if the fixture violates repository validation
     private static PluginStoreManifest parseManifest(String expectedPluginId, String json) throws IOException {
-        PluginStoreManifest manifest = Objects.requireNonNull(
-                JsonUtils.GSON.fromJson(json, PluginStoreManifest.class),
-                "Generated repository manifest was null"
-        );
-        manifest.validate(expectedPluginId);
-        return manifest;
+        return PluginStoreManifest.fromJson(JsonParser.parseString(json), expectedPluginId);
     }
 
     /// Creates the smallest package that passes package-manifest parsing for the requested schema.
@@ -1345,6 +1617,48 @@ public final class PluginStoreManagerTest {
                     schemaFourDeclarations,
                     dependenciesJson
             ).getBytes(StandardCharsets.UTF_8));
+            zip.closeEntry();
+        }
+        return bytes.toByteArray();
+    }
+
+    /// Creates the smallest valid schema-v5 package with exact runtime compatibility metadata.
+    ///
+    /// @param pluginId package plugin ID
+    /// @param version package version
+    /// @param runtime canonical runtime identifier
+    /// @param abi required HMCL Plugin ABI generation
+    /// @param platformsJson platform target array JSON
+    /// @return complete `.npl` package bytes
+    /// @throws IOException if ZIP creation fails
+    private static byte @Unmodifiable [] createPluginPackageFive(
+            String pluginId,
+            String version,
+            String runtime,
+            int abi,
+            String platformsJson
+    ) throws IOException {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (ZipOutputStream zip = new ZipOutputStream(bytes)) {
+            zip.putNextEntry(new ZipEntry("plugin.json"));
+            zip.write("""
+                    {
+                      "schemaVersion": 5,
+                      "id": "%s",
+                      "name": "Plugin Store Test",
+                      "version": "%s",
+                      "type": "java",
+                      "entrypoint": "dev.hmclce.test.Plugin",
+                      "permissions": [],
+                      "requiredPermissions": [],
+                      "launcherVersion": "*",
+                      "runtime": "%s",
+                      "abi": %d,
+                      "platforms": %s,
+                      "dependencies": []
+                    }
+                    """.formatted(pluginId, version, runtime, abi, platformsJson)
+                    .getBytes(StandardCharsets.UTF_8));
             zip.closeEntry();
         }
         return bytes.toByteArray();

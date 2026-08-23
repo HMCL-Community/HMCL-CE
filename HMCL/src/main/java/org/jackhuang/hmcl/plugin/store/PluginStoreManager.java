@@ -25,6 +25,10 @@ import org.jackhuang.hmcl.Metadata;
 import org.jackhuang.hmcl.plugin.PluginArtifactIdentity;
 import org.jackhuang.hmcl.plugin.PluginManifest;
 import org.jackhuang.hmcl.plugin.PluginVersion;
+import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityEvaluator;
+import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityResult;
+import org.jackhuang.hmcl.plugin.runtime.PluginPlatformTarget;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderRegistry;
 import org.jackhuang.hmcl.plugin.trust.PluginCertificationReceipt;
 import org.jackhuang.hmcl.plugin.trust.PluginDocumentVerification;
 import org.jackhuang.hmcl.plugin.trust.PluginRepositoryAttestation;
@@ -154,6 +158,9 @@ public final class PluginStoreManager {
     /// Raw-content base used for GitHub Topic repository manifests.
     private final String githubRawBaseUrl;
 
+    /// Shared launcher, platform, runtime, and ABI compatibility evaluator.
+    private final PluginCompatibilityEvaluator compatibilityEvaluator;
+
     /// README cache retained only for the historical explicit-manifest API before a source has loaded.
     private final Map<String, String> unloadedReadmeCache = new ConcurrentHashMap<>();
 
@@ -220,14 +227,21 @@ public final class PluginStoreManager {
 
     /// Creates an unloaded source-scoped store client.
     public PluginStoreManager() {
-        this(loadDefaultTrustVerifier(), null, GITHUB_RAW_BASE_URL);
+        this(loadDefaultTrustVerifier(), null, GITHUB_RAW_BASE_URL, createDefaultCompatibilityEvaluator());
     }
 
     /// Creates an unloaded client with an explicit GitHub raw-content base for package-local tests.
     ///
     /// @param githubRawBaseUrl raw-content base used for Topic repository manifests
     PluginStoreManager(String githubRawBaseUrl) {
-        this(loadDefaultTrustVerifier(), null, githubRawBaseUrl);
+        this(loadDefaultTrustVerifier(), null, githubRawBaseUrl, createDefaultCompatibilityEvaluator());
+    }
+
+    /// Creates an unloaded client with a deterministic compatibility evaluator for package-local tests.
+    ///
+    /// @param compatibilityEvaluator evaluator with the desired runtime registry and host platform
+    PluginStoreManager(PluginCompatibilityEvaluator compatibilityEvaluator) {
+        this(loadDefaultTrustVerifier(), null, GITHUB_RAW_BASE_URL, compatibilityEvaluator);
     }
 
     /// Loads the embedded plugin trust root for a new store manager.
@@ -242,9 +256,16 @@ public final class PluginStoreManager {
         }
     }
 
+    /// Creates the production evaluator backed by built-in runtime providers and the current host platform.
+    ///
+    /// @return production compatibility evaluator
+    private static PluginCompatibilityEvaluator createDefaultCompatibilityEvaluator() {
+        return new PluginCompatibilityEvaluator(new RuntimeProviderRegistry(), PluginPlatformTarget.current());
+    }
+
     /// Creates a store manager with an explicit verifier for package-local tests.
     PluginStoreManager(PluginTrustVerifier trustVerifier) {
-        this(trustVerifier, null, GITHUB_RAW_BASE_URL);
+        this(trustVerifier, null, GITHUB_RAW_BASE_URL, createDefaultCompatibilityEvaluator());
     }
 
     /// Creates a store manager with explicit trust and status services for package-local tests.
@@ -252,7 +273,7 @@ public final class PluginStoreManager {
     /// @param trustVerifier role-separated signature verifier
     /// @param trustStatusCache legacy authenticated status cache, or `null` under the current policy
     PluginStoreManager(PluginTrustVerifier trustVerifier, @Nullable PluginTrustStatusCache trustStatusCache) {
-        this(trustVerifier, trustStatusCache, GITHUB_RAW_BASE_URL);
+        this(trustVerifier, trustStatusCache, GITHUB_RAW_BASE_URL, createDefaultCompatibilityEvaluator());
     }
 
     /// Creates a store manager with explicit trust, status, and Topic transport dependencies.
@@ -260,14 +281,17 @@ public final class PluginStoreManager {
     /// @param trustVerifier role-separated signature verifier
     /// @param trustStatusCache legacy authenticated status cache, or `null` under the current policy
     /// @param githubRawBaseUrl raw-content base used for Topic repository manifests
+    /// @param compatibilityEvaluator shared compatibility evaluator for store filtering
     private PluginStoreManager(
             PluginTrustVerifier trustVerifier,
             @Nullable PluginTrustStatusCache trustStatusCache,
-            String githubRawBaseUrl
+            String githubRawBaseUrl,
+            PluginCompatibilityEvaluator compatibilityEvaluator
     ) {
         this.trustVerifier = Objects.requireNonNull(trustVerifier, "trustVerifier");
         this.trustStatusCache = trustStatusCache;
         this.githubRawBaseUrl = Objects.requireNonNull(githubRawBaseUrl, "githubRawBaseUrl");
+        this.compatibilityEvaluator = Objects.requireNonNull(compatibilityEvaluator, "compatibilityEvaluator");
     }
 
     /// Loads and validates one plugin source without persisting user configuration.
@@ -473,11 +497,7 @@ public final class PluginStoreManager {
                         : document.getAsJsonObject();
                 verification = new PluginDocumentVerification(manifestDocument, PluginTrustResult.community());
             }
-            @Nullable PluginStoreManifest manifest = JsonUtils.GSON.fromJson(verification.signed(), PluginStoreManifest.class);
-            if (manifest == null) {
-                throw new IOException("Empty plugin manifest: " + PluginSourceLabels.diagnosticUrl(manifestUrl));
-            }
-            manifest.validate(pluginId);
+            PluginStoreManifest manifest = PluginStoreManifest.fromJson(verification.signed(), pluginId);
             for (PluginStoreManifest.PluginVersionEntry version : manifest.getVersions()) {
                 validateRemoteUrl(version.getPackageUrl(), "plugin package");
             }
@@ -970,19 +990,17 @@ public final class PluginStoreManager {
         return current;
     }
 
-    /// Validates launcher, Java, and plugin API requirements before downloading a package.
+    /// Validates shared compatibility requirements and the store-only Java version before downloading a package.
     ///
     /// @param version remote version metadata
     /// @throws IOException if the current runtime is incompatible
     public void validateCompatibility(PluginStoreManifest.PluginVersionEntry version) throws IOException {
-        if (version.getPluginApiVersion() != PluginManifest.CURRENT_SCHEMA_VERSION) {
-            throw new IOException("HMCL CE only supports plugin API "
-                    + PluginManifest.CURRENT_SCHEMA_VERSION + "; this version uses plugin API "
-                    + version.getPluginApiVersion());
-        }
-        if (!version.matchesLauncherVersion(Metadata.VERSION)) {
-            throw new IOException("This plugin requires HMCL launcher version "
-                    + version.getLauncherVersion());
+        PluginCompatibilityResult compatibility = compatibilityEvaluator.evaluate(
+                version.toCompatibilityRequirements(),
+                Metadata.VERSION
+        );
+        if (!compatibility.isCompatible()) {
+            throw new IOException(compatibility.detail());
         }
 
         String requiredJava = version.getRequiredJavaVersion();
@@ -1358,6 +1376,15 @@ public final class PluginStoreManager {
             if (packageManifest.getSchemaVersion() != expectedVersion.getPluginApiVersion()) {
                 throw new IOException("Downloaded package schemaVersion " + packageManifest.getSchemaVersion()
                         + " does not match pluginApiVersion " + expectedVersion.getPluginApiVersion());
+            }
+            if (!packageManifest.getRuntime().equals(expectedVersion.getRuntime())) {
+                throw new IOException("Downloaded package runtime does not match selected version metadata");
+            }
+            if (packageManifest.getAbi() != expectedVersion.getAbi()) {
+                throw new IOException("Downloaded package ABI does not match selected version metadata");
+            }
+            if (!packageManifest.getPlatforms().equals(expectedVersion.getPlatforms())) {
+                throw new IOException("Downloaded package platforms do not match selected version metadata");
             }
             if (expectedVersion.getPluginApiVersion() >= 3
                     && !new HashSet<>(packageManifest.getPermissions())

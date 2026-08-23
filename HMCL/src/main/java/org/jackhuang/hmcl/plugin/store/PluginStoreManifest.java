@@ -25,7 +25,12 @@ import org.jackhuang.hmcl.plugin.PluginManifest;
 import org.jackhuang.hmcl.plugin.PluginPermission;
 import org.jackhuang.hmcl.plugin.PluginVersion;
 import org.jackhuang.hmcl.plugin.PluginVersionConstraint;
+import org.jackhuang.hmcl.plugin.runtime.PluginAbi;
+import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityRequirements;
+import org.jackhuang.hmcl.plugin.runtime.PluginPlatformTarget;
+import org.jackhuang.hmcl.plugin.runtime.PluginRuntimeTypes;
 import org.jackhuang.hmcl.plugin.trust.PluginTrustResult;
+import org.jackhuang.hmcl.util.gson.JsonUtils;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
@@ -180,6 +185,48 @@ public final class PluginStoreManifest {
         return Objects.requireNonNullElse(readmeUrl, "");
     }
 
+    /// Parses and validates one repository manifest while preserving per-version field presence.
+    ///
+    /// @param json parsed repository manifest document
+    /// @param expectedPluginId plugin ID from the parent registry entry
+    /// @return validated repository manifest
+    /// @throws IOException if the document is empty, malformed, invalid, or belongs to another plugin
+    public static PluginStoreManifest fromJson(JsonElement json, String expectedPluginId) throws IOException {
+        if (!json.isJsonObject()) {
+            throw new IOException("Plugin repository manifest is not an object");
+        }
+        JsonObject root = json.getAsJsonObject();
+        @Nullable PluginStoreManifest manifest = JsonUtils.GSON.fromJson(root, PluginStoreManifest.class);
+        if (manifest == null) {
+            throw new IOException("Plugin repository manifest is empty");
+        }
+        manifest.captureVersionFieldPresence(root);
+        manifest.validate(expectedPluginId);
+        return manifest;
+    }
+
+    /// Records compatibility-field presence before Gson's null/default mapping discards that distinction.
+    ///
+    /// @param root repository manifest object parsed from the source document
+    private void captureVersionFieldPresence(JsonObject root) {
+        @Nullable JsonElement versionsElement = root.get("versions");
+        if (versionsElement == null || !versionsElement.isJsonArray() || versions == null) {
+            return;
+        }
+        int count = Math.min(versions.size(), versionsElement.getAsJsonArray().size());
+        for (int index = 0; index < count; index++) {
+            @Nullable PluginVersionEntry entry = versions.get(index);
+            JsonElement source = versionsElement.getAsJsonArray().get(index);
+            if (entry == null || !source.isJsonObject()) {
+                continue;
+            }
+            JsonObject versionObject = source.getAsJsonObject();
+            entry.runtimeDeclared = versionObject.has("runtime");
+            entry.abiDeclared = versionObject.has("abi");
+            entry.platformsDeclared = versionObject.has("platforms");
+        }
+    }
+
     /// Validates schema, plugin identity, version uniqueness, checksums, and API declarations.
     ///
     /// @param expectedPluginId plugin ID from the parent registry entry
@@ -256,6 +303,27 @@ public final class PluginStoreManifest {
         /// Required HMCL plugin manifest/API schema version.
         @SerializedName("pluginApiVersion")
         private int pluginApiVersion = 1;
+
+        /// Canonical runtime identifier required by schema-v5 packages.
+        @SerializedName("runtime")
+        private @Nullable String runtime;
+
+        /// Whether the source JSON explicitly contained the schema-v5 `runtime` property.
+        private transient boolean runtimeDeclared;
+
+        /// HMCL Plugin ABI generation required by schema-v5 packages; ABI 1 for legacy packages.
+        @SerializedName("abi")
+        private @Nullable Integer abi = PluginAbi.ABI_1;
+
+        /// Whether the source JSON explicitly contained the schema-v5 `abi` property.
+        private transient boolean abiDeclared;
+
+        /// Canonical platform targets supported by schema-v5 packages; empty means unrestricted.
+        @SerializedName("platforms")
+        private @Nullable List<@Nullable String> platforms;
+
+        /// Whether the source JSON explicitly contained the schema-v5 `platforms` property.
+        private transient boolean platformsDeclared;
 
         /// Whether installation or update is expected to require a launcher restart.
         @SerializedName("requiresRestart")
@@ -385,6 +453,47 @@ public final class PluginStoreManifest {
         /// @return plugin API version
         public int getPluginApiVersion() {
             return pluginApiVersion;
+        }
+
+        /// Returns the canonical required runtime, defaulting legacy packages to built-in Java.
+        ///
+        /// @return canonical runtime identifier
+        public String getRuntime() {
+            return runtime == null || runtime.isBlank() ? PluginRuntimeTypes.JAVA : runtime;
+        }
+
+        /// Returns the required ABI generation, defaulting legacy packages to ABI 1.
+        ///
+        /// @return required HMCL Plugin ABI generation
+        public int getAbi() {
+            return Objects.requireNonNullElse(abi, PluginAbi.ABI_1);
+        }
+
+        /// Returns sorted canonical platform targets, or an empty immutable list when unrestricted.
+        ///
+        /// @return normalized immutable platform target identifiers
+        public @Unmodifiable List<String> getPlatforms() {
+            @Nullable List<@Nullable String> values = platforms;
+            if (values == null || values.isEmpty()) {
+                return List.of();
+            }
+            return values.stream().map(Objects::requireNonNull).sorted().toList();
+        }
+
+        /// Converts this validated store entry to the shared compatibility evaluator contract.
+        ///
+        /// @return immutable launcher, schema, runtime, ABI, and platform requirements
+        public PluginCompatibilityRequirements toCompatibilityRequirements() {
+            @Unmodifiable List<PluginPlatformTarget> platformTargets = getPlatforms().stream()
+                    .map(PluginPlatformTarget::parse)
+                    .toList();
+            return new PluginCompatibilityRequirements(
+                    getPluginApiVersion(),
+                    getLauncherVersion(),
+                    getRuntime(),
+                    getAbi(),
+                    platformTargets
+            );
         }
 
         /// Returns whether this version is expected to require a restart.
@@ -526,6 +635,7 @@ public final class PluginStoreManifest {
                 throw new IOException("Plugin version " + version + " requires unsupported plugin API "
                         + pluginApiVersion);
             }
+            validateRuntimeCompatibilityMetadata();
             if (releaseDate != null && !releaseDate.isBlank()) {
                 try {
                     LocalDate.parse(releaseDate);
@@ -608,6 +718,75 @@ public final class PluginStoreManifest {
                         throw new IOException("Plugin version " + version + " has duplicate dependency "
                                 + dependency.getId());
                     }
+                }
+            }
+        }
+
+        /// Validates schema-v5 runtime, ABI, and platform metadata and rejects it on legacy packages.
+        ///
+        /// @throws IOException if compatibility metadata is absent, unsupported, or not canonical
+        private void validateRuntimeCompatibilityMetadata() throws IOException {
+            if (pluginApiVersion < 5) {
+                if (runtimeDeclared || runtime != null) {
+                    throw new IOException("Plugin API " + pluginApiVersion + " cannot declare runtime");
+                }
+                if (abiDeclared) {
+                    throw new IOException("Plugin API " + pluginApiVersion + " cannot declare abi");
+                }
+                if (platformsDeclared || platforms != null) {
+                    throw new IOException("Plugin API " + pluginApiVersion + " cannot declare platforms");
+                }
+                return;
+            }
+
+            if (!runtimeDeclared) {
+                throw new IOException("Plugin API 5 version " + version + " must declare runtime");
+            }
+            if (runtime == null || runtime.isBlank()) {
+                throw new IOException("Plugin API 5 version " + version + " has null or blank runtime");
+            }
+            try {
+                String canonicalRuntime = PluginRuntimeTypes.requireValid(runtime);
+                if (!runtime.equals(canonicalRuntime)) {
+                    throw new IOException("Plugin runtime identifier must be canonical: " + runtime);
+                }
+            } catch (IllegalArgumentException exception) {
+                throw new IOException("Invalid plugin runtime identifier: " + runtime, exception);
+            }
+
+            if (!abiDeclared) {
+                throw new IOException("Plugin API 5 version " + version + " must declare abi");
+            }
+            if (abi == null) {
+                throw new IOException("Plugin API 5 version " + version + " has null abi");
+            }
+            try {
+                PluginAbi.requireValid(abi);
+            } catch (IllegalArgumentException exception) {
+                throw new IOException("Unsupported plugin ABI: " + abi, exception);
+            }
+
+            if (!platformsDeclared) {
+                return;
+            }
+            if (platforms == null) {
+                throw new IOException("Plugin platforms cannot be null");
+            }
+            Set<String> seenPlatforms = new HashSet<>();
+            for (@Nullable String platform : platforms) {
+                if (platform == null) {
+                    throw new IOException("Plugin platform target cannot be null");
+                }
+                try {
+                    String canonicalPlatform = PluginPlatformTarget.parse(platform).getId();
+                    if (!canonicalPlatform.equals(platform)) {
+                        throw new IOException("Plugin platform target must be canonical: " + platform);
+                    }
+                    if (!seenPlatforms.add(canonicalPlatform)) {
+                        throw new IOException("Duplicate plugin platform target: " + platform);
+                    }
+                } catch (IllegalArgumentException exception) {
+                    throw new IOException("Invalid plugin platform target: " + platform, exception);
                 }
             }
         }

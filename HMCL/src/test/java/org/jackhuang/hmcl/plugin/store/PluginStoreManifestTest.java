@@ -17,10 +17,13 @@
  */
 package org.jackhuang.hmcl.plugin.store;
 
+import com.google.gson.JsonParser;
 import org.jackhuang.hmcl.plugin.PluginPermission;
+import org.jackhuang.hmcl.plugin.runtime.PluginAbi;
+import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityRequirements;
+import org.jackhuang.hmcl.plugin.runtime.PluginRuntimeTypes;
 import org.jackhuang.hmcl.plugin.trust.PluginTrustLevel;
 import org.jackhuang.hmcl.plugin.trust.PluginTrustResult;
-import org.jackhuang.hmcl.util.gson.JsonUtils;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.junit.jupiter.api.Test;
 
@@ -177,6 +180,131 @@ public final class PluginStoreManifestTest {
         assertEquals(">=26.8-beta.1, <27.0", version.getLauncherVersion());
         assertTrue(version.matchesLauncherVersion("26.8-beta.3"));
         assertFalse(version.matchesLauncherVersion("27.0"));
+        assertEquals(PluginRuntimeTypes.JAVA, version.getRuntime());
+        assertEquals(PluginAbi.ABI_1, version.getAbi());
+        assertTrue(version.getPlatforms().isEmpty());
+    }
+
+    /// Normalizes schema-v5 runtime compatibility metadata and converts it to shared requirements.
+    @Test
+    public void parsePluginApiVersionFiveCompatibilityMetadata() throws IOException {
+        PluginStoreManifest manifest = parseManifest(
+                "dev.hmclce.test.invalid-declarations",
+                versionDeclarations(5, """
+                        "permissions": [],
+                        "requiredPermissions": [],
+                        "launcherVersion": ">=26.8, <28",
+                        "runtime": "java",
+                        "abi": 2,
+                        "platforms": ["windows-x64", "linux"],
+                        "dependencies": []
+                        """)
+        );
+        PluginStoreManifest.PluginVersionEntry version = Objects.requireNonNull(manifest.getLatestVersion());
+        PluginCompatibilityRequirements requirements = version.toCompatibilityRequirements();
+
+        assertEquals(PluginRuntimeTypes.JAVA, version.getRuntime());
+        assertEquals(PluginAbi.ABI_2, version.getAbi());
+        assertEquals(List.of("linux", "windows-x64"), version.getPlatforms());
+        assertThrows(UnsupportedOperationException.class, () -> version.getPlatforms().add("macos"));
+        assertEquals(5, requirements.schemaVersion());
+        assertEquals(">=26.8, <28", requirements.launcherVersion());
+        assertEquals(PluginRuntimeTypes.JAVA, requirements.runtime());
+        assertEquals(PluginAbi.ABI_2, requirements.abi());
+        assertEquals(List.of("linux", "windows-x64"), requirements.platforms().stream()
+                .map(Object::toString)
+                .toList());
+    }
+
+    /// Rejects missing, null, malformed, and noncanonical schema-v5 runtime identifiers.
+    @Test
+    public void rejectInvalidRuntimeDeclarations() {
+        assertManifestRejected(schemaFiveVersionDeclarations("""
+                "permissions": [],
+                "requiredPermissions": [],
+                "launcherVersion": "*",
+                "abi": 2,
+                "dependencies": []
+                """));
+        assertManifestRejected(schemaFiveVersionDeclarations("""
+                "permissions": [],
+                "requiredPermissions": [],
+                "launcherVersion": "*",
+                "runtime": null,
+                "abi": 2,
+                "dependencies": []
+                """));
+        assertManifestRejected(schemaFiveVersionDeclarations("""
+                "permissions": [],
+                "requiredPermissions": [],
+                "launcherVersion": "*",
+                "runtime": "bad/runtime",
+                "abi": 2,
+                "dependencies": []
+                """));
+        assertManifestRejected(schemaFiveVersionDeclarations("""
+                "permissions": [],
+                "requiredPermissions": [],
+                "launcherVersion": "*",
+                "runtime": "Java",
+                "abi": 2,
+                "dependencies": []
+                """));
+    }
+
+    /// Rejects missing, null, nonpositive, and unsupported schema-v5 ABI declarations.
+    @Test
+    public void rejectInvalidAbiDeclarations() {
+        for (String abiDeclaration : List.of("", "\"abi\": null,", "\"abi\": 0,", "\"abi\": 3,")) {
+            assertManifestRejected(schemaFiveVersionDeclarations("""
+                    "permissions": [],
+                    "requiredPermissions": [],
+                    "launcherVersion": "*",
+                    "runtime": "java",
+                    %s
+                    "dependencies": []
+                    """.formatted(abiDeclaration)));
+        }
+    }
+
+    /// Rejects null, malformed, noncanonical, and duplicate schema-v5 platform declarations.
+    @Test
+    public void rejectInvalidPlatformDeclarations() {
+        for (String platforms : List.of(
+                "null",
+                "[null]",
+                "[\"plan9\"]",
+                "[\"Windows\"]",
+                "[\"windows\", \"windows\"]"
+        )) {
+            assertManifestRejected(schemaFiveVersionDeclarations("""
+                    "permissions": [],
+                    "requiredPermissions": [],
+                    "launcherVersion": "*",
+                    "runtime": "java",
+                    "abi": 2,
+                    "platforms": %s,
+                    "dependencies": []
+                    """.formatted(platforms)));
+        }
+    }
+
+    /// Rejects schema-v4 declarations of compatibility fields, including explicit null values.
+    @Test
+    public void rejectSchemaFourRuntimeCompatibilityDeclarations() {
+        for (String declaration : List.of(
+                "\"runtime\": null,",
+                "\"abi\": null,",
+                "\"platforms\": null,"
+        )) {
+            assertManifestRejected(schemaFourVersionDeclarations("""
+                    "permissions": [],
+                    "requiredPermissions": [],
+                    "launcherVersion": "*",
+                    %s
+                    "dependencies": []
+                    """.formatted(declaration)));
+        }
     }
 
     /// Keeps schema-v1 manifests compatible without treating their optional dependency list as authoritative.
@@ -411,6 +539,14 @@ public final class PluginStoreManifestTest {
         return versionDeclarations(4, declarationsJson);
     }
 
+    /// Creates a complete schema-v2 manifest around caller-provided API-v5 version declarations.
+    ///
+    /// @param declarationsJson permission, launcher, runtime, ABI, platform, and dependency properties
+    /// @return complete repository manifest JSON
+    private static String schemaFiveVersionDeclarations(String declarationsJson) {
+        return versionDeclarations(5, declarationsJson);
+    }
+
     /// Creates a complete schema-v2 manifest around caller-provided version declarations.
     ///
     /// @param pluginApiVersion package manifest schema version
@@ -442,12 +578,7 @@ public final class PluginStoreManifestTest {
     /// @return validated repository manifest
     /// @throws IOException if the fixture violates repository validation
     private static PluginStoreManifest parseManifest(String expectedPluginId, String json) throws IOException {
-        PluginStoreManifest manifest = Objects.requireNonNull(
-                JsonUtils.GSON.fromJson(json, PluginStoreManifest.class),
-                "Generated repository manifest was null"
-        );
-        manifest.validate(expectedPluginId);
-        return manifest;
+        return PluginStoreManifest.fromJson(JsonParser.parseString(json), expectedPluginId);
     }
 
     /// Asserts that repository validation rejects an invalid declaration fixture.
