@@ -18,6 +18,8 @@
 package org.jackhuang.hmcl.plugin.runtime;
 
 import org.jetbrains.annotations.NotNullByDefault;
+import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.Unmodifiable;
 
 import java.util.Map;
 import java.util.Optional;
@@ -31,6 +33,7 @@ import java.util.stream.Collectors;
 /// the registry both when resolving install plans and when a package without a matching provider loads.
 @NotNullByDefault
 public final class RuntimeProviderRegistry {
+    /// Providers keyed by canonical runtime identifier.
     private final Map<String, RuntimeProvider> providers = new ConcurrentHashMap<>();
 
     /// Creates a registry containing the built-in Java provider.
@@ -38,18 +41,23 @@ public final class RuntimeProviderRegistry {
         register(new JavaRuntimeProvider());
     }
 
-    /// Registers or replaces the provider serving one runtime type.
+    /// Registers the provider serving one runtime type without replacing an existing provider.
     ///
     /// @throws IllegalArgumentException when the runtime identifier is malformed
+    /// @throws IllegalStateException when the canonical runtime identifier is already registered
     public void register(RuntimeProvider provider) {
         String type = PluginRuntimeTypes.requireValid(provider.runtimeType());
-        providers.put(type, provider);
+        @Nullable RuntimeProvider existing = providers.putIfAbsent(type, provider);
+        if (existing != null) {
+            throw new IllegalStateException("Plugin runtime provider is already registered: " + type);
+        }
     }
 
     /// Removes the provider serving one runtime type; the built-in Java provider is never removed.
     public void unregister(String runtimeType) {
-        if (!PluginRuntimeTypes.JAVA.equals(runtimeType)) {
-            providers.remove(PluginRuntimeTypes.requireValid(runtimeType));
+        String type = PluginRuntimeTypes.requireValid(runtimeType);
+        if (!PluginRuntimeTypes.JAVA.equals(type)) {
+            providers.remove(type);
         }
     }
 
@@ -64,9 +72,9 @@ public final class RuntimeProviderRegistry {
     }
 
     /// Returns a snapshot description of every registered provider keyed by runtime type.
-    public Map<String, String> describeAll() {
-        return providers.values().stream()
-                .collect(Collectors.toMap(RuntimeProvider::runtimeType, RuntimeProvider::describe));
+    public @Unmodifiable Map<String, String> describeAll() {
+        return providers.entrySet().stream()
+                .collect(Collectors.toUnmodifiableMap(Map.Entry::getKey, entry -> entry.getValue().describe()));
     }
 
     /// Returns the number of registered providers, used by diagnostics and tests.

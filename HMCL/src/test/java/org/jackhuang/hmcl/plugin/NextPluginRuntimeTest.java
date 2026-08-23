@@ -26,11 +26,13 @@ import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Unmodifiable;
 import org.junit.jupiter.api.Test;
 
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -111,6 +113,102 @@ public final class NextPluginRuntimeTest {
         assertThrows(IllegalArgumentException.class, () -> registry.find("Dot Net"));
     }
 
+    /// Rejects duplicate external runtime providers without replacing the first registration.
+    @Test
+    public void rejectDuplicateExternalRuntimeProvider() {
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        RuntimeProvider first = provider("dotnet", "First .NET host", Set.of(PluginAbi.ABI_1));
+        RuntimeProvider duplicate = provider(" DOTNET ", "Duplicate .NET host", Set.of(PluginAbi.ABI_2));
+        registry.register(first);
+
+        IllegalStateException exception = assertThrows(IllegalStateException.class,
+                () -> registry.register(duplicate));
+
+        assertTrue(exception.getMessage().contains("dotnet"));
+        assertSame(first, registry.find("dotnet").orElseThrow());
+    }
+
+    /// Rejects a provider whose canonical runtime identifier would replace built-in Java.
+    @Test
+    public void rejectDuplicateJavaRuntimeProvider() {
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        RuntimeProvider duplicate = provider(" JAVA ", "External Java host", Set.of(PluginAbi.ABI_1));
+
+        IllegalStateException exception = assertThrows(IllegalStateException.class,
+                () -> registry.register(duplicate));
+
+        assertTrue(exception.getMessage().contains(PluginRuntimeTypes.JAVA));
+        assertEquals(1, registry.size());
+        assertEquals("Built-in Java plugin runtime (in-process JVM)",
+                registry.find(PluginRuntimeTypes.JAVA).orElseThrow().describe());
+    }
+
+    /// Protects the built-in Java provider after canonicalizing the unregister identifier.
+    @Test
+    public void preserveJavaProviderForCanonicalUnregisterInput() {
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+
+        registry.unregister(" JAVA ");
+
+        assertTrue(registry.isAvailable(PluginRuntimeTypes.JAVA));
+        assertEquals(1, registry.size());
+    }
+
+    /// Allows an explicitly removed external runtime provider to be registered again.
+    @Test
+    public void reregisterRemovedExternalRuntimeProvider() {
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        RuntimeProvider first = provider("dotnet", "First .NET host", Set.of(PluginAbi.ABI_1));
+        RuntimeProvider replacement = provider("dotnet", "Replacement .NET host", Set.of(PluginAbi.ABI_2));
+        registry.register(first);
+
+        registry.unregister(" DOTNET ");
+        registry.register(replacement);
+
+        assertEquals(2, registry.size());
+        assertSame(replacement, registry.find("dotnet").orElseThrow());
+    }
+
+    /// Exposes the registered provider contract through canonical lookup.
+    @Test
+    public void findRuntimeProviderContract() {
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        registry.register(provider("dotnet", "Test .NET host", Set.of(PluginAbi.ABI_1)));
+
+        RuntimeProvider found = registry.find(" DOTNET ").orElseThrow();
+
+        assertEquals("dotnet", found.runtimeType());
+        assertEquals("Test .NET host", found.describe());
+        assertTrue(found.supportsAbi(PluginAbi.ABI_1));
+        assertFalse(found.supportsAbi(PluginAbi.ABI_2));
+    }
+
+    /// Keys provider descriptions by the canonical identifiers stored in the registry.
+    @Test
+    public void describeRuntimeProvidersWithCanonicalRegistryIds() {
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        registry.register(provider(" PYTHON ", "Test Python host", Set.of(PluginAbi.ABI_1)));
+
+        @Unmodifiable Map<String, String> descriptions = registry.describeAll();
+
+        assertEquals("Test Python host", descriptions.get("python"));
+        assertFalse(descriptions.containsKey(" PYTHON "));
+    }
+
+    /// Returns an immutable provider-description snapshot independent of later registry changes.
+    @Test
+    public void describeRuntimeProvidersAsImmutableSnapshot() {
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        registry.register(provider("dotnet", "Test .NET host", Set.of(PluginAbi.ABI_1)));
+        @Unmodifiable Map<String, String> descriptions = registry.describeAll();
+
+        registry.unregister("dotnet");
+
+        assertEquals("Test .NET host", descriptions.get("dotnet"));
+        assertThrows(UnsupportedOperationException.class,
+                () -> descriptions.put("python", "Mutable description"));
+    }
+
     /// Verifies the risk tier assigned to each declared permission.
     @Test
     public void permissionTierClassification() {
@@ -134,5 +232,36 @@ public final class NextPluginRuntimeTest {
         assertEquals(PluginCapabilityLevel.HOOK, PluginCapabilityLevel.of(true, false));
         assertEquals(PluginCapabilityLevel.PATCH, PluginCapabilityLevel.of(false, true));
         assertEquals(PluginCapabilityLevel.PATCH, PluginCapabilityLevel.of(true, true));
+    }
+
+    /// Creates a runtime provider with the supplied immutable test contract.
+    ///
+    /// @param runtimeType provider runtime identifier
+    /// @param description provider diagnostic description
+    /// @param implementedAbis ABI generations implemented by the provider
+    /// @return runtime provider exposing the supplied values
+    private static RuntimeProvider provider(
+            String runtimeType,
+            String description,
+            @Unmodifiable Set<Integer> implementedAbis) {
+        return new RuntimeProvider() {
+            /// Returns the configured runtime identifier.
+            @Override
+            public String runtimeType() {
+                return runtimeType;
+            }
+
+            /// Returns the configured ABI generations.
+            @Override
+            public @Unmodifiable Set<Integer> implementedPluginAbis() {
+                return implementedAbis;
+            }
+
+            /// Returns the configured diagnostic description.
+            @Override
+            public String describe() {
+                return description;
+            }
+        };
     }
 }
