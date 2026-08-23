@@ -23,6 +23,9 @@ import com.google.gson.JsonParser;
 import com.google.gson.annotations.SerializedName;
 import org.jackhuang.hmcl.util.gson.JsonUtils;
 import org.jetbrains.annotations.NotNullByDefault;
+import org.jackhuang.hmcl.plugin.runtime.PluginAbi;
+import org.jackhuang.hmcl.plugin.runtime.PluginPlatformTarget;
+import org.jackhuang.hmcl.plugin.runtime.PluginRuntimeTypes;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
 
@@ -40,7 +43,7 @@ import java.util.regex.Pattern;
 @NotNullByDefault
 public final class PluginManifest {
     /// Current manifest schema understood by HMCL and the plugin SDK.
-    public static final int CURRENT_SCHEMA_VERSION = 4;
+    public static final int CURRENT_SCHEMA_VERSION = 5;
 
     /// Only manifest schema whose plugin code may install or execute.
     public static final int MIN_EXECUTABLE_SCHEMA_VERSION = 4;
@@ -122,6 +125,21 @@ public final class PluginManifest {
 
     /// Whether the source JSON explicitly contained the schema-v4 `launcherVersion` property.
     private transient boolean launcherVersionDeclared;
+
+    /// Schema-v5 runtime identifier; defaults to the built-in Java runtime.
+    @SerializedName("runtime")
+    private @Nullable String runtime;
+
+    /// Schema-v5 HMCL Plugin ABI generation required by this package; ABI 1 when omitted.
+    @SerializedName("abi")
+    private int abi = PluginAbi.ABI_1;
+
+    /// Schema-v5 platform targets; null means platform independent.
+    @SerializedName("platforms")
+    private @Nullable List<@Nullable String> platforms;
+
+    /// Whether the source JSON explicitly contained the schema-v5 `platforms` property.
+    private transient boolean platformsDeclared;
 
     /// Mixin configuration resources contributed by Java or Kotlin plugins.
     @SerializedName("mixins")
@@ -402,6 +420,26 @@ public final class PluginManifest {
         );
     }
 
+    /// Returns the schema-v5 runtime identifier, defaulting to the built-in Java runtime.
+    public String getRuntime() {
+        return runtime == null || runtime.isBlank() ? PluginRuntimeTypes.JAVA : runtime;
+    }
+
+    /// Returns the HMCL Plugin ABI generation required by this package; ABI 1 when omitted.
+    public int getAbi() {
+        return abi;
+    }
+
+    /// Returns whether the source JSON explicitly declared platform targets.
+    public boolean isPlatformRestricted() {
+        return platformsDeclared;
+    }
+
+    /// Returns the raw schema-v5 platform target identifiers, or null when platform independent.
+    public @Nullable List<@Nullable String> getPlatforms() {
+        return platforms;
+    }
+
     /// Validates all fields used by discovery, dependency resolution, lifecycle loading, and Mixin bootstrap.
     ///
     /// @throws IOException if the manifest is invalid or unsupported
@@ -419,6 +457,47 @@ public final class PluginManifest {
         }
         requireNonBlank(entrypoint, "entrypoint");
         requireValidIconResource(icon);
+
+        if (schemaVersion >= 5) {
+            if (runtime == null || runtime.isBlank()) {
+                throw new IOException("Schema-v5 plugin manifest must declare runtime");
+            }
+            try {
+                PluginRuntimeTypes.requireValid(runtime);
+            } catch (IllegalArgumentException exception) {
+                throw new IOException("Invalid plugin runtime identifier: " + runtime, exception);
+            }
+            try {
+                PluginAbi.requireValid(abi);
+            } catch (IllegalArgumentException exception) {
+                throw new IOException("Unsupported plugin manifest abi: " + abi, exception);
+            }
+        } else if (runtime != null) {
+            throw new IOException("Plugin manifest schemaVersion " + schemaVersion
+                    + " cannot declare runtime");
+        }
+        if (platformsDeclared) {
+            if (schemaVersion < 5) {
+                throw new IOException("Plugin manifest schemaVersion " + schemaVersion
+                        + " cannot declare platforms");
+            }
+            if (platforms == null) {
+                throw new IOException("Plugin platforms cannot be null");
+            }
+            java.util.Set<String> seenPlatforms = new java.util.HashSet<>();
+            for (@Nullable String platform : platforms) {
+                if (platform == null) {
+                    throw new IOException("Plugin platform target cannot be null");
+                }
+                try {
+                    if (!seenPlatforms.add(PluginPlatformTarget.parse(platform).getId())) {
+                        throw new IOException("Duplicate plugin platform target: " + platform);
+                    }
+                } catch (IllegalArgumentException exception) {
+                    throw new IOException("Invalid plugin platform target: " + platform, exception);
+                }
+            }
+        }
 
         if (schemaVersion >= 3 && !permissionsDeclared) {
             throw new IOException("Schema-v3 plugin manifest must declare permissions");
@@ -550,6 +629,9 @@ public final class PluginManifest {
         manifest.minLauncherVersionDeclared = json != null
                 && json.isJsonObject()
                 && json.getAsJsonObject().has("minLauncherVersion");
+        manifest.platformsDeclared = json != null
+                && json.isJsonObject()
+                && json.getAsJsonObject().has("platforms");
         manifest.launcherVersionDeclared = json != null
                 && json.isJsonObject()
                 && json.getAsJsonObject().has("launcherVersion");
