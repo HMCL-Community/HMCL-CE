@@ -19,6 +19,7 @@ package org.jackhuang.hmcl.plugin.store;
 
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.google.gson.JsonParseException;
 import com.google.gson.annotations.SerializedName;
 import org.jackhuang.hmcl.plugin.PluginDependency;
 import org.jackhuang.hmcl.plugin.PluginManifest;
@@ -196,7 +197,12 @@ public final class PluginStoreManifest {
             throw new IOException("Plugin repository manifest is not an object");
         }
         JsonObject root = json.getAsJsonObject();
-        @Nullable PluginStoreManifest manifest = JsonUtils.GSON.fromJson(root, PluginStoreManifest.class);
+        @Nullable PluginStoreManifest manifest;
+        try {
+            manifest = JsonUtils.GSON.fromJson(root, PluginStoreManifest.class);
+        } catch (JsonParseException exception) {
+            throw new IOException("Plugin repository manifest is malformed", exception);
+        }
         if (manifest == null) {
             throw new IOException("Plugin repository manifest is empty");
         }

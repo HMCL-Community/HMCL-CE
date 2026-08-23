@@ -28,6 +28,12 @@ import java.util.Optional;
 /// Evaluates plugin package requirements against launcher, platform, runtime, and ABI capabilities.
 @NotNullByDefault
 public final class PluginCompatibilityEvaluator {
+    /// Evaluator shared by production plugin compatibility consumers.
+    private static final PluginCompatibilityEvaluator PROCESS_WIDE = new PluginCompatibilityEvaluator(
+            RuntimeProviderRegistry.processWide(),
+            PluginPlatformTarget.current()
+    );
+
     /// Runtime providers currently available to execute plugin packages.
     private final RuntimeProviderRegistry runtimeProviders;
 
@@ -43,6 +49,11 @@ public final class PluginCompatibilityEvaluator {
             PluginPlatformTarget hostPlatform) {
         this.runtimeProviders = runtimeProviders;
         this.hostPlatform = hostPlatform;
+    }
+
+    /// Returns the process-wide evaluator backed by the shared runtime provider registry.
+    public static PluginCompatibilityEvaluator processWide() {
+        return PROCESS_WIDE;
     }
 
     /// Evaluates package requirements in deterministic diagnostic-priority order.

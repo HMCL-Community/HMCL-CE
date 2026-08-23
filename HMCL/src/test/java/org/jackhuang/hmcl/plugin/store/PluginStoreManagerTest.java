@@ -21,6 +21,7 @@ import com.google.gson.JsonParser;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import org.jackhuang.hmcl.Metadata;
+import org.jackhuang.hmcl.plugin.runtime.PluginAbi;
 import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityEvaluator;
 import org.jackhuang.hmcl.plugin.runtime.PluginPlatformTarget;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProvider;
@@ -547,25 +548,7 @@ public final class PluginStoreManagerTest {
     @Test
     public void evaluateStoreCompatibilityWithSharedRuntimeContract() throws IOException {
         RuntimeProviderRegistry runtimeProviders = new RuntimeProviderRegistry();
-        runtimeProviders.register(new RuntimeProvider() {
-            /// Returns the test runtime identifier.
-            @Override
-            public String runtimeType() {
-                return "limited";
-            }
-
-            /// Restricts this test provider to ABI 1.
-            @Override
-            public @Unmodifiable Set<Integer> implementedPluginAbis() {
-                return Set.of(1);
-            }
-
-            /// Describes the deliberately ABI-limited test provider.
-            @Override
-            public String describe() {
-                return "ABI-limited test runtime";
-            }
-        });
+        runtimeProviders.register(runtimeProvider("limited", Set.of(1)));
         PluginStoreManager manager = new PluginStoreManager(new PluginCompatibilityEvaluator(
                 runtimeProviders,
                 PluginPlatformTarget.parse("windows-x64")
@@ -622,6 +605,31 @@ public final class PluginStoreManagerTest {
                 "abi": 2,
                 "dependencies": []
                 """), "limited", "ABI 2", "[1]");
+    }
+
+    /// Observes providers registered after a production store manager has been constructed.
+    @Test
+    public void useProcessWideRuntimeProvidersForStoreCompatibility() throws IOException {
+        String runtimeType = "store-shared-test";
+        RuntimeProviderRegistry runtimeProviders = RuntimeProviderRegistry.processWide();
+        runtimeProviders.unregister(runtimeType);
+        PluginStoreManager manager = new PluginStoreManager();
+        PluginStoreManifest.PluginVersionEntry version = compatibilityVersion(5, """
+                "permissions": [],
+                "requiredPermissions": [],
+                "launcherVersion": "*",
+                "runtime": "%s",
+                "abi": 1,
+                "dependencies": []
+                """.formatted(runtimeType));
+
+        assertFalse(manager.isCompatible(version));
+        try {
+            runtimeProviders.register(runtimeProvider(runtimeType, Set.of(PluginAbi.ABI_1)));
+            assertTrue(manager.isCompatible(version));
+        } finally {
+            runtimeProviders.unregister(runtimeType);
+        }
     }
 
     /// Persists favorite changes across repository instances and rejects IDs that cannot be stored safely.
@@ -1528,6 +1536,36 @@ public final class PluginStoreManagerTest {
             assertTrue(exception.getMessage().contains(expectedDetail), exception.getMessage());
         }
         assertFalse(manager.isCompatible(version));
+    }
+
+    /// Creates a runtime provider with the supplied canonical type and ABI generations.
+    ///
+    /// @param runtimeType canonical runtime identifier
+    /// @param implementedAbis ABI generations implemented by the provider
+    /// @return test runtime provider
+    private static RuntimeProvider runtimeProvider(
+            String runtimeType,
+            @Unmodifiable Set<Integer> implementedAbis
+    ) {
+        return new RuntimeProvider() {
+            /// Returns the configured runtime identifier.
+            @Override
+            public String runtimeType() {
+                return runtimeType;
+            }
+
+            /// Returns the configured immutable ABI set.
+            @Override
+            public @Unmodifiable Set<Integer> implementedPluginAbis() {
+                return implementedAbis;
+            }
+
+            /// Describes the deterministic test runtime provider.
+            @Override
+            public String describe() {
+                return "Test runtime provider " + runtimeType;
+            }
+        };
     }
 
     /// Parses and validates one repository manifest fixture.

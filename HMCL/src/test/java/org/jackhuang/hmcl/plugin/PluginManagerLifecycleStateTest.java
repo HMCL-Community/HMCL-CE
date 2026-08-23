@@ -184,39 +184,41 @@ public final class PluginManagerLifecycleStateTest {
         Path localHome = temporaryDirectory.resolve("home");
         String dependencyId = "dev.hmclce.test.runtime-intent-dependency";
         String dependentId = "dev.hmclce.test.runtime-intent-dependent";
-        RuntimeProviderRegistry runtimeProviders = new RuntimeProviderRegistry();
-        PluginCompatibilityEvaluator evaluator = new PluginCompatibilityEvaluator(
-                runtimeProviders,
-                PluginPlatformTarget.current()
-        );
-        PluginManager manager = new PluginManager(localHome, evaluator);
-        writeSchemaFivePluginPackage(
-                manager.getPluginsDirectory().resolve(dependencyId + ".npl"),
-                dependencyId,
-                "dotnet",
-                PluginAbi.ABI_1,
-                "[]"
-        );
-        writeSchemaFivePluginPackage(
-                manager.getPluginsDirectory().resolve(dependentId + ".npl"),
-                dependentId,
-                PluginRuntimeTypes.JAVA,
-                PluginAbi.ABI_1,
-                "[]",
-                "[{\"id\":\"" + dependencyId + "\",\"version\":\">=1.0.0\"}]"
-        );
+        String runtimeType = "lifecycle-shared-test";
+        RuntimeProviderRegistry runtimeProviders = RuntimeProviderRegistry.processWide();
+        runtimeProviders.unregister(runtimeType);
+        try {
+            PluginManager manager = new PluginManager(localHome);
+            writeSchemaFivePluginPackage(
+                    manager.getPluginsDirectory().resolve(dependencyId + ".npl"),
+                    dependencyId,
+                    runtimeType,
+                    PluginAbi.ABI_1,
+                    "[]"
+            );
+            writeSchemaFivePluginPackage(
+                    manager.getPluginsDirectory().resolve(dependentId + ".npl"),
+                    dependentId,
+                    PluginRuntimeTypes.JAVA,
+                    PluginAbi.ABI_1,
+                    "[]",
+                    "[{\"id\":\"" + dependencyId + "\",\"version\":\">=1.0.0\"}]"
+            );
 
-        assertFalse(manager.enablePlugin(dependentId));
-        assertTrue(manager.isPluginEnabled(dependentId));
-        assertTrue(manager.isPluginEnabled(dependencyId));
+            assertFalse(manager.enablePlugin(dependentId));
+            assertTrue(manager.isPluginEnabled(dependentId));
+            assertTrue(manager.isPluginEnabled(dependencyId));
 
-        runtimeProviders.register(runtimeProvider("dotnet", Set.of(PluginAbi.ABI_1)));
-        FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
+            runtimeProviders.register(runtimeProvider(runtimeType, Set.of(PluginAbi.ABI_1)));
+            FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
 
-        assertTrue(Objects.requireNonNull(manager.getPlugin(dependencyId)).isEnabled());
-        assertTrue(Objects.requireNonNull(manager.getPlugin(dependentId)).isEnabled());
-        assertEquals(PluginRuntimeStatus.ENABLED, manager.getPluginRuntimeStatus(dependencyId));
-        assertEquals(PluginRuntimeStatus.ENABLED, manager.getPluginRuntimeStatus(dependentId));
+            assertTrue(Objects.requireNonNull(manager.getPlugin(dependencyId)).isEnabled());
+            assertTrue(Objects.requireNonNull(manager.getPlugin(dependentId)).isEnabled());
+            assertEquals(PluginRuntimeStatus.ENABLED, manager.getPluginRuntimeStatus(dependencyId));
+            assertEquals(PluginRuntimeStatus.ENABLED, manager.getPluginRuntimeStatus(dependentId));
+        } finally {
+            runtimeProviders.unregister(runtimeType);
+        }
     }
 
     /// Clears restart-pending enablement for an unloaded dependent when its installed dependency is disabled.

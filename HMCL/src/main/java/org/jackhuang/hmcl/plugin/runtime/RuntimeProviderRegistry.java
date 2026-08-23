@@ -33,12 +33,20 @@ import java.util.stream.Collectors;
 /// the registry both when resolving install plans and when a package without a matching provider loads.
 @NotNullByDefault
 public final class RuntimeProviderRegistry {
+    /// Registry shared by production plugin compatibility consumers.
+    private static final RuntimeProviderRegistry PROCESS_WIDE = new RuntimeProviderRegistry();
+
     /// Providers keyed by canonical runtime identifier.
     private final Map<String, RuntimeProvider> providers = new ConcurrentHashMap<>();
 
     /// Creates a registry containing the built-in Java provider.
     public RuntimeProviderRegistry() {
         register(new JavaRuntimeProvider());
+    }
+
+    /// Returns the process-wide registry used by production plugin services.
+    public static RuntimeProviderRegistry processWide() {
+        return PROCESS_WIDE;
     }
 
     /// Registers the provider serving one runtime type without replacing an existing provider.

@@ -30,8 +30,6 @@ import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityEvaluator;
 import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityRequirements;
 import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityResult;
 import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityStatus;
-import org.jackhuang.hmcl.plugin.runtime.PluginPlatformTarget;
-import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderRegistry;
 import org.jackhuang.hmcl.plugin.trust.PluginCertificationReceipt;
 import org.jackhuang.hmcl.plugin.trust.PluginCertificationReceiptStore;
 import org.jackhuang.hmcl.plugin.trust.PluginRuntimeTrustGuard;
@@ -149,10 +147,7 @@ public final class PluginManager {
                 localHome,
                 trustConstructionStack,
                 explicitRuntimeTrustGuard,
-                new PluginCompatibilityEvaluator(
-                        new RuntimeProviderRegistry(),
-                        PluginPlatformTarget.current()
-                )
+                PluginCompatibilityEvaluator.processWide()
         );
     }
 

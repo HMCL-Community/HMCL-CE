@@ -27,8 +27,6 @@ import org.jackhuang.hmcl.plugin.PluginManifest;
 import org.jackhuang.hmcl.plugin.PluginVersion;
 import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityEvaluator;
 import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityResult;
-import org.jackhuang.hmcl.plugin.runtime.PluginPlatformTarget;
-import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderRegistry;
 import org.jackhuang.hmcl.plugin.trust.PluginCertificationReceipt;
 import org.jackhuang.hmcl.plugin.trust.PluginDocumentVerification;
 import org.jackhuang.hmcl.plugin.trust.PluginRepositoryAttestation;
@@ -256,11 +254,11 @@ public final class PluginStoreManager {
         }
     }
 
-    /// Creates the production evaluator backed by built-in runtime providers and the current host platform.
+    /// Returns the production evaluator backed by the process-wide runtime provider registry.
     ///
     /// @return production compatibility evaluator
     private static PluginCompatibilityEvaluator createDefaultCompatibilityEvaluator() {
-        return new PluginCompatibilityEvaluator(new RuntimeProviderRegistry(), PluginPlatformTarget.current());
+        return PluginCompatibilityEvaluator.processWide();
     }
 
     /// Creates a store manager with an explicit verifier for package-local tests.
@@ -1339,7 +1337,8 @@ public final class PluginStoreManager {
     /// @param packageFile verified temporary `.npl` file
     /// @param expectedPluginId plugin ID from the registry
     /// @param expectedVersion complete remote version metadata
-    /// @throws IOException if package identity, version, schema, permissions, or dependencies differ from metadata
+    /// @throws IOException if package identity, version, schema, permissions, required permissions, dependencies,
+    /// runtime, ABI, platforms, or launcher version differ from the selected metadata
     private static void validateDownloadedPackage(
             Path packageFile,
             String expectedPluginId,

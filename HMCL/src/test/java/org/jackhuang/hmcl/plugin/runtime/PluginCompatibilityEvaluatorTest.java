@@ -30,12 +30,35 @@ import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// Verifies shared plugin compatibility requirements and ordered compatibility diagnostics.
 @NotNullByDefault
 public final class PluginCompatibilityEvaluatorTest {
+    /// Shares one mutable provider registry and evaluator across production compatibility consumers.
+    @Test
+    public void exposeProcessWideCompatibilityServices() {
+        String runtimeType = "process-wide-test";
+        RuntimeProviderRegistry registry = RuntimeProviderRegistry.processWide();
+        PluginCompatibilityEvaluator evaluator = PluginCompatibilityEvaluator.processWide();
+        PluginCompatibilityRequirements requirements = new PluginCompatibilityRequirements(
+                5, "*", runtimeType, PluginAbi.ABI_1, List.of());
+        registry.unregister(runtimeType);
+
+        assertSame(registry, RuntimeProviderRegistry.processWide());
+        assertSame(evaluator, PluginCompatibilityEvaluator.processWide());
+        assertStatus(PluginCompatibilityStatus.MISSING_RUNTIME, evaluator.evaluate(requirements, "26.8"));
+
+        try {
+            registry.register(provider(runtimeType, Set.of(PluginAbi.ABI_1)));
+            assertStatus(PluginCompatibilityStatus.COMPATIBLE, evaluator.evaluate(requirements, "26.8"));
+        } finally {
+            registry.unregister(runtimeType);
+        }
+    }
+
     /// Defensively copies platform requirements and exposes them as an immutable list.
     @Test
     public void copyRequiredPlatformsDefensively() {

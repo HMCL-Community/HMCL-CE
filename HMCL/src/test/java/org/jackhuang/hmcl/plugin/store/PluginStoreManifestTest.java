@@ -17,6 +17,7 @@
  */
 package org.jackhuang.hmcl.plugin.store;
 
+import com.google.gson.JsonParseException;
 import com.google.gson.JsonParser;
 import org.jackhuang.hmcl.plugin.PluginPermission;
 import org.jackhuang.hmcl.plugin.runtime.PluginAbi;
@@ -33,6 +34,7 @@ import java.util.Objects;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertIterableEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -41,6 +43,23 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /// Verifies repository schema compatibility, version history, and version-scoped security metadata.
 @NotNullByDefault
 public final class PluginStoreManifestTest {
+    /// Wraps malformed Gson field mappings in the manifest parser's checked I/O contract.
+    @Test
+    public void wrapMalformedFieldTypeAsIOException() {
+        IOException exception = assertThrows(IOException.class, () -> PluginStoreManifest.fromJson(
+                JsonParser.parseString("""
+                        {
+                          "schemaVersion": 2,
+                          "id": "dev.hmclce.test.malformed-type",
+                          "versions": {}
+                        }
+                        """),
+                "dev.hmclce.test.malformed-type"
+        ));
+
+        assertInstanceOf(JsonParseException.class, exception.getCause());
+    }
+
     /// Parses repository identity and keeps certification declarations and trust decisions on their exact versions.
     @Test
     public void certificationMetadataAndTrustAreVersionScoped() throws IOException {

@@ -33,8 +33,6 @@ import org.jackhuang.hmcl.plugin.internal.VerifiedPluginPackage;
 import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityEvaluator;
 import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityRequirements;
 import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityResult;
-import org.jackhuang.hmcl.plugin.runtime.PluginPlatformTarget;
-import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderRegistry;
 import org.jackhuang.hmcl.plugin.trust.PluginRuntimeTrustGuard;
 import org.jackhuang.hmcl.util.SelfDependencyPatcher;
 import org.jetbrains.annotations.NotNullByDefault;
@@ -263,10 +261,7 @@ public final class HmclMixinBootstrap {
             runtimeTrustGuard = PluginRuntimeTrustGuard.inactive();
         }
         PluginCompatibilityEvaluator compatibilityEvaluator = explicitCompatibilityEvaluator == null
-                ? new PluginCompatibilityEvaluator(
-                        new RuntimeProviderRegistry(),
-                        PluginPlatformTarget.current()
-                )
+                ? PluginCompatibilityEvaluator.processWide()
                 : explicitCompatibilityEvaluator;
         @Unmodifiable List<PluginLaunchDescriptor> descriptors =
                 discoverEnabledJvmPlugins(localHome, runtimeTrustGuard, compatibilityEvaluator);

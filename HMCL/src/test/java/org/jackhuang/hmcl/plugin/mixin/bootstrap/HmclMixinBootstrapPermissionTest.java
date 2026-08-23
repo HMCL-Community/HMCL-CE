@@ -214,6 +214,36 @@ public final class HmclMixinBootstrapPermissionTest {
         assertMixinDenied(temporaryDirectory);
     }
 
+    /// Uses a provider registered through the process-wide registry during default Mixin discovery.
+    ///
+    /// @param temporaryDirectory isolated launcher home
+    /// @throws Exception if package, state, grant, or startup inspection fails
+    @Test
+    public void acceptProcessWideRuntimeProviderDuringMixinDiscovery(
+            @TempDir Path temporaryDirectory
+    ) throws Exception {
+        String runtimeType = "mixin-shared-test";
+        writeAuthorizedSchemaFiveMixinPackage(
+                temporaryDirectory,
+                runtimeType,
+                PluginAbi.ABI_1,
+                "[]"
+        );
+        RuntimeProviderRegistry runtimeProviders = RuntimeProviderRegistry.processWide();
+        runtimeProviders.unregister(runtimeType);
+
+        try {
+            runtimeProviders.register(runtimeProvider(runtimeType, Set.of(PluginAbi.ABI_1)));
+            HmclMixinBootstrap.AgentConfiguration configuration =
+                    HmclMixinBootstrap.prepareAgentConfiguration(temporaryDirectory);
+
+            assertEquals(List.of(MIXIN_CONFIG), configuration.mixinConfigs());
+            assertEquals(List.of(PLUGIN_ID), configuration.activePluginIds());
+        } finally {
+            runtimeProviders.unregister(runtimeType);
+        }
+    }
+
     /// Rejects an otherwise authorized raw schema-v5 Mixin package requiring an unsupported provider ABI.
     ///
     /// @param temporaryDirectory isolated launcher home
