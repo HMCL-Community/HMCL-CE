@@ -21,6 +21,13 @@ import org.jackhuang.hmcl.plugin.LifecycleProbePlugin;
 import org.jackhuang.hmcl.plugin.PluginManifest;
 import org.jackhuang.hmcl.plugin.PluginMutationLock;
 import org.jackhuang.hmcl.plugin.internal.PluginPackageVersions;
+import org.jackhuang.hmcl.plugin.runtime.PluginAbi;
+import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityEvaluator;
+import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityRequirements;
+import org.jackhuang.hmcl.plugin.runtime.PluginPlatformTarget;
+import org.jackhuang.hmcl.plugin.runtime.PluginRuntimeTypes;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeProvider;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderRegistry;
 import org.jackhuang.hmcl.plugin.trust.PluginRuntimeTrustGuard;
 import org.jackhuang.hmcl.plugin.trust.PluginRuntimeTrustTestSupport;
 import org.jetbrains.annotations.NotNullByDefault;
@@ -40,6 +47,7 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -169,6 +177,63 @@ public final class HmclMixinBootstrapPermissionTest {
         writePluginPackage(temporaryDirectory, 2, "1.0.0", false);
 
         assertMixinDenied(temporaryDirectory);
+    }
+
+    /// Rejects an otherwise authorized raw schema-v5 Mixin package targeting another host platform.
+    ///
+    /// @param temporaryDirectory isolated launcher home
+    /// @throws Exception if package, state, grant, or startup inspection fails
+    @Test
+    public void rejectRawMixinPackageForUnsupportedPlatform(@TempDir Path temporaryDirectory) throws Exception {
+        String incompatiblePlatform = PluginPlatformTarget.current().getOperatingSystem().equals("windows")
+                ? "linux"
+                : "windows";
+        writeAuthorizedSchemaFiveMixinPackage(
+                temporaryDirectory,
+                PluginRuntimeTypes.JAVA,
+                PluginAbi.ABI_1,
+                "[\"" + incompatiblePlatform + "\"]"
+        );
+
+        assertMixinDenied(temporaryDirectory);
+    }
+
+    /// Rejects an otherwise authorized raw schema-v5 Mixin package with no runtime provider.
+    ///
+    /// @param temporaryDirectory isolated launcher home
+    /// @throws Exception if package, state, grant, or startup inspection fails
+    @Test
+    public void rejectRawMixinPackageForMissingRuntime(@TempDir Path temporaryDirectory) throws Exception {
+        writeAuthorizedSchemaFiveMixinPackage(
+                temporaryDirectory,
+                "dotnet",
+                PluginAbi.ABI_1,
+                "[]"
+        );
+
+        assertMixinDenied(temporaryDirectory);
+    }
+
+    /// Rejects an otherwise authorized raw schema-v5 Mixin package requiring an unsupported provider ABI.
+    ///
+    /// @param temporaryDirectory isolated launcher home
+    /// @throws Exception if package, state, grant, or startup inspection fails
+    @Test
+    public void rejectRawMixinPackageForUnsupportedProviderAbi(@TempDir Path temporaryDirectory) throws Exception {
+        writeAuthorizedSchemaFiveMixinPackage(
+                temporaryDirectory,
+                "dotnet",
+                PluginAbi.ABI_2,
+                "[]"
+        );
+        RuntimeProviderRegistry runtimeProviders = new RuntimeProviderRegistry();
+        runtimeProviders.register(runtimeProvider("dotnet", Set.of(PluginAbi.ABI_1)));
+        PluginCompatibilityEvaluator evaluator = new PluginCompatibilityEvaluator(
+                runtimeProviders,
+                PluginPlatformTarget.current()
+        );
+
+        assertMixinDenied(temporaryDirectory, evaluator);
     }
 
     /// Rejects a schema-v3 Mixin package until the user records an explicit decision for it.
@@ -365,10 +430,15 @@ public final class HmclMixinBootstrapPermissionTest {
                 ">=99.0",
                 ",\n  \"mixins\": [\"" + MIXIN_CONFIG + "\"]"
         )));
+        PluginCompatibilityEvaluator evaluator = new PluginCompatibilityEvaluator(
+                new RuntimeProviderRegistry(),
+                PluginPlatformTarget.current()
+        );
+        PluginCompatibilityRequirements requirements = PluginCompatibilityRequirements.fromManifest(manifest);
 
-        assertFalse(HmclMixinBootstrap.isLauncherCompatible("26.8-beta.3", manifest));
-        assertFalse(HmclMixinBootstrap.isLauncherCompatible("26.8-beta.SNAPSHOT", manifest));
-        assertTrue(HmclMixinBootstrap.isLauncherCompatible("99.0", manifest));
+        assertFalse(evaluator.evaluate(requirements, "26.8-beta.3").isCompatible());
+        assertFalse(evaluator.evaluate(requirements, "26.8-beta.SNAPSHOT").isCompatible());
+        assertTrue(evaluator.evaluate(requirements, "99.0").isCompatible());
     }
 
     /// Keeps an executable ordinary dependency outside premain even when it packages the owner's config name.
@@ -940,6 +1010,56 @@ public final class HmclMixinBootstrapPermissionTest {
         assertMixinDenied(temporaryDirectory);
     }
 
+    /// Writes and authorizes one raw schema-v5 Mixin package with explicit compatibility requirements.
+    ///
+    /// @param localHome isolated launcher home
+    /// @param runtime canonical runtime identifier
+    /// @param abi required runtime ABI
+    /// @param platformsJson raw platform target array
+    /// @return created package path
+    /// @throws IOException if package, state, or grant creation fails
+    private static Path writeAuthorizedSchemaFiveMixinPackage(
+            Path localHome,
+            String runtime,
+            int abi,
+            String platformsJson
+    ) throws IOException {
+        String manifest = """
+                {
+                  "schemaVersion": 5,
+                  "id": "%s",
+                  "name": "Mixin Compatibility Test",
+                  "version": "1.0.1",
+                  "type": "java",
+                  "entrypoint": "%s",
+                  "permissions": ["mixin"],
+                  "requiredPermissions": ["mixin"],
+                  "launcherVersion": "*",
+                  "runtime": "%s",
+                  "abi": %s,
+                  "platforms": %s,
+                  "dependencies": [],
+                  "mixins": ["%s"]
+                }
+                """.formatted(
+                        PLUGIN_ID,
+                        entrypointFor(PLUGIN_ID),
+                        runtime,
+                        abi,
+                        platformsJson,
+                        MIXIN_CONFIG
+                );
+        Path packageFile = writeRawPluginPackage(localHome, PLUGIN_ID, manifest, List.of(MIXIN_CONFIG));
+        writeEnabledPlugins(localHome, List.of(PLUGIN_ID));
+        writeMixinGrant(
+                localHome,
+                PLUGIN_ID,
+                "1.0.1",
+                PluginPackageVersions.calculateSha256(packageFile)
+        );
+        return packageFile;
+    }
+
     /// Creates one enabled `.npl` package with a root Mixin configuration resource.
     ///
     /// @param localHome isolated launcher home
@@ -1377,6 +1497,57 @@ public final class HmclMixinBootstrapPermissionTest {
         assertTrue(configuration.activePluginIds().isEmpty());
         assertTrue(configuration.classPathEntries().isEmpty());
         assertTrue(configuration.registrations().isEmpty());
+    }
+
+    /// Asserts that startup preparation with an explicit evaluator exposes no Agent configuration or class path.
+    ///
+    /// @param localHome isolated launcher home
+    /// @param evaluator explicit compatibility evaluator
+    /// @throws IOException if startup discovery fails unexpectedly
+    private static void assertMixinDenied(
+            Path localHome,
+            PluginCompatibilityEvaluator evaluator
+    ) throws IOException {
+        HmclMixinBootstrap.AgentConfiguration configuration = HmclMixinBootstrap.prepareAgentConfiguration(
+                localHome,
+                PluginRuntimeTrustGuard.inactive(),
+                evaluator
+        );
+
+        assertTrue(configuration.mixinConfigs().isEmpty());
+        assertTrue(configuration.activePluginIds().isEmpty());
+        assertTrue(configuration.classPathEntries().isEmpty());
+        assertTrue(configuration.registrations().isEmpty());
+    }
+
+    /// Creates a deterministic runtime provider fixture for bootstrap compatibility tests.
+    ///
+    /// @param runtimeType canonical runtime identifier
+    /// @param implementedAbis immutable implemented ABI generations
+    /// @return runtime provider fixture
+    private static RuntimeProvider runtimeProvider(
+            String runtimeType,
+            @Unmodifiable Set<Integer> implementedAbis
+    ) {
+        return new RuntimeProvider() {
+            /// Returns the caller-selected runtime identifier.
+            @Override
+            public String runtimeType() {
+                return runtimeType;
+            }
+
+            /// Returns the caller-selected immutable ABI set.
+            @Override
+            public @Unmodifiable Set<Integer> implementedPluginAbis() {
+                return Set.copyOf(implementedAbis);
+            }
+
+            /// Describes this deterministic test provider.
+            @Override
+            public String describe() {
+                return "Mixin bootstrap compatibility test provider";
+            }
+        };
     }
 
     /// Verifies that one unresolved journal phase suppresses otherwise authorized Mixin startup.

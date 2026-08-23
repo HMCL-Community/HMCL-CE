@@ -18,6 +18,8 @@
 package org.jackhuang.hmcl.plugin;
 
 import org.jackhuang.hmcl.plugin.internal.PluginPackageVersions;
+import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityEvaluator;
+import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityRequirements;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
@@ -28,7 +30,6 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.function.Predicate;
 
 /// Validates whether exact installed artifacts may be reused by a plugin installation dependency plan.
 @NotNullByDefault
@@ -39,22 +40,28 @@ final class PluginReusePolicy {
     /// Artifact-bound permission service used for current required grants.
     private final PluginPermissionService permissionService;
 
-    /// Launcher compatibility policy shared with ordinary lifecycle loading.
-    private final Predicate<PluginManifest> launcherCompatibility;
+    /// Complete compatibility policy shared with ordinary lifecycle loading.
+    private final PluginCompatibilityEvaluator compatibilityEvaluator;
+
+    /// Launcher version supplied to the shared compatibility evaluator.
+    private final String launcherVersion;
 
     /// Creates one exact-artifact dependency reuse policy.
     ///
     /// @param packageRepository installed package repository
     /// @param permissionService artifact-bound permission service
-    /// @param launcherCompatibility launcher version compatibility predicate
+    /// @param compatibilityEvaluator shared launcher-host compatibility policy
+    /// @param launcherVersion current launcher version
     PluginReusePolicy(
             PluginPackageRepository packageRepository,
             PluginPermissionService permissionService,
-            Predicate<PluginManifest> launcherCompatibility
+            PluginCompatibilityEvaluator compatibilityEvaluator,
+            String launcherVersion
     ) {
         this.packageRepository = packageRepository;
         this.permissionService = permissionService;
-        this.launcherCompatibility = launcherCompatibility;
+        this.compatibilityEvaluator = compatibilityEvaluator;
+        this.launcherVersion = launcherVersion;
     }
 
     /// Returns whether one installed manifest currently satisfies every reuse gate.
@@ -90,13 +97,13 @@ final class PluginReusePolicy {
         if (!enabledPluginIds.contains(pluginId)) {
             return null;
         }
-        if (manifest.getSchemaVersion() < PluginManifest.MIN_EXECUTABLE_SCHEMA_VERSION) {
+        if (!compatibilityEvaluator.evaluate(
+                PluginCompatibilityRequirements.fromManifest(manifest),
+                launcherVersion
+        ).isCompatible()) {
             return null;
         }
         if (!PluginManifest.isCanonicalExecutableId(pluginId)) {
-            return null;
-        }
-        if (!launcherCompatibility.test(manifest)) {
             return null;
         }
         @Unmodifiable List<Path> packages = packageRepository.findInstalledPackages(pluginId);

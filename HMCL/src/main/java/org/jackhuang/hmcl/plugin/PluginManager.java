@@ -26,6 +26,12 @@ import org.jackhuang.hmcl.plugin.internal.VerifiedPluginPackage;
 import org.jackhuang.hmcl.plugin.loader.JavaPluginLoader;
 import org.jackhuang.hmcl.plugin.loader.PluginLoader;
 import org.jackhuang.hmcl.plugin.mixin.bootstrap.PluginAgentSnapshot;
+import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityEvaluator;
+import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityRequirements;
+import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityResult;
+import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityStatus;
+import org.jackhuang.hmcl.plugin.runtime.PluginPlatformTarget;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderRegistry;
 import org.jackhuang.hmcl.plugin.trust.PluginCertificationReceipt;
 import org.jackhuang.hmcl.plugin.trust.PluginCertificationReceiptStore;
 import org.jackhuang.hmcl.plugin.trust.PluginRuntimeTrustGuard;
@@ -89,6 +95,8 @@ public final class PluginManager {
     private final PluginReusePolicy reusePolicy;
     /// Exact prior-state capture and final replacement revalidation.
     private final PluginInstallationStateGuard installationStateGuard;
+    /// Shared launcher, platform, runtime, and ABI compatibility policy for every execution path.
+    private final PluginCompatibilityEvaluator compatibilityEvaluator;
     /// Same-process guard protecting launcher-administrative entry points from ordinary plugin code.
     private final PluginAdministrativeGuard administrativeGuard;
     /// Startup snapshot that re-verifies certified receipts and applies authenticated revocations.
@@ -131,11 +139,44 @@ public final class PluginManager {
     /// Creates one manager with an explicit construction-stack trust policy.
     /// @param localHome launcher-local home
     /// @param trustConstructionStack whether to trust exact test-framework loaders on the construction stack
+    /// @param explicitRuntimeTrustGuard explicit proof-backed runtime gate, or `null` for the inactive gate
     private PluginManager(
             Path localHome,
             boolean trustConstructionStack,
             @Nullable PluginRuntimeTrustGuard explicitRuntimeTrustGuard
     ) {
+        this(
+                localHome,
+                trustConstructionStack,
+                explicitRuntimeTrustGuard,
+                new PluginCompatibilityEvaluator(
+                        new RuntimeProviderRegistry(),
+                        PluginPlatformTarget.current()
+                )
+        );
+    }
+
+    /// Creates an isolated manager with a deterministic compatibility evaluator for lifecycle gate tests.
+    ///
+    /// @param localHome isolated HMCL home
+    /// @param compatibilityEvaluator explicit launcher-host compatibility policy
+    PluginManager(Path localHome, PluginCompatibilityEvaluator compatibilityEvaluator) {
+        this(localHome, true, null, compatibilityEvaluator);
+    }
+
+    /// Creates one manager with explicit construction, trust, and compatibility policies.
+    ///
+    /// @param localHome launcher-local home
+    /// @param trustConstructionStack whether to trust exact test-framework loaders on the construction stack
+    /// @param explicitRuntimeTrustGuard explicit proof-backed runtime gate, or `null` for the inactive gate
+    /// @param compatibilityEvaluator shared launcher-host compatibility policy
+    private PluginManager(
+            Path localHome,
+            boolean trustConstructionStack,
+            @Nullable PluginRuntimeTrustGuard explicitRuntimeTrustGuard,
+            PluginCompatibilityEvaluator compatibilityEvaluator
+    ) {
+        this.compatibilityEvaluator = compatibilityEvaluator;
         administrativeGuard = new PluginAdministrativeGuard(trustConstructionStack);
         pluginsDirectory = localHome.resolve("plugins");
         pluginPackageDirectory = localHome.resolve("plugin-data");
@@ -170,7 +211,12 @@ public final class PluginManager {
                 artifactResolver::findCurrentPermissionArtifact,
                 mutationLock
         );
-        reusePolicy = new PluginReusePolicy(packageRepository, permissionService, PluginManager::isLauncherCompatible);
+        reusePolicy = new PluginReusePolicy(
+                packageRepository,
+                permissionService,
+                compatibilityEvaluator,
+                Metadata.VERSION
+        );
         stateStore.load(enabledStates, pendingUninstall);
         loaders.put(PluginManifest.PluginType.JAVA, new JavaPluginLoader());
         loaders.put(PluginManifest.PluginType.KOTLIN, new JavaPluginLoader());
@@ -245,13 +291,15 @@ public final class PluginManager {
         Map<String, PluginVisitState> visitStates = new HashMap<>();
         Set<String> failed = new HashSet<>();
         for (PluginPackageCandidate candidate : candidates.values()) {
-            if (candidate.manifest.getSchemaVersion() != PluginManifest.CURRENT_SCHEMA_VERSION) {
-                enabledStates.remove(candidate.manifest.getId());
+            PluginCompatibilityResult compatibility = evaluateCompatibility(candidate.manifest);
+            if (!compatibility.isCompatible()) {
+                if (compatibility.status() == PluginCompatibilityStatus.UNSUPPORTED_SCHEMA) {
+                    enabledStates.remove(candidate.manifest.getId());
+                }
                 setRuntimeStatus(
                         candidate.identity,
-                        PluginRuntimeStatus.BLOCKED_LEGACY,
-                        "Plugin " + candidate.manifest.getId() + " uses legacy manifest schema "
-                                + candidate.manifest.getSchemaVersion() + " and cannot execute"
+                        runtimeStatusFor(compatibility),
+                        compatibility.detail()
                 );
                 continue;
             }
@@ -537,21 +585,15 @@ public final class PluginManager {
     /// @return blocking status or `null` when lifecycle preparation may continue
     private @Nullable PluginRuntimeStatus getPreLoadBlock(PluginPackageCandidate candidate) {
         PluginManifest manifest = candidate.manifest;
-        if (manifest.getSchemaVersion() < PluginManifest.MIN_EXECUTABLE_SCHEMA_VERSION) {
-            String detail = "Plugin " + manifest.getId() + " uses legacy manifest schema "
-                    + manifest.getSchemaVersion() + " and cannot execute";
-            setRuntimeStatus(candidate.identity, PluginRuntimeStatus.BLOCKED_LEGACY, detail);
-            return PluginRuntimeStatus.BLOCKED_LEGACY;
+        PluginCompatibilityResult compatibility = evaluateCompatibility(manifest);
+        if (!compatibility.isCompatible()) {
+            PluginRuntimeStatus status = runtimeStatusFor(compatibility);
+            setRuntimeStatus(candidate.identity, status, compatibility.detail());
+            return status;
         }
         if (!PluginManifest.isCanonicalExecutableId(manifest.getId())) {
             String detail = "Plugin " + manifest.getId()
                     + " does not use a portable canonical lower-case ID";
-            setRuntimeStatus(candidate.identity, PluginRuntimeStatus.LOAD_FAILED, detail);
-            return PluginRuntimeStatus.LOAD_FAILED;
-        }
-        if (!isLauncherCompatible(manifest)) {
-            String detail = "Plugin " + manifest.getId() + " requires launcher version "
-                    + manifest.getLauncherVersion() + " but this launcher is " + Metadata.VERSION;
             setRuntimeStatus(candidate.identity, PluginRuntimeStatus.LOAD_FAILED, detail);
             return PluginRuntimeStatus.LOAD_FAILED;
         }
@@ -614,6 +656,38 @@ public final class PluginManager {
         runtimeState.set(identity, status, detail);
     }
 
+    /// Evaluates one validated manifest against this manager's shared launcher-host capabilities.
+    ///
+    /// @param manifest validated plugin manifest
+    /// @return compatibility outcome with a specific diagnostic
+    private PluginCompatibilityResult evaluateCompatibility(PluginManifest manifest) {
+        return compatibilityEvaluator.evaluate(
+                PluginCompatibilityRequirements.fromManifest(manifest),
+                Metadata.VERSION
+        );
+    }
+
+    /// Maps a compatibility rejection to the established lifecycle status model.
+    ///
+    /// @param compatibility incompatible evaluation result
+    /// @return lifecycle status representing the rejection
+    private static PluginRuntimeStatus runtimeStatusFor(PluginCompatibilityResult compatibility) {
+        return compatibility.status() == PluginCompatibilityStatus.UNSUPPORTED_SCHEMA
+                ? PluginRuntimeStatus.BLOCKED_LEGACY
+                : PluginRuntimeStatus.LOAD_FAILED;
+    }
+
+    /// Requires one validated manifest to satisfy this manager's complete compatibility policy.
+    ///
+    /// @param manifest validated plugin manifest
+    /// @throws IOException with the evaluator detail when compatibility fails
+    private void requireCompatible(PluginManifest manifest) throws IOException {
+        PluginCompatibilityResult compatibility = evaluateCompatibility(manifest);
+        if (!compatibility.isCompatible()) {
+            throw new IOException(compatibility.detail());
+        }
+    }
+
     /// Removes every runtime identity and diagnostic belonging to one plugin ID.
     ///
     /// @param pluginId plugin ID
@@ -644,12 +718,9 @@ public final class PluginManager {
         PluginManifest manifest = candidate.manifest;
         String pluginId = manifest.getId();
 
+        requireCompatible(manifest);
         if (pluginMap.containsKey(pluginId)) {
             throw new IOException("Plugin already loaded: " + pluginId);
-        }
-        if (!isLauncherCompatible(manifest)) {
-            throw new IOException("Plugin " + pluginId + " requires launcher version "
-                    + manifest.getLauncherVersion() + " but this launcher is " + Metadata.VERSION);
         }
         for (PluginDependency dependency : manifest.getPluginDependencies()) {
             @Nullable PluginContainer dependencyContainer = pluginMap.get(dependency.getId());
@@ -707,14 +778,6 @@ public final class PluginManager {
                 manifest,
                 nplFile
         );
-    }
-
-    /// Returns whether the current launcher version satisfies one manifest's normalized version constraint.
-    ///
-    /// @param manifest plugin manifest to check
-    /// @return whether the launcher is compatible
-    private static boolean isLauncherCompatible(PluginManifest manifest) {
-        return manifest.matchesLauncherVersion(Metadata.VERSION);
     }
 
     /// Closes a dedicated plugin loader after preparation fails.
@@ -819,20 +882,27 @@ public final class PluginManager {
                 @Unmodifiable Map<String, PluginManifest> installedManifests =
                         packageRepository.readInstalledManifests(plugins);
                 @Nullable PluginManifest requestedManifest = installedManifests.get(pluginId);
-                if (requestedManifest != null
-                        && requestedManifest.getSchemaVersion() != PluginManifest.CURRENT_SCHEMA_VERSION) {
-                    enabledStates.remove(pluginId);
-                    @Nullable PluginArtifactIdentity identity = artifactResolver.resolveInstalledIdentity(pluginId);
-                    if (identity != null) {
-                        setRuntimeStatus(
-                                identity,
-                                PluginRuntimeStatus.BLOCKED_LEGACY,
-                                "Plugin " + pluginId + " uses legacy manifest schema "
-                                        + requestedManifest.getSchemaVersion() + " and cannot execute"
-                        );
+                if (requestedManifest != null) {
+                    PluginCompatibilityResult compatibility = evaluateCompatibility(requestedManifest);
+                    if (!compatibility.isCompatible()) {
+                        if (compatibility.status() == PluginCompatibilityStatus.UNSUPPORTED_SCHEMA) {
+                            enabledStates.remove(pluginId);
+                        } else {
+                            enabledStates.add(pluginId);
+                            pendingUninstall.remove(pluginId);
+                        }
+                        @Nullable PluginArtifactIdentity identity =
+                                artifactResolver.resolveInstalledIdentity(pluginId);
+                        if (identity != null) {
+                            setRuntimeStatus(
+                                    identity,
+                                    runtimeStatusFor(compatibility),
+                                    compatibility.detail()
+                            );
+                        }
+                        saveStates();
+                        return false;
                     }
-                    saveStates();
-                    return false;
                 }
                 recordEnableIntent(pluginId, installedManifests, new HashSet<>());
                 boolean enabled = enablePlugin(pluginId, new HashSet<>());
@@ -865,15 +935,15 @@ public final class PluginManager {
         if (manifest == null) {
             return;
         }
-        if (manifest.getSchemaVersion() != PluginManifest.CURRENT_SCHEMA_VERSION) {
+        PluginCompatibilityResult compatibility = evaluateCompatibility(manifest);
+        if (compatibility.status() == PluginCompatibilityStatus.UNSUPPORTED_SCHEMA) {
             return;
         }
         enabledStates.add(pluginId);
         pendingUninstall.remove(pluginId);
         for (PluginDependency dependency : manifest.getPluginDependencies()) {
             @Nullable PluginManifest dependencyManifest = installedManifests.get(dependency.getId());
-            if (dependencyManifest != null
-                    && dependencyManifest.getSchemaVersion() >= PluginManifest.MIN_EXECUTABLE_SCHEMA_VERSION) {
+            if (dependencyManifest != null) {
                 recordEnableIntent(dependency.getId(), installedManifests, visited);
             }
         }
@@ -901,6 +971,11 @@ public final class PluginManager {
                 return false;
             }
             LOG.error("Cannot enable missing plugin: " + pluginId);
+            return false;
+        }
+        PluginCompatibilityResult compatibility = evaluateCompatibility(container.getManifest());
+        if (!compatibility.isCompatible()) {
+            setLoadedRuntimeStatus(container, runtimeStatusFor(compatibility), compatibility.detail());
             return false;
         }
         enabledStates.add(pluginId);
@@ -1207,14 +1282,7 @@ public final class PluginManager {
         if (!initialSha256.equals(verifiedSha256)) {
             throw new IOException("Plugin package changed while it was being inspected: " + source);
         }
-        if (manifest.getSchemaVersion() != PluginManifest.CURRENT_SCHEMA_VERSION) {
-            throw new IOException("Only plugin API v" + PluginManifest.CURRENT_SCHEMA_VERSION
-                    + " packages can be installed; found schema " + manifest.getSchemaVersion());
-        }
-        if (!isLauncherCompatible(manifest)) {
-            throw new IOException("Plugin " + manifest.getId() + " requires launcher version "
-                    + manifest.getLauncherVersion() + " but this launcher is " + Metadata.VERSION);
-        }
+        requireCompatible(manifest);
         if (manifest.getSchemaVersion() >= PluginManifest.MIN_EXECUTABLE_SCHEMA_VERSION
                 && !PluginManifest.isCanonicalExecutableId(manifest.getId())) {
             throw new IOException("Executable plugin ID must be portable canonical lower-case text: "
@@ -1761,15 +1829,7 @@ public final class PluginManager {
             PluginPackageRepository.validateLocalPackage(source);
             PluginPackageMutationService.verifyPackageHash(source, inspection.sha256);
             PluginManifest manifest = inspection.manifest;
-            if (manifest.getSchemaVersion() != PluginManifest.CURRENT_SCHEMA_VERSION) {
-                throw new IOException("Only plugin API v" + PluginManifest.CURRENT_SCHEMA_VERSION
-                        + " packages can be installed; found schema " + manifest.getSchemaVersion()
-                        + " for " + manifest.getId());
-            }
-            if (!isLauncherCompatible(manifest)) {
-                throw new IOException("Plugin " + manifest.getId() + " requires launcher version "
-                        + manifest.getLauncherVersion() + " but this launcher is " + Metadata.VERSION);
-            }
+            requireCompatible(manifest);
             if (inspectionsById.putIfAbsent(manifest.getId(), inspection) != null) {
                 throw new IOException("Plugin installation batch contains duplicate ID: " + manifest.getId());
             }
@@ -1838,6 +1898,10 @@ public final class PluginManager {
                     inspection.manifest,
                     inspection.sha256
             ));
+        }
+        // Runtime providers are live process state, so close the planning-to-publication compatibility window.
+        for (PluginManifest replacement : replacements.values()) {
+            requireCompatible(replacement);
         }
         packageMutationService.publishInstallations(
                 installArtifacts,

@@ -18,6 +18,12 @@
 package org.jackhuang.hmcl.plugin;
 
 import org.jackhuang.hmcl.plugin.internal.PluginPackageVersions;
+import org.jackhuang.hmcl.plugin.runtime.PluginAbi;
+import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityEvaluator;
+import org.jackhuang.hmcl.plugin.runtime.PluginPlatformTarget;
+import org.jackhuang.hmcl.plugin.runtime.PluginRuntimeTypes;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeProvider;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderRegistry;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Unmodifiable;
 import org.junit.jupiter.api.Test;
@@ -514,6 +520,121 @@ public final class PluginManagerReuseEligibilityTest {
         );
 
         assertThrows(IOException.class, () -> manager.inspectLocalPluginPackage(sourcePackage));
+    }
+
+    /// Excludes schema-v5 artifacts rejected by platform, runtime availability, or provider ABI gates.
+    ///
+    /// @param temporaryDirectory isolated launcher home
+    /// @throws IOException if package or persisted enablement fixtures cannot be created
+    @Test
+    public void reuseEligibilityRequiresCompleteRuntimeCompatibility(@TempDir Path temporaryDirectory)
+            throws IOException {
+        RuntimeProviderRegistry runtimeProviders = new RuntimeProviderRegistry();
+        runtimeProviders.register(runtimeProvider("dotnet", Set.of(PluginAbi.ABI_1)));
+        PluginCompatibilityEvaluator evaluator = new PluginCompatibilityEvaluator(
+                runtimeProviders,
+                PluginPlatformTarget.parse("linux-x64")
+        );
+        PluginManager manager = new PluginManager(temporaryDirectory.resolve("home"), evaluator);
+        String platformId = "dev.test.reuse.unsupported-platform";
+        String runtimeId = "dev.test.reuse.missing-runtime";
+        String abiId = "dev.test.reuse.unsupported-abi";
+        writeSchemaFivePackage(
+                manager.getPluginsDirectory().resolve(platformId + ".npl"),
+                platformId,
+                PluginRuntimeTypes.JAVA,
+                PluginAbi.ABI_1,
+                "[\"windows-x64\"]"
+        );
+        writeSchemaFivePackage(
+                manager.getPluginsDirectory().resolve(runtimeId + ".npl"),
+                runtimeId,
+                "python",
+                PluginAbi.ABI_1,
+                "[]"
+        );
+        writeSchemaFivePackage(
+                manager.getPluginsDirectory().resolve(abiId + ".npl"),
+                abiId,
+                "dotnet",
+                PluginAbi.ABI_2,
+                "[]"
+        );
+        manager.enablePlugin(platformId);
+        manager.enablePlugin(runtimeId);
+        manager.enablePlugin(abiId);
+
+        @Unmodifiable Map<String, PluginManifest> installed = manager.getInstalledManifests();
+        @Unmodifiable Set<String> reusable = manager.getReusableInstalledPluginIds(installed);
+
+        assertFalse(reusable.contains(platformId));
+        assertFalse(reusable.contains(runtimeId));
+        assertFalse(reusable.contains(abiId));
+    }
+
+    /// Writes one schema-v5 package with explicit runtime compatibility requirements.
+    ///
+    /// @param target package path
+    /// @param pluginId plugin ID
+    /// @param runtime canonical runtime identifier
+    /// @param abi required runtime ABI
+    /// @param platformsJson raw platform target array
+    /// @throws IOException if package creation fails
+    private static void writeSchemaFivePackage(
+            Path target,
+            String pluginId,
+            String runtime,
+            int abi,
+            String platformsJson
+    ) throws IOException {
+        String manifest = """
+                {
+                  "schemaVersion": 5,
+                  "id": "%s",
+                  "name": "Reuse Compatibility Test",
+                  "version": "1.0.0",
+                  "type": "java",
+                  "entrypoint": "dev.test.Plugin",
+                  "permissions": [],
+                  "requiredPermissions": [],
+                  "launcherVersion": "*",
+                  "runtime": "%s",
+                  "abi": %s,
+                  "platforms": %s,
+                  "dependencies": []
+                }
+                """.formatted(pluginId, runtime, abi, platformsJson);
+        writePackage(target, manifest, "schema-five");
+    }
+
+    /// Creates a deterministic runtime provider fixture for reuse compatibility tests.
+    ///
+    /// @param runtimeType canonical runtime identifier
+    /// @param implementedAbis immutable implemented ABI generations
+    /// @return runtime provider fixture
+    private static RuntimeProvider runtimeProvider(
+            String runtimeType,
+            @Unmodifiable Set<Integer> implementedAbis
+    ) {
+        return new RuntimeProvider() {
+            /// Returns the caller-selected runtime identifier.
+            @Override
+            public String runtimeType() {
+                return runtimeType;
+            }
+
+            /// Returns the caller-selected immutable ABI set.
+            @Override
+            public @Unmodifiable Set<Integer> implementedPluginAbis() {
+                return Set.copyOf(implementedAbis);
+            }
+
+            /// Describes this deterministic test provider.
+            @Override
+            public String describe() {
+                return "Reuse compatibility test provider";
+            }
+        };
     }
 
     /// Writes one schema-v4 package containing a manifest and a caller-selected byte marker.

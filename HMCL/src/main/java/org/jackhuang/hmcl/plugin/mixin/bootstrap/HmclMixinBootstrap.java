@@ -30,6 +30,11 @@ import org.jackhuang.hmcl.plugin.PluginMutationLock;
 import org.jackhuang.hmcl.plugin.PluginPermission;
 import org.jackhuang.hmcl.plugin.internal.PluginPackageVersions;
 import org.jackhuang.hmcl.plugin.internal.VerifiedPluginPackage;
+import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityEvaluator;
+import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityRequirements;
+import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityResult;
+import org.jackhuang.hmcl.plugin.runtime.PluginPlatformTarget;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderRegistry;
 import org.jackhuang.hmcl.plugin.trust.PluginRuntimeTrustGuard;
 import org.jackhuang.hmcl.util.SelfDependencyPatcher;
 import org.jetbrains.annotations.NotNullByDefault;
@@ -191,7 +196,7 @@ public final class HmclMixinBootstrap {
     static AgentConfiguration prepareAgentConfiguration(Path localHome) throws IOException {
         Path normalizedLocalHome = localHome.toAbsolutePath().normalize();
         return new PluginMutationLock(normalizedLocalHome).call(
-                () -> prepareAgentConfigurationLocked(normalizedLocalHome, null)
+                () -> prepareAgentConfigurationLocked(normalizedLocalHome, null, null)
         );
     }
 
@@ -207,18 +212,43 @@ public final class HmclMixinBootstrap {
     ) throws IOException {
         Path normalizedLocalHome = localHome.toAbsolutePath().normalize();
         return new PluginMutationLock(normalizedLocalHome).call(
-                () -> prepareAgentConfigurationLocked(normalizedLocalHome, runtimeTrustGuard)
+                () -> prepareAgentConfigurationLocked(normalizedLocalHome, runtimeTrustGuard, null)
+        );
+    }
+
+    /// Prepares an agent configuration with explicit trust and compatibility policies for deterministic tests.
+    ///
+    /// @param localHome launcher-local directory
+    /// @param runtimeTrustGuard explicit proof-backed runtime gate
+    /// @param compatibilityEvaluator explicit launcher-host compatibility policy
+    /// @return agent configuration, possibly with no Mixin configurations
+    /// @throws IOException if package discovery or resource validation fails
+    static AgentConfiguration prepareAgentConfiguration(
+            Path localHome,
+            PluginRuntimeTrustGuard runtimeTrustGuard,
+            PluginCompatibilityEvaluator compatibilityEvaluator
+    ) throws IOException {
+        Path normalizedLocalHome = localHome.toAbsolutePath().normalize();
+        return new PluginMutationLock(normalizedLocalHome).call(
+                () -> prepareAgentConfigurationLocked(
+                        normalizedLocalHome,
+                        runtimeTrustGuard,
+                        compatibilityEvaluator
+                )
         );
     }
 
     /// Prepares one exact Agent configuration while the launcher-local mutation lock is held.
     ///
     /// @param localHome normalized launcher-local directory containing plugin state, packages, and grants
+    /// @param explicitRuntimeTrustGuard explicit proof-backed runtime gate, or `null` for the inactive gate
+    /// @param explicitCompatibilityEvaluator explicit launcher-host policy, or `null` for the current host policy
     /// @return agent configuration, possibly with no Mixin configurations
     /// @throws IOException if package discovery or resource validation fails
     private static AgentConfiguration prepareAgentConfigurationLocked(
             Path localHome,
-            @Nullable PluginRuntimeTrustGuard explicitRuntimeTrustGuard
+            @Nullable PluginRuntimeTrustGuard explicitRuntimeTrustGuard,
+            @Nullable PluginCompatibilityEvaluator explicitCompatibilityEvaluator
     ) throws IOException {
         Path transactionFile = localHome.resolve(PLUGIN_TRANSACTION_FILE);
         if (Files.exists(transactionFile, LinkOption.NOFOLLOW_LINKS)) {
@@ -232,8 +262,14 @@ public final class HmclMixinBootstrap {
         } else {
             runtimeTrustGuard = PluginRuntimeTrustGuard.inactive();
         }
+        PluginCompatibilityEvaluator compatibilityEvaluator = explicitCompatibilityEvaluator == null
+                ? new PluginCompatibilityEvaluator(
+                        new RuntimeProviderRegistry(),
+                        PluginPlatformTarget.current()
+                )
+                : explicitCompatibilityEvaluator;
         @Unmodifiable List<PluginLaunchDescriptor> descriptors =
-                discoverEnabledJvmPlugins(localHome, runtimeTrustGuard);
+                discoverEnabledJvmPlugins(localHome, runtimeTrustGuard, compatibilityEvaluator);
         @Unmodifiable Map<String, AgentClassDefinition> agentClasses = validateAgentClassOwnership(descriptors);
         @Unmodifiable List<String> configs = collectMixinConfigs(descriptors);
         for (PluginLaunchDescriptor descriptor : descriptors) {
@@ -391,23 +427,17 @@ public final class HmclMixinBootstrap {
         return DEVELOPMENT_LAUNCHER_VERSION;
     }
 
-    /// Returns whether one launcher version satisfies a manifest's normalized version constraint.
-    ///
-    /// @param launcherVersion current launcher version
-    /// @param manifest plugin manifest to check
-    /// @return whether the plugin may execute in this launcher
-    static boolean isLauncherCompatible(String launcherVersion, PluginManifest manifest) {
-        return manifest.matchesLauncherVersion(launcherVersion);
-    }
-
     /// Discovers enabled Java and Kotlin packages, preparing a safe immutable launch cache for each one.
     ///
     /// @param localHome local HMCL directory
+    /// @param runtimeTrustGuard proof-backed certified artifact revocation policy
+    /// @param compatibilityEvaluator complete launcher-host compatibility policy
     /// @return enabled JVM plugin descriptors
     /// @throws IOException if state or package discovery fails
     private static @Unmodifiable List<PluginLaunchDescriptor> discoverEnabledJvmPlugins(
             Path localHome,
-            PluginRuntimeTrustGuard runtimeTrustGuard
+            PluginRuntimeTrustGuard runtimeTrustGuard,
+            PluginCompatibilityEvaluator compatibilityEvaluator
     ) throws IOException {
         Path pluginsDirectory = localHome.resolve("plugins");
         if (!Files.isDirectory(pluginsDirectory)) {
@@ -488,6 +518,7 @@ public final class HmclMixinBootstrap {
                         candidates,
                         enabled,
                         launcherVersion,
+                        compatibilityEvaluator,
                         permissionGuard,
                         runtimeTrustGuard,
                         visitStates,
@@ -625,6 +656,7 @@ public final class HmclMixinBootstrap {
     /// @param candidates all valid installed candidates
     /// @param enabled enabled plugin IDs
     /// @param launcherVersion current launcher version
+    /// @param compatibilityEvaluator complete launcher-host compatibility policy
     /// @param permissionGuard exact artifact-bound Mixin permission policy
     /// @param runtimeTrustGuard proof-backed certified artifact revocation policy
     /// @param visitStates dependency traversal states
@@ -636,6 +668,7 @@ public final class HmclMixinBootstrap {
             Map<String, BootstrapCandidate> candidates,
             Set<String> enabled,
             String launcherVersion,
+            PluginCompatibilityEvaluator compatibilityEvaluator,
             PluginMixinPermissionGuard permissionGuard,
             PluginRuntimeTrustGuard runtimeTrustGuard,
             Map<String, VisitState> visitStates,
@@ -658,6 +691,7 @@ public final class HmclMixinBootstrap {
         if (!isExecutableCandidateAuthorized(
                 candidate,
                 launcherVersion,
+                compatibilityEvaluator,
                 permissionGuard,
                 runtimeTrustGuard
         )) {
@@ -693,6 +727,7 @@ public final class HmclMixinBootstrap {
                     candidates,
                     enabled,
                     launcherVersion,
+                    compatibilityEvaluator,
                     permissionGuard,
                     runtimeTrustGuard,
                     visitStates,
@@ -714,35 +749,35 @@ public final class HmclMixinBootstrap {
 
     /// Returns whether one enabled artifact passes all pre-class-loading execution gates relevant to premain.
     ///
-    /// Every API-v4 dependency-closure member must satisfy its effective required permissions. Optional denials do
-    /// not block premain participation unless the denied permission belongs to the manifest's required subset.
+    /// Every executable dependency-closure member must satisfy its effective required permissions. Optional denials
+    /// do not block premain participation unless the denied permission belongs to the manifest's required subset.
     ///
     /// @param candidate exact installed artifact candidate
     /// @param launcherVersion current launcher version
+    /// @param compatibilityEvaluator complete launcher-host compatibility policy
     /// @param permissionGuard exact artifact-bound Mixin permission policy
     /// @param runtimeTrustGuard proof-backed certified artifact revocation policy
     /// @return whether the artifact may participate in an executable dependency closure
     private static boolean isExecutableCandidateAuthorized(
             BootstrapCandidate candidate,
             String launcherVersion,
+            PluginCompatibilityEvaluator compatibilityEvaluator,
             PluginMixinPermissionGuard permissionGuard,
             PluginRuntimeTrustGuard runtimeTrustGuard
     ) {
         PluginManifest manifest = candidate.manifest;
-        if (manifest.getSchemaVersion() < PluginManifest.MIN_EXECUTABLE_SCHEMA_VERSION) {
-            report("Skipping plugin " + manifest.getId() + " because legacy schema "
-                    + manifest.getSchemaVersion() + " artifacts cannot execute");
+        PluginCompatibilityResult compatibility = compatibilityEvaluator.evaluate(
+                PluginCompatibilityRequirements.fromManifest(manifest),
+                launcherVersion
+        );
+        if (!compatibility.isCompatible()) {
+            report("Skipping plugin " + manifest.getId() + " " + manifest.getVersion()
+                    + " because " + compatibility.detail());
             return false;
         }
         if (!PluginManifest.isCanonicalExecutableId(manifest.getId())) {
             report("Skipping plugin " + manifest.getId()
                     + " because executable plugin IDs must be portable canonical lower-case text");
-            return false;
-        }
-        if (!isLauncherCompatible(launcherVersion, manifest)) {
-            report("Skipping plugin " + manifest.getId() + " " + manifest.getVersion()
-                    + " because it requires launcher version " + manifest.getLauncherVersion()
-                    + " but this launcher is " + launcherVersion);
             return false;
         }
         final @Nullable String trustBlock;
