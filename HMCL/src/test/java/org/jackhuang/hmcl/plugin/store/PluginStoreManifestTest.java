@@ -386,6 +386,56 @@ public final class PluginStoreManifestTest {
         ));
     }
 
+    /// Rejects artifact sizes unless their JSON spelling is a positive base-ten integer that fits in a long.
+    @Test
+    public void rejectNonIntegralOrOverflowingArtifactSizes() {
+        for (String size : List.of("1.0", "1e0", "18446744073709551617", "-1", "0")) {
+            IOException exception = assertThrows(IOException.class, () -> parseManifest(
+                    "dev.hmclce.test.invalid-declarations",
+                    schemaFiveArtifactManifest(
+                            "dev.hmclce.test.invalid-declarations",
+                            "\"pluginKind\": \"normal\",",
+                            """
+                                    {"platform": "windows-x64", "packageUrl": "https://example.test/plugin.npl",
+                                     "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                                     "size": %s}
+                                    """.formatted(size)
+                    )
+            ));
+            assertInstanceOf(JsonParseException.class, exception.getCause());
+        }
+    }
+
+    /// Keeps the legacy single-package compatibility view aligned with Manager's accepted IPv6 loopback spelling.
+    @Test
+    public void acceptIpv6LoopbackForLegacySinglePackageArtifactView() throws IOException {
+        PluginStoreManifest.PluginVersionEntry version = parseManifest(
+                "dev.hmclce.test.ipv6-loopback",
+                """
+                        {
+                          "schemaVersion": 2,
+                          "id": "dev.hmclce.test.ipv6-loopback",
+                          "versions": [{
+                            "version": "1.0.0",
+                            "packageUrl": "http://[::1]:8080/plugin.npl",
+                            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            "pluginApiVersion": 4,
+                            "permissions": [],
+                            "requiredPermissions": [],
+                            "launcherVersion": "*",
+                            "dependencies": [],
+                            "size": 1
+                          }]
+                        }
+                        """
+        ).getVersions().get(0);
+
+        PluginStoreArtifact artifact = version.requireArtifact(PluginPlatformTarget.parse("windows-x64"));
+
+        assertEquals("http://[::1]:8080/plugin.npl", artifact.packageUrl());
+        assertEquals("windows-x64", artifact.platform().getId());
+    }
+
     /// Requires exactly one package representation and mandates an artifact matrix for runtime providers.
     @Test
     public void enforceSchemaFiveArtifactRepresentation() throws IOException {

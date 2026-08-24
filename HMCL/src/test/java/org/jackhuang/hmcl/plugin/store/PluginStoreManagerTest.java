@@ -738,6 +738,73 @@ public final class PluginStoreManagerTest {
                 """)));
     }
 
+    /// Uses the compatibility evaluator's injected host for both matrix filtering and artifact download selection.
+    @Test
+    public void useInjectedHostForPlatformArtifactSelection(@TempDir Path temporaryDirectory) throws Exception {
+        PluginPlatformTarget currentPlatform = PluginPlatformTarget.current();
+        PluginPlatformTarget injectedPlatform = currentPlatform.equals(PluginPlatformTarget.parse("linux-x64"))
+                ? PluginPlatformTarget.parse("macos-arm64")
+                : PluginPlatformTarget.parse("linux-x64");
+        String pluginId = "dev.hmclce.test.injected-platform-artifact";
+        byte @Unmodifiable [] packageBytes = createPluginPackageFive(
+                pluginId,
+                "1.0.0",
+                "java",
+                2,
+                "[\"" + injectedPlatform.getId() + "\"]"
+        );
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/package", exchange -> respond(exchange, packageBytes));
+        server.start();
+
+        try {
+            String packageUrl = "http://127.0.0.1:" + server.getAddress().getPort() + "/package";
+            PluginStoreManifest manifest = parseManifest(pluginId, """
+                    {
+                      "schemaVersion": 2,
+                      "id": "%s",
+                      "versions": [{
+                        "version": "1.0.0",
+                        "pluginApiVersion": 5,
+                        "permissions": [],
+                        "requiredPermissions": [],
+                        "launcherVersion": "*",
+                        "runtime": "java",
+                        "abi": 2,
+                        "platforms": ["%s"],
+                        "pluginKind": "normal",
+                        "artifacts": [{
+                          "platform": "%s",
+                          "packageUrl": "%s",
+                          "sha256": "%s",
+                          "size": %d
+                        }],
+                        "dependencies": []
+                      }]
+                    }
+                    """.formatted(
+                    pluginId,
+                    injectedPlatform.getId(),
+                    injectedPlatform.getId(),
+                    packageUrl,
+                    sha256(packageBytes),
+                    packageBytes.length
+            ));
+            PluginStoreManager manager = new PluginStoreManager(new PluginCompatibilityEvaluator(
+                    new RuntimeProviderRegistry(),
+                    injectedPlatform
+            ));
+            PluginStoreManifest.PluginVersionEntry version = manifest.getVersions().get(0);
+
+            assertDoesNotThrow(() -> manager.validateCompatibility(version));
+            Path installed = manager.downloadPlugin(pluginId, version, temporaryDirectory.resolve("plugins"));
+
+            assertArrayEquals(packageBytes, Files.readAllBytes(installed));
+        } finally {
+            server.stop(0);
+        }
+    }
+
     /// Observes providers registered after a production store manager has been constructed.
     @Test
     public void useProcessWideRuntimeProvidersForStoreCompatibility() throws IOException {

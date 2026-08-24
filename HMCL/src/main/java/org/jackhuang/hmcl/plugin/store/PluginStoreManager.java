@@ -27,7 +27,6 @@ import org.jackhuang.hmcl.plugin.PluginManifest;
 import org.jackhuang.hmcl.plugin.PluginVersion;
 import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityEvaluator;
 import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityResult;
-import org.jackhuang.hmcl.plugin.runtime.PluginPlatformTarget;
 import org.jackhuang.hmcl.plugin.trust.PluginCertificationReceipt;
 import org.jackhuang.hmcl.plugin.trust.PluginDocumentVerification;
 import org.jackhuang.hmcl.plugin.trust.PluginRepositoryAttestation;
@@ -834,7 +833,7 @@ public final class PluginStoreManager {
             PluginStoreManifest.PluginVersionEntry version,
             Path targetDirectory
     ) throws IOException {
-        PluginStoreArtifact artifact = version.requireArtifact(PluginPlatformTarget.current());
+        PluginStoreArtifact artifact = version.requireArtifact(compatibilityEvaluator.getHostPlatform());
         return downloadPluginToFile(
                 pluginId,
                 version,
@@ -858,7 +857,7 @@ public final class PluginStoreManager {
             PluginStoreManifest.PluginVersionEntry version,
             Path stagingDirectory
     ) throws IOException {
-        PluginStoreArtifact artifact = version.requireArtifact(PluginPlatformTarget.current());
+        PluginStoreArtifact artifact = version.requireArtifact(compatibilityEvaluator.getHostPlatform());
         String checksumPrefix = artifact.sha256().substring(0, 12).toLowerCase(Locale.ROOT);
         return downloadPluginToFile(
                 pluginId,
@@ -1025,7 +1024,7 @@ public final class PluginStoreManager {
             throw new IOException(compatibility.detail());
         }
         if (!version.getArtifacts().isEmpty()) {
-            version.requireArtifact(PluginPlatformTarget.current());
+            version.requireArtifact(compatibilityEvaluator.getHostPlatform());
         }
 
         String requiredJava = version.getRequiredJavaVersion();

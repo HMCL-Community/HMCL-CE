@@ -56,6 +56,13 @@ public final class PluginCompatibilityEvaluator {
         return PROCESS_WIDE;
     }
 
+    /// Returns the exact host target used by this evaluator for package and Store artifact compatibility.
+    ///
+    /// @return configured host operating system and architecture
+    public PluginPlatformTarget getHostPlatform() {
+        return hostPlatform;
+    }
+
     /// Evaluates package requirements in deterministic diagnostic-priority order.
     ///
     /// @param requirements package compatibility requirements

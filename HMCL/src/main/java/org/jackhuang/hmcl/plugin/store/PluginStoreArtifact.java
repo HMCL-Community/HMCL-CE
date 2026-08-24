@@ -50,6 +50,9 @@ public record PluginStoreArtifact(
     /// Required lower-case SHA-256 representation for platform artifacts.
     private static final Pattern SHA256_PATTERN = Pattern.compile("[0-9a-f]{64}");
 
+    /// Strict positive base-ten integer spelling accepted for artifact sizes.
+    private static final Pattern POSITIVE_DECIMAL_PATTERN = Pattern.compile("[1-9][0-9]*");
+
     /// Validates that every component identifies one exact downloadable artifact.
     public PluginStoreArtifact {
         Objects.requireNonNull(platform, "platform");
@@ -77,7 +80,8 @@ public record PluginStoreArtifact(
         String scheme = Objects.requireNonNullElse(uri.getScheme(), "").toLowerCase(Locale.ROOT);
         String host = Objects.requireNonNullElse(uri.getHost(), "").toLowerCase(Locale.ROOT);
         boolean loopbackHttp = scheme.equals("http")
-                && (host.equals("localhost") || host.equals("127.0.0.1") || host.equals("::1"));
+                && (host.equals("localhost") || host.equals("127.0.0.1")
+                || host.equals("::1") || host.equals("[::1]"));
         if ((!scheme.equals("https") && !loopbackHttp) || host.isBlank()) {
             throw new IllegalArgumentException("Store artifact package URL must use HTTPS or loopback HTTP");
         }
@@ -140,10 +144,7 @@ public record PluginStoreArtifact(
                         sha256 = readString(reader, "sha256");
                         break;
                     case "size":
-                        if (reader.peek() != JsonToken.NUMBER) {
-                            throw new IOException("Plugin Store artifact size is not an integer");
-                        }
-                        size = reader.nextLong();
+                        size = readSize(reader);
                         break;
                     default:
                         reader.skipValue();
@@ -176,6 +177,26 @@ public record PluginStoreArtifact(
                 throw new IOException("Plugin Store artifact " + name + " is not a string");
             }
             return reader.nextString();
+        }
+
+        /// Reads a positive decimal integer without allowing Gson to truncate fractional or exponent notation.
+        ///
+        /// @param reader source JSON reader
+        /// @return positive artifact size that fits in a signed long
+        /// @throws IOException if the token is not a canonical positive decimal long
+        private static long readSize(JsonReader reader) throws IOException {
+            if (reader.peek() != JsonToken.NUMBER) {
+                throw new IOException("Plugin Store artifact size is not a number");
+            }
+            String value = reader.nextString();
+            if (!POSITIVE_DECIMAL_PATTERN.matcher(value).matches()) {
+                throw new IOException("Plugin Store artifact size is not a positive decimal integer");
+            }
+            try {
+                return Long.parseLong(value);
+            } catch (NumberFormatException exception) {
+                throw new IOException("Plugin Store artifact size exceeds the supported range", exception);
+            }
         }
     }
 }
