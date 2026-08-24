@@ -48,7 +48,7 @@ public final class RuntimeRequirement {
 
     /// Creates an immutable runtime requirement.
     ///
-    /// @param runtime runtime identifier
+    /// @param runtime canonical runtime identifier
     /// @param pluginAbi required plugin ABI generation
     /// @param bridgeAbi required bridge ABI generation
     /// @param executionMode requested execution boundary
@@ -62,7 +62,11 @@ public final class RuntimeRequirement {
             PluginExecutionMode executionMode,
             Set<RuntimeFeature> requiredFeatures,
             @Nullable String pinnedProviderId) {
-        this.runtime = PluginRuntimeTypes.requireValid(runtime);
+        String canonicalRuntime = PluginRuntimeTypes.requireValid(runtime);
+        if (!canonicalRuntime.equals(runtime)) {
+            throw new IllegalArgumentException("Runtime requirement identifier must be canonical: " + runtime);
+        }
+        this.runtime = canonicalRuntime;
         this.pluginAbi = PluginAbi.requireValid(pluginAbi);
         if (bridgeAbi != 1) {
             throw new IllegalArgumentException("Unsupported runtime bridge ABI: " + bridgeAbi);

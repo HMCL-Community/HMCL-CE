@@ -678,6 +678,13 @@ public final class PluginManifest {
         if (providesRuntimesDeclared && providesRuntimes == null) {
             throw new IOException("Plugin provided runtime declarations cannot be null");
         }
+        if (providesRuntimes != null) {
+            for (@Nullable RuntimeProviderDeclaration declaration : providesRuntimes) {
+                if (declaration == null) {
+                    throw new IOException("Plugin provided runtime declaration cannot be null");
+                }
+            }
+        }
         if (platformsDeclared) {
             if (schemaVersion < 5) {
                 throw new IOException("Plugin manifest schemaVersion " + schemaVersion

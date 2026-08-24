@@ -21,6 +21,7 @@ import org.jackhuang.hmcl.plugin.runtime.PluginAbi;
 import org.jackhuang.hmcl.plugin.runtime.PluginExecutionMode;
 import org.jackhuang.hmcl.plugin.runtime.PluginRuntimeTypes;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeFeature;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderDeclaration;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeRequirement;
 import org.jackhuang.hmcl.util.gson.JsonUtils;
 import org.jetbrains.annotations.NotNullByDefault;
@@ -41,7 +42,7 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/// Verifies legacy, schema-v3, and schema-v4 plugin manifest parsing and validation.
+/// Verifies legacy through schema-v5 plugin manifest parsing, validation, and runtime-provider contracts.
 @NotNullByDefault
 public final class PluginManifestTest {
     /// Parses a schema-v1 manifest with legacy string dependencies and no permission declaration.
@@ -279,6 +280,44 @@ public final class PluginManifestTest {
                 PluginExecutionMode.ISOLATED,
                 Set.of(RuntimeFeature.BRIDGE, RuntimeFeature.RAW_JVM),
                 null));
+    }
+
+    /// Rejects non-canonical runtime identifiers in direct runtime requirement construction.
+    @Test
+    public void rejectNonCanonicalRuntimeRequirementIdentifier() {
+        assertThrows(IllegalArgumentException.class, () -> new RuntimeRequirement(
+                " Java ",
+                PluginAbi.ABI_2,
+                1,
+                PluginExecutionMode.EMBEDDED,
+                Set.of(RuntimeFeature.BRIDGE),
+                null));
+    }
+
+    /// Preserves future plugin ABI declarations from runtime providers while rejecting non-positive values.
+    @Test
+    public void acceptFutureRuntimeProviderAbiDeclarations() {
+        RuntimeProviderDeclaration declaration = assertDoesNotThrow(() -> new RuntimeProviderDeclaration(
+                PluginRuntimeTypes.RUST,
+                Set.of(PluginAbi.ABI_2, 3),
+                1,
+                Set.of(PluginExecutionMode.ISOLATED),
+                Set.of(RuntimeFeature.BRIDGE)));
+
+        assertEquals(Set.of(PluginAbi.ABI_2, 3), declaration.getAbis());
+        assertThrows(IllegalArgumentException.class, () -> new RuntimeProviderDeclaration(
+                PluginRuntimeTypes.RUST,
+                Set.of(0),
+                1,
+                Set.of(PluginExecutionMode.ISOLATED),
+                Set.of(RuntimeFeature.BRIDGE)));
+    }
+
+    /// Rejects null runtime declarations through manifest validation rather than leaking a getter null pointer.
+    @Test
+    public void rejectNullProvidedRuntimeDeclaration() {
+        assertManifestRejected(schemaFiveWithDeclarations(
+                "\"runtime\": \"java\", \"abi\": 2, \"providesRuntimes\": [null]"));
     }
 
     /// Includes the schema-v5 provider vocabulary in manifest value identity.

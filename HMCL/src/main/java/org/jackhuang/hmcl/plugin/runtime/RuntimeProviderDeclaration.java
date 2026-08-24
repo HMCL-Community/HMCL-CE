@@ -40,7 +40,7 @@ public final class RuntimeProviderDeclaration {
     /// Canonical runtime identifier provided by the declaring plugin.
     private final String runtime;
 
-    /// Immutable set of plugin ABI generations implemented by this runtime.
+    /// Immutable set of positive plugin ABI generations implemented by this runtime.
     private final @Unmodifiable Set<Integer> abis;
 
     /// Launcher-to-provider bridge ABI generation implemented by this runtime.
@@ -55,7 +55,7 @@ public final class RuntimeProviderDeclaration {
     /// Creates a validated immutable runtime provider declaration.
     ///
     /// @param runtime provided runtime identifier
-    /// @param abis implemented plugin ABI generations
+    /// @param abis implemented positive plugin ABI generations, including future generations
     /// @param bridgeAbi implemented bridge ABI generation
     /// @param executionModes supported execution boundaries
     /// @param features implemented runtime features
@@ -79,7 +79,9 @@ public final class RuntimeProviderDeclaration {
             if (abi == null) {
                 throw new IllegalArgumentException("Runtime provider ABI cannot be null");
             }
-            PluginAbi.requireValid(abi);
+            if (abi <= 0) {
+                throw new IllegalArgumentException("Runtime provider ABI must be positive: " + abi);
+            }
         }
         if (bridgeAbi != 1) {
             throw new IllegalArgumentException("Unsupported runtime bridge ABI: " + bridgeAbi);
@@ -155,7 +157,7 @@ public final class RuntimeProviderDeclaration {
 
     /// Reads and writes the schema-v5 object form while preserving immutable construction.
     @NotNullByDefault
-    public static final class GsonAdapter extends TypeAdapter<RuntimeProviderDeclaration> {
+    public static final class GsonAdapter extends TypeAdapter<@Nullable RuntimeProviderDeclaration> {
         /// Creates the stateless runtime-provider declaration adapter.
         public GsonAdapter() {
         }
