@@ -30,6 +30,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -171,6 +172,32 @@ public final class RuntimeProviderRegistryTest {
         assertEquals(1, originalChecks.get());
         assertEquals(1, replacementChecks.get());
         assertSame(replacement, registry.findById("dev.host.rust.racing").orElseThrow());
+    }
+
+    /// Fails closed within a bounded time when every live ABI check replaces its registered provider instance.
+    @Test
+    public void failClosedWhenProviderRegistryNeverStabilizes() throws Exception {
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        AtomicInteger liveChecks = new AtomicInteger();
+        registry.register(selfReplacingProvider(registry, liveChecks));
+
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        Future<RuntimeProviderBinding> result = executor.submit(
+                () -> registry.bind("dev.plugin.unstable", requirement("rust", null)));
+        try {
+            ExecutionException failure = assertThrows(
+                    ExecutionException.class, () -> result.get(2, TimeUnit.SECONDS));
+            assertTrue(failure.getCause() instanceof IllegalStateException);
+            assertTrue(failure.getCause().getMessage().contains("changed repeatedly"));
+            assertTrue(failure.getCause().getMessage().contains("dev.plugin.unstable"));
+        } finally {
+            result.cancel(true);
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+        }
+
+        assertTrue(liveChecks.get() > 1);
+        assertTrue(registry.bindingFor("dev.plugin.unstable").isEmpty());
     }
 
     /// Prefers enabled installed providers before disabled installed and remote candidates.
@@ -467,6 +494,37 @@ public final class RuntimeProviderRegistryTest {
             @Override
             public boolean supportsAbi(String runtime, int requiredAbi) {
                 return liveSupport.getAsBoolean();
+            }
+        };
+    }
+
+    /// Creates a provider which replaces itself with a fresh equivalent instance after every live ABI check.
+    ///
+    /// @param registry registry mutated by live checks
+    /// @param liveChecks completed live check counter
+    /// @return self-replacing provider
+    private static RuntimeProvider selfReplacingProvider(
+            RuntimeProviderRegistry registry,
+            AtomicInteger liveChecks) {
+        RuntimeProviderDescriptor descriptor = provider("dev.host.rust.unstable", "rust", "1.0.0", true, true,
+                0, 1, Set.of(PluginExecutionMode.EMBEDDED), Set.of(RuntimeFeature.BRIDGE)).descriptor();
+        return new RuntimeProvider() {
+            /// Returns the immutable test descriptor.
+            @Override
+            public RuntimeProviderDescriptor descriptor() {
+                return descriptor;
+            }
+
+            /// Replaces this provider instance and reports live ABI support until the test cancels the task.
+            @Override
+            public boolean supportsAbi(String runtime, int requiredAbi) {
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new IllegalStateException("Interrupted unstable provider test callback");
+                }
+                liveChecks.incrementAndGet();
+                registry.unregister(descriptor.providerId());
+                registry.register(selfReplacingProvider(registry, liveChecks));
+                return true;
             }
         };
     }

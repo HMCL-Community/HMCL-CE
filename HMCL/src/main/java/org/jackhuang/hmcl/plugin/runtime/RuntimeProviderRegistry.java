@@ -40,6 +40,9 @@ public final class RuntimeProviderRegistry {
     /// Registry shared by production plugin compatibility consumers.
     private static final RuntimeProviderRegistry PROCESS_WIDE = new RuntimeProviderRegistry();
 
+    /// Maximum provider-registration retries allowed after the initial binding attempt.
+    private static final int MAX_BINDING_RETRIES = 8;
+
     /// Stateless deterministic selector shared by registry operations.
     private final RuntimeProviderSelector selector = new RuntimeProviderSelector();
 
@@ -126,14 +129,15 @@ public final class RuntimeProviderRegistry {
     /// @param dependentPluginId canonical dependent plugin ID
     /// @param requirement runtime capability requirement
     /// @return immutable selected binding
-    /// @throws IllegalStateException if the dependent is already bound or no compatible provider exists
+    /// @throws IllegalStateException if the dependent is already bound, no compatible provider exists, or provider
+    /// registration changes repeatedly during live compatibility checks
     public RuntimeProviderBinding bind(
             String dependentPluginId,
             RuntimeRequirement requirement) {
         if (!PluginManifest.isCanonicalExecutableId(dependentPluginId)) {
             throw new IllegalArgumentException("Dependent plugin ID must be canonical: " + dependentPluginId);
         }
-        while (true) {
+        for (int attempt = 0; attempt <= MAX_BINDING_RETRIES; attempt++) {
             BindingSnapshot snapshot = snapshotBindingCandidates(dependentPluginId, requirement);
             if (snapshot.candidates().isEmpty()) {
                 throw noCompatibleProvider(requirement);
@@ -165,6 +169,9 @@ public final class RuntimeProviderRegistry {
                 throw noCompatibleProvider(requirement);
             }
         }
+        throw new IllegalStateException("Runtime provider registry changed repeatedly while binding "
+                + dependentPluginId + " for " + requirement.getRuntime() + " after "
+                + (MAX_BINDING_RETRIES + 1) + " attempts");
     }
 
     /// Removes and returns one dependent plugin binding.
