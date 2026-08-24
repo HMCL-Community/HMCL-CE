@@ -94,7 +94,7 @@ public final class GameLaunchHookCodecTest {
     public void malformedVersionOneEnvelopeIsRejected() {
         PluginDataObject encoded = GameLaunchHookCodec.encodeBefore(
                 completeStructuredPlan(), immutableMetadata());
-        PluginDataObject badVersion = encoded.with("contractVersion", PluginDataValue.number(BigDecimal.TWO));
+        PluginDataObject badVersion = encoded.with("contractVersion", PluginDataValue.number(new BigDecimal("2")));
         PluginDataObject missingPlan = encoded.without("plan");
         PluginDataObject unknownPlanField = encoded.with("plan", PluginDataValue.object(
                 encoded.requireObject("plan").with("futureField", PluginDataValue.bool(true))));
