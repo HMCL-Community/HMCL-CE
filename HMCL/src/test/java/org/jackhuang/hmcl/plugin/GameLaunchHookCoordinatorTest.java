@@ -510,7 +510,7 @@ public final class GameLaunchHookCoordinatorTest {
         AtomicBoolean laterInvoked = new AtomicBoolean();
         GameLaunchHookCoordinator coordinator = coordinator(List.of(
                 subscriber("dev.test.policy", Set.of(), event ->
-                        PluginHookResult.cancel("policy-denied", "Launch denied")),
+                        PluginHookResult.cancel("policy-denied", "Launch denied by policy")),
                 subscriber("dev.test.later", Set.of(), event -> {
                     laterInvoked.set(true);
                     return PluginHookResult.unchanged();
@@ -522,6 +522,37 @@ public final class GameLaunchHookCoordinatorTest {
 
         assertEquals(PluginHookDispatchException.Category.CANCELLED, failure.category());
         assertEquals("dev.test.policy", failure.pluginId());
+        assertEquals("policy-denied", failure.cancellationReasonCode());
+        assertEquals("Launch denied by policy", failure.cancellationMessage());
+        assertFalse(failure.getMessage().contains("Launch denied by policy"));
+        assertFalse(laterInvoked.get());
+    }
+
+    /// Rejects a cancellation message containing a secret visible to an account-authorized callback.
+    @Test
+    public void cancellationMessageCannotExposeResolvedSecret() {
+        AtomicBoolean laterInvoked = new AtomicBoolean();
+        GameLaunchHookCoordinator coordinator = coordinator(List.of(
+                accountSubscriber("dev.test.cancelling-account", event -> PluginHookResult.cancel(
+                        "policy-secret",
+                        "Launch denied for " + event.secrets().resolve("access-token")
+                )),
+                subscriber("dev.test.after-secret-cancel", Set.of("dev.test.cancelling-account"), event -> {
+                    laterInvoked.set(true);
+                    return PluginHookResult.unchanged();
+                })
+        ), false);
+
+        PluginHookDispatchException failure = assertThrows(PluginHookDispatchException.class,
+                () -> coordinator.beforeLaunch(
+                        preparation(LaunchExecutionMode.DIRECT), metadata("direct")));
+
+        assertEquals(PluginHookDispatchException.Category.INVALID_RESULT, failure.category());
+        assertEquals("dev.test.cancelling-account", failure.pluginId());
+        assertNull(failure.cancellationReasonCode());
+        assertNull(failure.cancellationMessage());
+        assertFalse(failure.toString().contains("top-secret"));
+        assertFalse(StringUtils.getStackTrace(failure).contains("top-secret"));
         assertFalse(laterInvoked.get());
     }
 

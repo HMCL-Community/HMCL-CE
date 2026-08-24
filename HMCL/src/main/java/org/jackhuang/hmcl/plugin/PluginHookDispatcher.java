@@ -246,10 +246,19 @@ final class PluginHookDispatcher {
             throw failure(point, subscriber, PluginHookDispatchException.Category.INVALID_RESULT, null);
         }
         if (result.action() == PluginHookResult.Action.CANCEL) {
-            PluginHookDispatchException.Category category = policy.cancellationAllowed()
-                    ? PluginHookDispatchException.Category.CANCELLED
-                    : PluginHookDispatchException.Category.INVALID_RESULT;
-            throw failure(point, subscriber, category, null);
+            try {
+                policy.validateCancellation(subscriber, result);
+            } catch (PluginHookDispatchException exception) {
+                throw exception;
+            } catch (RuntimeException | Error exception) {
+                throw failure(point, subscriber, PluginHookDispatchException.Category.INVALID_RESULT, exception);
+            }
+            throw PluginHookDispatchException.cancelled(
+                    point,
+                    subscriber.pluginId(),
+                    Objects.requireNonNull(result.reasonCode(), "Cancellation reason"),
+                    Objects.requireNonNull(result.message(), "Cancellation message")
+            );
         }
         try {
             return Objects.requireNonNull(
@@ -443,10 +452,15 @@ final class PluginHookDispatcher {
                 PluginHookResult result
         ) throws PluginHookDispatchException;
 
-        /// Returns whether a deliberate cancel result is valid for this operation.
+        /// Validates a deliberate cancel result for this operation without exposing its message to diagnostics.
         ///
-        /// @return whether cancellation is allowed
-        boolean cancellationAllowed();
+        /// @param subscriber current subscriber
+        /// @param result cancel endpoint result
+        /// @throws PluginHookDispatchException if cancellation is not allowed or its message is unsafe
+        void validateCancellation(
+                PluginHookSubscriber subscriber,
+                PluginHookResult result
+        ) throws PluginHookDispatchException;
 
         /// Reports one isolated after callback failure.
         ///

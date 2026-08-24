@@ -20,6 +20,7 @@ package org.jackhuang.hmcl.game;
 import org.jackhuang.hmcl.plugin.PluginHookDispatchException;
 import org.jackhuang.hmcl.plugin.PluginHookPoint;
 import org.jetbrains.annotations.NotNullByDefault;
+import org.jetbrains.annotations.Nullable;
 
 import java.io.IOException;
 import java.util.Locale;
@@ -37,6 +38,12 @@ public final class GameLaunchHookIOException extends IOException {
     /// Stable Hook failure category.
     private final PluginHookDispatchException.Category category;
 
+    /// Validated stable reason for a deliberate cancellation.
+    private final @Nullable String cancellationReasonCode;
+
+    /// Validated user-facing message for a deliberate cancellation.
+    private final @Nullable String cancellationMessage;
+
     /// Converts one categorized Hook failure to the checked launcher boundary.
     ///
     /// @param failure categorized redacted Hook failure
@@ -45,6 +52,8 @@ public final class GameLaunchHookIOException extends IOException {
         this.point = failure.point();
         this.pluginId = failure.pluginId();
         this.category = failure.category();
+        this.cancellationReasonCode = failure.cancellationReasonCode();
+        this.cancellationMessage = failure.cancellationMessage();
     }
 
     /// Returns the Hook point whose coordination failed.
@@ -66,6 +75,20 @@ public final class GameLaunchHookIOException extends IOException {
     /// @return failure category
     public PluginHookDispatchException.Category category() {
         return category;
+    }
+
+    /// Returns the validated stable reason for a deliberate cancellation.
+    ///
+    /// @return cancellation reason or `null` for other failure categories
+    public @Nullable String cancellationReasonCode() {
+        return cancellationReasonCode;
+    }
+
+    /// Returns the validated user-facing message for a deliberate cancellation.
+    ///
+    /// @return cancellation message or `null` for other failure categories
+    public @Nullable String cancellationMessage() {
+        return cancellationMessage;
     }
 
     /// Builds a user-visible message from redacted stable failure identity only.

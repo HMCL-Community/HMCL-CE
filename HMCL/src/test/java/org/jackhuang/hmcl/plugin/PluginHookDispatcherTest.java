@@ -146,7 +146,7 @@ public final class PluginHookDispatcherTest {
         AtomicInteger released = new AtomicInteger();
         PluginHookDispatcher dispatcher = dispatcher(Duration.ofSeconds(1), () -> List.of(
                 subscriber("dev.test.policy", event ->
-                        PluginHookResult.cancel("policy-denied", "Launch denied"), released),
+                        PluginHookResult.cancel("policy-denied", "Launch denied by policy"), released),
                 subscriber("dev.test.later", event -> {
                     laterInvoked.set(true);
                     return PluginHookResult.unchanged();
@@ -162,9 +162,22 @@ public final class PluginHookDispatcherTest {
 
         assertEquals(PluginHookDispatchException.Category.CANCELLED, failure.category());
         assertEquals("dev.test.policy", failure.pluginId());
-        assertFalse(failure.getMessage().contains("Launch denied"));
+        assertEquals("policy-denied", failure.cancellationReasonCode());
+        assertEquals("Launch denied by policy", failure.cancellationMessage());
+        assertFalse(failure.getMessage().contains("policy-denied"));
+        assertFalse(failure.getMessage().contains("Launch denied by policy"));
         assertFalse(laterInvoked.get());
         assertEquals(2, released.get());
+    }
+
+    /// Rejects construction of an unvalidated cancelled category without cancellation fields.
+    @Test
+    public void rejectUnvalidatedCancelledCategoryConstruction() {
+        assertThrows(IllegalArgumentException.class, () -> new PluginHookDispatchException(
+                PluginHookPoint.BEFORE_GAME_LAUNCH,
+                "dev.test.forged-cancel",
+                PluginHookDispatchException.Category.CANCELLED
+        ));
     }
 
     /// Categorizes endpoint exceptions without retaining the plugin-controlled throwable.
@@ -187,6 +200,8 @@ public final class PluginHookDispatcherTest {
 
         assertEquals(PluginHookDispatchException.Category.EXCEPTION, failure.category());
         assertNull(failure.getCause());
+        assertNull(failure.cancellationReasonCode());
+        assertNull(failure.cancellationMessage());
         assertFalse(failure.getMessage().contains("credential-value"));
         assertEquals(1, released.get());
     }
@@ -268,6 +283,10 @@ public final class PluginHookDispatcherTest {
                 PluginHookDispatchException.Category.EXCEPTION,
                 PluginHookDispatchException.Category.INVALID_RESULT
         ), policy.failureCategories());
+        assertNull(policy.failures().get(0).cancellationReasonCode());
+        assertNull(policy.failures().get(0).cancellationMessage());
+        assertFalse(policy.failures().get(0).getMessage().contains("too-late"));
+        assertFalse(policy.failures().get(0).getMessage().contains("Cannot cancel an after Hook"));
         assertTrue(policy.committedNames().isEmpty());
         assertEquals(5, released.get());
     }
@@ -587,12 +606,23 @@ public final class PluginHookDispatcherTest {
             }
         }
 
-        /// Returns whether this policy permits a cancel result.
+        /// Validates whether this policy permits a cancel result.
         ///
-        /// @return cancellation policy
+        /// @param subscriber cancelling subscriber
+        /// @param result cancel endpoint result
+        /// @throws PluginHookDispatchException if this policy rejects cancellation
         @Override
-        public boolean cancellationAllowed() {
-            return cancellationAllowed;
+        public void validateCancellation(
+                PluginHookSubscriber subscriber,
+                PluginHookResult result
+        ) throws PluginHookDispatchException {
+            if (!cancellationAllowed) {
+                throw new PluginHookDispatchException(
+                        point,
+                        subscriber.pluginId(),
+                        PluginHookDispatchException.Category.INVALID_RESULT
+                );
+            }
         }
 
         /// Records one isolated after failure.
@@ -619,6 +649,13 @@ public final class PluginHookDispatcherTest {
         /// @return immutable category list
         private @Unmodifiable List<PluginHookDispatchException.Category> failureCategories() {
             return afterFailures.stream().map(PluginHookDispatchException::category).toList();
+        }
+
+        /// Returns reported after failures.
+        ///
+        /// @return immutable failure list
+        private @Unmodifiable List<PluginHookDispatchException> failures() {
+            return List.copyOf(afterFailures);
         }
     }
 }

@@ -135,6 +135,10 @@ public final class LauncherHelper {
     static @NotNull String formatLaunchFailure(@NotNull Exception failure) {
         Objects.requireNonNull(failure, "failure");
         if (failure instanceof GameLaunchHookIOException hookFailure) {
+            @Nullable String cancellationMessage = hookFailure.cancellationMessage();
+            if (cancellationMessage != null) {
+                return cancellationMessage;
+            }
             return Objects.requireNonNull(hookFailure.getMessage(), "Hook failure message");
         }
         return StringUtils.getStackTrace(failure);

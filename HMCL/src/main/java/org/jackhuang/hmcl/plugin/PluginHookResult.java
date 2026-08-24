@@ -160,7 +160,7 @@ public final class PluginHookResult {
         return message;
     }
 
-    /// Returns a diagnostic representation that never includes protected secret values.
+    /// Returns a diagnostic representation that never includes protected secret values or cancellation messages.
     ///
     /// @return redacted result representation
     @Override
@@ -169,7 +169,7 @@ public final class PluginHookResult {
                 + ", data=" + data
                 + ", protectedSecretSlots=" + protectedSecrets.keySet()
                 + ", reasonCode=" + reasonCode
-                + ", message=" + message + "]";
+                + ", cancellationMessagePresent=" + (message != null) + "]";
     }
 
     /// Copies protected values while rejecting null keys or values.

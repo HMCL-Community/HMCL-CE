@@ -180,6 +180,7 @@ public final class PluginHookContractTest {
         assertEquals("Launch denied", cancel.message());
         assertFalse(replace.toString().contains("hidden-value"));
         assertFalse(replace.toString().contains("late-value"));
+        assertFalse(cancel.toString().contains("Launch denied"));
         assertThrows(IllegalArgumentException.class, () -> PluginHookResult.cancel("Not Kebab", "Denied"));
         assertThrows(IllegalArgumentException.class, () -> PluginHookResult.cancel("", "Denied"));
         assertThrows(IllegalArgumentException.class, () -> PluginHookResult.cancel("denied", " "));

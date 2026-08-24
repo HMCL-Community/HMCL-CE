@@ -294,12 +294,21 @@ public final class GameLaunchHookCoordinator {
             );
         }
 
-        /// Permits deliberate cancellation before any launcher side effect begins.
+        /// Validates a deliberate cancellation before any launcher side effect begins.
         ///
-        /// @return always `true`
+        /// @param subscriber cancelling subscriber
+        /// @param result cancel endpoint result
         @Override
-        public boolean cancellationAllowed() {
-            return true;
+        public void validateCancellation(
+                PluginHookSubscriber subscriber,
+                PluginHookResult result
+        ) {
+            boolean accountGranted = subscriber.permissions().contains(PluginPermission.ACCOUNT);
+            secrets.validateCancellationMessage(
+                    subscriber.pluginId(),
+                    Objects.requireNonNull(result.message(), "Cancellation message"),
+                    accountGranted
+            );
         }
 
         /// Rejects use as an after policy because this session path is fail-fast.
@@ -382,12 +391,21 @@ public final class GameLaunchHookCoordinator {
             });
         }
 
-        /// Rejects cancellation because an after Hook is notification-only.
+        /// Rejects cancellation without inspecting its plugin-controlled message because an after Hook is notification-only.
         ///
-        /// @return always `false`
+        /// @param subscriber cancelling subscriber
+        /// @param result unused cancel endpoint result
+        /// @throws PluginHookDispatchException always, with an invalid-result category
         @Override
-        public boolean cancellationAllowed() {
-            return false;
+        public void validateCancellation(
+                PluginHookSubscriber subscriber,
+                PluginHookResult result
+        ) throws PluginHookDispatchException {
+            throw new PluginHookDispatchException(
+                    PluginHookPoint.AFTER_GAME_LAUNCH,
+                    subscriber.pluginId(),
+                    PluginHookDispatchException.Category.INVALID_RESULT
+            );
         }
 
         /// Logs one redacted after failure while dispatch continues to later subscribers.

@@ -38,7 +38,7 @@ public final class GameLaunchHookIOExceptionTest {
         PluginHookDispatchException failure = new PluginHookDispatchException(
                 PluginHookPoint.BEFORE_GAME_LAUNCH,
                 "dev.test.policy",
-                PluginHookDispatchException.Category.CANCELLED,
+                PluginHookDispatchException.Category.EXCEPTION,
                 secretCause
         );
 
@@ -47,10 +47,12 @@ public final class GameLaunchHookIOExceptionTest {
         assertNull(translated.getCause());
         assertEquals(PluginHookPoint.BEFORE_GAME_LAUNCH, translated.point());
         assertEquals("dev.test.policy", translated.pluginId());
-        assertEquals(PluginHookDispatchException.Category.CANCELLED, translated.category());
+        assertEquals(PluginHookDispatchException.Category.EXCEPTION, translated.category());
+        assertNull(translated.cancellationReasonCode());
+        assertNull(translated.cancellationMessage());
         assertTrue(translated.getMessage().contains("before-game-launch"));
         assertTrue(translated.getMessage().contains("dev.test.policy"));
-        assertTrue(translated.getMessage().contains("cancelled"));
+        assertTrue(translated.getMessage().contains("exception"));
         assertFalse(translated.getMessage().contains("top-secret"));
         assertFalse(translated.toString().contains("top-secret"));
         assertFalse(StringUtils.getStackTrace(translated).contains("top-secret"));
@@ -72,5 +74,27 @@ public final class GameLaunchHookIOExceptionTest {
         assertEquals(translated.getMessage(), display);
         assertFalse(display.contains("GameLaunchHookIOException"));
         assertFalse(display.contains("top-secret"));
+    }
+
+    /// Preserves a validated cancellation for the checked boundary and displays only its controlled message.
+    @Test
+    public void launcherHelperDisplaysValidatedCancellationMessage() {
+        PluginHookDispatchException failure = PluginHookDispatchException.cancelled(
+                PluginHookPoint.BEFORE_GAME_LAUNCH,
+                "dev.test.policy",
+                "policy-denied",
+                "Launch denied by policy"
+        );
+
+        GameLaunchHookIOException translated = new GameLaunchHookIOException(failure);
+        String display = LauncherHelper.formatLaunchFailure(translated);
+
+        assertNull(translated.getCause());
+        assertEquals(PluginHookDispatchException.Category.CANCELLED, translated.category());
+        assertEquals("policy-denied", translated.cancellationReasonCode());
+        assertEquals("Launch denied by policy", translated.cancellationMessage());
+        assertFalse(translated.getMessage().contains("Launch denied by policy"));
+        assertEquals("Launch denied by policy", display);
+        assertFalse(display.contains("GameLaunchHookIOException"));
     }
 }

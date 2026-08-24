@@ -112,6 +112,29 @@ final class GameLaunchSecretStore {
         scanObject(pluginId, data, visibleSecrets.values(), "$");
     }
 
+    /// Rejects a cancellation message containing any secret visible to that callback.
+    ///
+    /// @param pluginId callback plugin ID
+    /// @param message candidate user-facing cancellation message
+    /// @param accountGranted whether the callback could resolve stored secrets
+    void validateCancellationMessage(String pluginId, String message, boolean accountGranted) {
+        Objects.requireNonNull(pluginId, "pluginId");
+        Objects.requireNonNull(message, "message");
+        if (!accountGranted) {
+            return;
+        }
+        Map<String, String> visibleSecrets;
+        synchronized (this) {
+            visibleSecrets = Map.copyOf(secrets);
+        }
+        for (String secret : visibleSecrets.values()) {
+            if (!secret.isEmpty() && message.contains(secret)) {
+                throw invalidResult(pluginId,
+                        new IllegalArgumentException("Cancellation message contains a protected value"));
+            }
+        }
+    }
+
     /// Applies authorized protected updates whose slots are all referenced by the candidate plan.
     ///
     /// @param pluginId callback plugin ID
