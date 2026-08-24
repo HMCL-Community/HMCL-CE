@@ -1068,7 +1068,7 @@ git commit -m "Wire game launch hooks into launcher flow"
 - Create: `C:/Users/ACX/Documents/Plugins/HMCL-CE-Plugin-SDK/examples/java-launch-hook/plugin.json`
 - Create: `C:/Users/ACX/Documents/Plugins/HMCL-CE-Plugin-SDK/examples/java-launch-hook/src/main/java/dev/hmclce/example/launchhook/LaunchHookPlugin.java`
 
-- [ ] **Step 1: Add the new snapshot names and prove sync detects absence**
+- [x] **Step 1: Add the new snapshot names and prove sync detects absence**
 
 Append the five new public files to `$files` in `tools/sync-api-references.ps1`, then run:
 
@@ -1081,7 +1081,7 @@ git status --short
 Expected: the five files appear as untracked and `Plugin.java`/`PluginHookPoint.java` appear modified;
 no schema-v4 checkout or file changes occur.
 
-- [ ] **Step 2: Create a real before-launch Java example**
+- [x] **Step 2: Create a real before-launch Java example**
 
 The manifest is schema 5, Java ABI 2, declares only `before-game-launch`, and includes
 `launcher-hook` in both `permissions` and `requiredPermissions`. The callback must preserve every
@@ -1110,7 +1110,7 @@ Implement ordinary lifecycle methods and `getManifest()` using the same pattern 
 Java example. The Gradle build uses the latest HMCL jar as `compileOnly`, Java release 17,
 reproducible archives, and produces `dev.hmclce.example.java.launch-hook-v1.0.0.npl`.
 
-- [ ] **Step 3: Build and validate the new SDK example**
+- [x] **Step 3: Build and validate the new SDK example**
 
 ```powershell
 Set-Location C:\Users\ACX\Documents\HMCL-CE
@@ -1124,7 +1124,7 @@ Set-Location C:\Users\ACX\Documents\Plugins\HMCL-CE-Plugin-SDK
 Expected: build and both validators succeed; the package contains `plugin.json` and the compiled
 plugin jar and requests no `account` permission.
 
-- [ ] **Step 4: Verify snapshot reproducibility and document the executable status**
+- [x] **Step 4: Verify snapshot reproducibility and document the executable status**
 
 Run the sync script a second time and assert `git diff --exit-code` reports no further changes after
 the generated snapshots are staged. Update `references/README.md` to list the five types and state
@@ -1132,7 +1132,7 @@ that game-launch Hooks execute on HMCL CE `next`, while other declared points an
 remain unavailable. Add `java-launch-hook` to the example matrix in
 `tools/test-publishing-tools.ps1` and run that script so publishing checks cover the new package.
 
-- [ ] **Step 5: Commit only to SDK schema-v5**
+- [x] **Step 5: Commit only to SDK schema-v5**
 
 ```powershell
 Set-Location C:\Users\ACX\Documents\Plugins\HMCL-CE-Plugin-SDK
