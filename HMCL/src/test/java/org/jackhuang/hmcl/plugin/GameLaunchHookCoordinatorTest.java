@@ -17,6 +17,7 @@
  */
 package org.jackhuang.hmcl.plugin;
 
+import org.jackhuang.hmcl.ApplicationShutdownCoordinator;
 import org.jackhuang.hmcl.game.GameLaunchHookProcessListener;
 import org.jackhuang.hmcl.launch.LaunchAuxiliaryProcessPlan;
 import org.jackhuang.hmcl.launch.LaunchCommandPlan;
@@ -51,6 +52,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -113,11 +115,71 @@ public final class GameLaunchHookCoordinatorTest {
 
     /// Returns the original listener when no after subscriber was eligible for the direct session.
     @Test
-    public void noAfterSubscriberReturnsOriginalListener() {
+    public void productionCompositionKeepsOriginalListenerWithoutAfterSubscriber() {
         GameLaunchHookCoordinator.LaunchSession session = coordinator(List.of(), false)
                 .beforeLaunch(preparation(LaunchExecutionMode.DIRECT), metadata("direct"));
 
         assertSame(NO_OP_LISTENER, session.processListener(NO_OP_LISTENER));
+    }
+
+    /// Lets close-mode shutdown start immediately when no after subscriber owns a session lease.
+    @Test
+    public void productionCompositionCloseWithoutAfterSubscriberShutsDownImmediately() {
+        AtomicInteger shutdowns = new AtomicInteger();
+        AtomicInteger hides = new AtomicInteger();
+        ApplicationShutdownCoordinator shutdownCoordinator =
+                new ApplicationShutdownCoordinator(shutdowns::incrementAndGet, hides::incrementAndGet);
+        GameLaunchHookCoordinator hookCoordinator = coordinator(
+                List.of(), List.of(), false, shutdownCoordinator::acquireLease);
+
+        GameLaunchHookCoordinator.LaunchSession session = hookCoordinator.beforeLaunch(
+                preparation(LaunchExecutionMode.DIRECT), metadata("direct"));
+        shutdownCoordinator.requestShutdown();
+
+        assertNull(session.processListener(null));
+        assertEquals(1, shutdowns.get());
+        assertEquals(0, hides.get());
+    }
+
+    /// Installs a Hook-only listener for close mode and releases its shutdown lease without a created process.
+    @Test
+    public void productionCompositionCloseWithAfterSubscriberDefersUntilNoProcessClose() {
+        AtomicInteger shutdowns = new AtomicInteger();
+        AtomicInteger hides = new AtomicInteger();
+        ApplicationShutdownCoordinator shutdownCoordinator =
+                new ApplicationShutdownCoordinator(shutdowns::incrementAndGet, hides::incrementAndGet);
+        GameLaunchHookCoordinator hookCoordinator = coordinator(
+                List.of(), List.of(), true, shutdownCoordinator::acquireLease);
+
+        GameLaunchHookCoordinator.LaunchSession session = hookCoordinator.beforeLaunch(
+                preparation(LaunchExecutionMode.DIRECT), metadata("direct"));
+        shutdownCoordinator.requestShutdown();
+
+        assertTrue(session.processListener(null) instanceof GameLaunchHookProcessListener);
+        assertEquals(0, shutdowns.get());
+        assertEquals(1, hides.get());
+        session.closeWithoutProcess();
+        assertEquals(1, shutdowns.get());
+    }
+
+    /// Keeps script generation free of process listeners and shutdown leases.
+    @Test
+    public void productionCompositionScriptKeepsNullListenerAndNoLease() {
+        AtomicInteger shutdowns = new AtomicInteger();
+        AtomicInteger hides = new AtomicInteger();
+        ApplicationShutdownCoordinator shutdownCoordinator =
+                new ApplicationShutdownCoordinator(shutdowns::incrementAndGet, hides::incrementAndGet);
+        GameLaunchHookCoordinator hookCoordinator = coordinator(
+                List.of(), List.of(), true, shutdownCoordinator::acquireLease);
+
+        GameLaunchHookCoordinator.LaunchSession session = hookCoordinator.beforeLaunch(
+                preparation(LaunchExecutionMode.SCRIPT), metadata("script"));
+        shutdownCoordinator.requestShutdown();
+
+        assertFalse(session.hasAfterSubscribers());
+        assertNull(session.processListener(null));
+        assertEquals(1, shutdowns.get());
+        assertEquals(0, hides.get());
     }
 
     /// Acquires one direct-session shutdown lease and releases it idempotently at exit completion.

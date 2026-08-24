@@ -547,6 +547,11 @@ public final class GameLaunchHookCoordinator {
             }
         }
 
+        /// Releases exit-scoped resources when process creation failed before an exit callback was possible.
+        public void closeWithoutProcess() {
+            finishExit();
+        }
+
         /// Returns the protected store for package-internal after coordination.
         ///
         /// @return launch-scoped secret store

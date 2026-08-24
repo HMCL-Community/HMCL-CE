@@ -1004,14 +1004,14 @@ git commit -m "Keep HMCL alive for after launch hooks"
 - Modify: `HMCL/src/test/java/org/jackhuang/hmcl/plugin/GameLaunchHookCoordinatorTest.java`
 - Modify: `HMCL/src/test/java/org/jackhuang/hmcl/game/GameLaunchHookProcessListenerTest.java`
 
-- [ ] **Step 1: Add regression tests around production composition**
+- [x] **Step 1: Add regression tests around production composition**
 
 Test that no Hook subscriber keeps the current listener/null-listener paths, close visibility still
 stops immediately, script completion still returns `null`, and a close-mode launch with an after
 subscriber installs a Hook-only listener so `ExitWaiter` can report termination without constructing
 the log UI.
 
-- [ ] **Step 2: Run integration-focused tests and verify RED**
+- [x] **Step 2: Run integration-focused tests and verify RED**
 
 ```powershell
 .\gradlew.bat :HMCL:test --tests "org.jackhuang.hmcl.plugin.GameLaunchHookCoordinatorTest.productionComposition*" --tests "org.jackhuang.hmcl.game.GameLaunchHookProcessListenerTest.closeMode*" --no-daemon --stacktrace
@@ -1020,7 +1020,7 @@ the log UI.
 Expected: at least the close-mode after subscriber assertion fails because `LauncherHelper` still
 passes `null` and stops the application immediately.
 
-- [ ] **Step 3: Inject the process-wide coordinator in LauncherHelper**
+- [x] **Step 3: Inject the process-wide coordinator in LauncherHelper**
 
 Construct `HMCLGameLauncher` with `GameLaunchHookCoordinator.processWide(PluginManager.getInstance())`.
 Keep the current rich `HMCLProcessListener` for every non-close visibility. For close visibility, let
@@ -1031,7 +1031,7 @@ the shutdown coordinator decides whether that call is immediate or deferred.
 On process-creation failure, call `session.closeWithoutProcess()` before propagating
 `ProcessCreationException`. Do not acquire a lease during script generation.
 
-- [ ] **Step 4: Run focused and module regression suites GREEN**
+- [x] **Step 4: Run focused and module regression suites GREEN**
 
 ```powershell
 .\gradlew.bat :HMCL:test --tests "org.jackhuang.hmcl.plugin.PluginHookContractTest" --tests "org.jackhuang.hmcl.plugin.PluginHookSubscriberOrderTest" --tests "org.jackhuang.hmcl.plugin.PluginHookDispatcherTest" --tests "org.jackhuang.hmcl.plugin.GameLaunchHookCodecTest" --tests "org.jackhuang.hmcl.plugin.GameLaunchHookCoordinatorTest" --tests "org.jackhuang.hmcl.game.GameLaunchHookProcessListenerTest" --tests "org.jackhuang.hmcl.ApplicationShutdownCoordinatorTest" --no-daemon --stacktrace
@@ -1041,7 +1041,7 @@ On process-creation failure, call `session.closeWithoutProcess()` before propaga
 
 Expected: all commands succeed, including schema-v4 plugin and existing launcher lifecycle tests.
 
-- [ ] **Step 5: Commit production wiring**
+- [x] **Step 5: Commit production wiring**
 
 ```powershell
 git add HMCL/src/main/java/org/jackhuang/hmcl/game/LauncherHelper.java

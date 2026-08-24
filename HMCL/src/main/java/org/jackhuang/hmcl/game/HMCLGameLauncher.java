@@ -234,7 +234,7 @@ public final class HMCLGameLauncher extends DefaultLauncher {
                     session::finishExit
             );
         } catch (IOException | InterruptedException | RuntimeException | Error failure) {
-            session.finishExit();
+            session.closeWithoutProcess();
             throw failure;
         }
     }

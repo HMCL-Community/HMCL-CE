@@ -143,7 +143,7 @@ public final class GameLaunchHookProcessListenerTest {
 
     /// Supports an absent delegate while retaining after observation and nonnegative elapsed time.
     @Test
-    public void absentDelegateAndBackwardClockRemainValid() {
+    public void closeModeHookOnlyListenerReportsExitWithoutDelegate() {
         List<GameLaunchHookProcessListener.ExitObservation> observations = new ArrayList<>();
         GameLaunchHookProcessListener listener = new GameLaunchHookProcessListener(
                 null,
