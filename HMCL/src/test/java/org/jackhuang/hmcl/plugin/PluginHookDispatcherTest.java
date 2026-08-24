@@ -44,6 +44,7 @@ import java.util.function.Supplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -166,7 +167,7 @@ public final class PluginHookDispatcherTest {
         assertEquals(2, released.get());
     }
 
-    /// Categorizes endpoint exceptions without copying sensitive cause text into the public failure message.
+    /// Categorizes endpoint exceptions without retaining the plugin-controlled throwable.
     @Test
     public void categorizeEndpointExceptionWithoutLeakingCauseText() {
         AtomicInteger released = new AtomicInteger();
@@ -185,7 +186,7 @@ public final class PluginHookDispatcherTest {
                 ));
 
         assertEquals(PluginHookDispatchException.Category.EXCEPTION, failure.category());
-        assertSame(endpointFailure, failure.getCause());
+        assertNull(failure.getCause());
         assertFalse(failure.getMessage().contains("credential-value"));
         assertEquals(1, released.get());
     }

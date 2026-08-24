@@ -319,8 +319,7 @@ final class PluginHookDispatcher {
                     && dispatchFailure.category() == PluginHookDispatchException.Category.MISSING_ENDPOINT) {
                 throw dispatchFailure;
             }
-            throw failure(point, subscriber, PluginHookDispatchException.Category.EXCEPTION,
-                    cause == null ? exception : cause);
+            throw failure(point, subscriber, PluginHookDispatchException.Category.EXCEPTION, null);
         }
     }
 

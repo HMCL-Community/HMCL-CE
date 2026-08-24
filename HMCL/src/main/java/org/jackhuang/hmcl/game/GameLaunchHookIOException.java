@@ -18,6 +18,7 @@
 package org.jackhuang.hmcl.game;
 
 import org.jackhuang.hmcl.plugin.PluginHookDispatchException;
+import org.jackhuang.hmcl.plugin.PluginHookPoint;
 import org.jetbrains.annotations.NotNullByDefault;
 
 import java.io.IOException;
@@ -27,6 +28,9 @@ import java.util.Objects;
 /// Exposes a redacted checked launch failure when a before-game-launch plugin Hook cannot complete.
 @NotNullByDefault
 public final class GameLaunchHookIOException extends IOException {
+    /// Hook point whose coordination failed.
+    private final PluginHookPoint point;
+
     /// Plugin responsible for the failed launch coordination.
     private final String pluginId;
 
@@ -37,9 +41,17 @@ public final class GameLaunchHookIOException extends IOException {
     ///
     /// @param failure categorized redacted Hook failure
     GameLaunchHookIOException(PluginHookDispatchException failure) {
-        super(message(failure), failure);
+        super(message(failure));
+        this.point = failure.point();
         this.pluginId = failure.pluginId();
         this.category = failure.category();
+    }
+
+    /// Returns the Hook point whose coordination failed.
+    ///
+    /// @return Hook point
+    public PluginHookPoint point() {
+        return point;
     }
 
     /// Returns the plugin responsible for the failed launch.
@@ -62,7 +74,8 @@ public final class GameLaunchHookIOException extends IOException {
     /// @return redacted launch failure message
     private static String message(PluginHookDispatchException failure) {
         Objects.requireNonNull(failure, "failure");
-        return "Plugin " + failure.pluginId() + " stopped game launch: "
+        return "Plugin Hook " + failure.point().getId() + " for " + failure.pluginId()
+                + " stopped game launch: "
                 + failure.category().name().toLowerCase(Locale.ROOT);
     }
 }

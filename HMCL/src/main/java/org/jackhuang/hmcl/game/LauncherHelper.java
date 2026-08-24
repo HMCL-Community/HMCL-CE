@@ -54,6 +54,7 @@ import org.jackhuang.hmcl.util.platform.*;
 import org.jackhuang.hmcl.util.platform.windows.WinReg;
 import org.jackhuang.hmcl.util.versioning.GameVersionNumber;
 import org.jackhuang.hmcl.util.versioning.VersionNumber;
+import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import java.io.FileNotFoundException;
@@ -122,6 +123,21 @@ public final class LauncherHelper {
 
     public void setKeep() {
         launcherVisibility = LauncherVisibility.KEEP;
+    }
+
+    /// Formats one launch task failure for user-visible dialog display.
+    ///
+    /// Plugin Hook failures expose only their controlled stable message; other failures retain the existing
+    /// diagnostic stack trace.
+    ///
+    /// @param failure launch task failure
+    /// @return user-visible failure text
+    static @NotNull String formatLaunchFailure(@NotNull Exception failure) {
+        Objects.requireNonNull(failure, "failure");
+        if (failure instanceof GameLaunchHookIOException hookFailure) {
+            return Objects.requireNonNull(hookFailure.getMessage(), "Hook failure message");
+        }
+        return StringUtils.getStackTrace(failure);
     }
 
     public void setQuickPlayOption(QuickPlayOption quickPlayOption) {
@@ -410,7 +426,7 @@ public final class LauncherHelper {
                                 } else if (ex instanceof AccessDeniedException) {
                                     message = i18n("exception.access_denied", ((AccessDeniedException) ex).getFile());
                                 } else {
-                                    message = StringUtils.getStackTrace(ex);
+                                    message = formatLaunchFailure(ex);
                                 }
                                 Controllers.dialog(message,
                                         scriptFile == null ? i18n("launch.failed") : i18n("instance.launch_script.failed"),

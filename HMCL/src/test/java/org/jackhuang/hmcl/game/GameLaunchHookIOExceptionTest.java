@@ -19,18 +19,19 @@ package org.jackhuang.hmcl.game;
 
 import org.jackhuang.hmcl.plugin.PluginHookDispatchException;
 import org.jackhuang.hmcl.plugin.PluginHookPoint;
+import org.jackhuang.hmcl.util.StringUtils;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// Verifies checked launch-boundary translation of redacted plugin Hook failures.
 @NotNullByDefault
 public final class GameLaunchHookIOExceptionTest {
-    /// Retains stable failure identity without leaking an internal cause message.
+    /// Retains stable failure identity without retaining an internal cause chain.
     @Test
     public void wrapsRedactedHookFailureForLaunchTasks() {
         IllegalStateException secretCause = new IllegalStateException("top-secret");
@@ -43,11 +44,33 @@ public final class GameLaunchHookIOExceptionTest {
 
         GameLaunchHookIOException translated = new GameLaunchHookIOException(failure);
 
-        assertSame(failure, translated.getCause());
+        assertNull(translated.getCause());
+        assertEquals(PluginHookPoint.BEFORE_GAME_LAUNCH, translated.point());
         assertEquals("dev.test.policy", translated.pluginId());
         assertEquals(PluginHookDispatchException.Category.CANCELLED, translated.category());
+        assertTrue(translated.getMessage().contains("before-game-launch"));
         assertTrue(translated.getMessage().contains("dev.test.policy"));
         assertTrue(translated.getMessage().contains("cancelled"));
         assertFalse(translated.getMessage().contains("top-secret"));
+        assertFalse(translated.toString().contains("top-secret"));
+        assertFalse(StringUtils.getStackTrace(translated).contains("top-secret"));
+    }
+
+    /// Formats Hook launch failures through the controlled dialog message instead of a generic stack trace.
+    @Test
+    public void launcherHelperFormatsHookFailureWithoutGenericStackTrace() {
+        PluginHookDispatchException failure = new PluginHookDispatchException(
+                PluginHookPoint.BEFORE_GAME_LAUNCH,
+                "dev.test.throwing-account",
+                PluginHookDispatchException.Category.EXCEPTION,
+                new IllegalStateException("top-secret")
+        );
+        GameLaunchHookIOException translated = new GameLaunchHookIOException(failure);
+
+        String display = LauncherHelper.formatLaunchFailure(translated);
+
+        assertEquals(translated.getMessage(), display);
+        assertFalse(display.contains("GameLaunchHookIOException"));
+        assertFalse(display.contains("top-secret"));
     }
 }

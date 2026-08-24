@@ -26,6 +26,7 @@ import org.jackhuang.hmcl.launch.LaunchPlanText;
 import org.jackhuang.hmcl.launch.LaunchPreparation;
 import org.jackhuang.hmcl.launch.LaunchProcessPlan;
 import org.jackhuang.hmcl.launch.ProcessListener;
+import org.jackhuang.hmcl.util.StringUtils;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -460,6 +461,26 @@ public final class GameLaunchHookCoordinatorTest {
         assertFalse(Objects.toString(failure.getCause(), "").contains("TOPSECRET123"));
         assertFalse(laterInvoked.get());
         assertFalse(original.plan().environmentSet().containsKey("TOPSECRET123"));
+    }
+
+    /// Redacts an account-authorized endpoint throwable whose message contains a resolved secret.
+    @Test
+    public void accountEndpointThrowableDoesNotExposeResolvedSecret() {
+        GameLaunchHookCoordinator coordinator = coordinator(List.of(
+                accountSubscriber("dev.test.throwing-account", event -> {
+                    throw new IllegalStateException(event.secrets().resolve("access-token"));
+                })
+        ), false);
+
+        PluginHookDispatchException failure = assertThrows(PluginHookDispatchException.class,
+                () -> coordinator.beforeLaunch(
+                        preparation(LaunchExecutionMode.DIRECT), metadata("direct")));
+
+        assertEquals(PluginHookDispatchException.Category.EXCEPTION, failure.category());
+        assertEquals("dev.test.throwing-account", failure.pluginId());
+        assertNull(failure.getCause());
+        assertFalse(failure.toString().contains("top-secret"));
+        assertFalse(StringUtils.getStackTrace(failure).contains("top-secret"));
     }
 
     /// Coordinates script plans without allocating direct-execution after state.
