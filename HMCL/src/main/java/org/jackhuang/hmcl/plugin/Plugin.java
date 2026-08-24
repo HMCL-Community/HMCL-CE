@@ -37,6 +37,14 @@ public interface Plugin {
     default void onUnload() {
     }
 
+    /// Handles one manifest-declared Hook event.
+    ///
+    /// @param event immutable event envelope
+    /// @return transactional Hook result
+    default PluginHookResult onHook(PluginHookEvent event) {
+        return PluginHookResult.unchanged();
+    }
+
     /// Returns the plugin manifest associated with this instance.
     ///
     /// The manager uses the package manifest as the authoritative value and exposes this method for compatibility.
