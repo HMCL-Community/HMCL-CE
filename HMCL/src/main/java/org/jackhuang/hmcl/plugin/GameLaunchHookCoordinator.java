@@ -17,6 +17,7 @@
  */
 package org.jackhuang.hmcl.plugin;
 
+import org.jackhuang.hmcl.Launcher;
 import org.jackhuang.hmcl.game.GameLaunchHookProcessListener;
 import org.jackhuang.hmcl.launch.LaunchAuxiliaryProcessPlan;
 import org.jackhuang.hmcl.launch.LaunchExecutionMode;
@@ -34,7 +35,9 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
+import java.util.function.Function;
 
 import static org.jackhuang.hmcl.util.logging.Logger.LOG;
 
@@ -47,13 +50,17 @@ public final class GameLaunchHookCoordinator {
     /// Dynamic eligibility probe for direct-launch after subscribers.
     private final BooleanSupplier afterSubscriberEligibility;
 
+    /// Acquires application shutdown leases for eligible direct launch sessions.
+    private final Function<String, AutoCloseable> shutdownLeaseFactory;
+
     /// Creates a coordinator backed by one plugin manager.
     ///
     /// @param pluginManager plugin manager supplying Hook subscribers
     public GameLaunchHookCoordinator(PluginManager pluginManager) {
         this(
                 new PluginHookDispatcher(Objects.requireNonNull(pluginManager, "pluginManager")),
-                () -> pluginManager.hasEligibleHookSubscriber(PluginHookPoint.AFTER_GAME_LAUNCH)
+                () -> pluginManager.hasEligibleHookSubscriber(PluginHookPoint.AFTER_GAME_LAUNCH),
+                Launcher::acquireShutdownLease
         );
     }
 
@@ -61,13 +68,16 @@ public final class GameLaunchHookCoordinator {
     ///
     /// @param dispatcher Hook dispatcher
     /// @param afterSubscriberEligibility after-Hook eligibility probe
+    /// @param shutdownLeaseFactory application shutdown lease factory
     GameLaunchHookCoordinator(
             PluginHookDispatcher dispatcher,
-            BooleanSupplier afterSubscriberEligibility
+            BooleanSupplier afterSubscriberEligibility,
+            Function<String, AutoCloseable> shutdownLeaseFactory
     ) {
         this.dispatcher = Objects.requireNonNull(dispatcher, "dispatcher");
         this.afterSubscriberEligibility = Objects.requireNonNull(
                 afterSubscriberEligibility, "afterSubscriberEligibility");
+        this.shutdownLeaseFactory = Objects.requireNonNull(shutdownLeaseFactory, "shutdownLeaseFactory");
     }
 
     /// Returns the process-wide coordinator used by launcher instances.
@@ -110,6 +120,11 @@ public final class GameLaunchHookCoordinator {
                 : preparation.withPlan(finalPlan).withSecrets(finalSecrets);
         boolean hasAfterSubscribers = finalPlan.executionMode() == LaunchExecutionMode.DIRECT
                 && afterSubscriberEligibility.getAsBoolean();
+        @Nullable AutoCloseable shutdownLease = hasAfterSubscribers
+                ? Objects.requireNonNull(
+                        shutdownLeaseFactory.apply("after-game-launch:" + dispatchId),
+                        "shutdownLease")
+                : null;
         return new LaunchSession(
                 this,
                 finalPreparation,
@@ -118,7 +133,8 @@ public final class GameLaunchHookCoordinator {
                 immutableMetadata,
                 finalPreparation.plan(),
                 secrets,
-                hasAfterSubscribers
+                hasAfterSubscribers,
+                shutdownLease
         );
     }
 
@@ -413,8 +429,15 @@ public final class GameLaunchHookCoordinator {
         /// Whether a direct launch had an eligible after subscriber at before completion.
         private final boolean hasAfterSubscribers;
 
+        /// Application shutdown lease held until after callbacks and post-exit handling complete.
+        private final @Nullable AutoCloseable shutdownLease;
+
+        /// Ensures exit-scoped resources are released at most once.
+        private final AtomicBoolean exitFinished = new AtomicBoolean();
+
         /// Creates one complete immutable session.
         ///
+        /// @param coordinator owning Hook coordinator
         /// @param preparation transformed launch preparation
         /// @param dispatchId opaque dispatch ID
         /// @param startedAt session start instant
@@ -422,6 +445,7 @@ public final class GameLaunchHookCoordinator {
         /// @param finalPlan redacted final plan
         /// @param secrets protected secret store
         /// @param hasAfterSubscribers after subscriber eligibility snapshot
+        /// @param shutdownLease application shutdown lease, or `null` when no after event is owed
         private LaunchSession(
                 GameLaunchHookCoordinator coordinator,
                 LaunchPreparation preparation,
@@ -430,7 +454,8 @@ public final class GameLaunchHookCoordinator {
                 PluginDataObject metadata,
                 LaunchProcessPlan finalPlan,
                 GameLaunchSecretStore secrets,
-                boolean hasAfterSubscribers
+                boolean hasAfterSubscribers,
+                @Nullable AutoCloseable shutdownLease
         ) {
             this.coordinator = coordinator;
             this.preparation = preparation;
@@ -440,6 +465,7 @@ public final class GameLaunchHookCoordinator {
             this.finalPlan = finalPlan;
             this.secrets = secrets;
             this.hasAfterSubscribers = hasAfterSubscribers;
+            this.shutdownLease = shutdownLease;
         }
 
         /// Returns the transformed executable or renderable preparation.
@@ -509,10 +535,16 @@ public final class GameLaunchHookCoordinator {
             }
         }
 
-        /// Finishes exit-scoped resources after listener and post-exit processing.
-        ///
-        /// Task 9 attaches the application shutdown lease to this lifecycle boundary.
+        /// Releases exit-scoped resources after listener and post-exit processing exactly once.
         public void finishExit() {
+            if (shutdownLease == null || !exitFinished.compareAndSet(false, true)) {
+                return;
+            }
+            try {
+                shutdownLease.close();
+            } catch (Exception exception) {
+                LOG.warning("Failed to release application shutdown lease for launch " + dispatchId, exception);
+            }
         }
 
         /// Returns the protected store for package-internal after coordination.

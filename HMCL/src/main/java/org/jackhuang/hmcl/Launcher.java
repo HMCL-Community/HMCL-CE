@@ -82,6 +82,10 @@ import static org.jackhuang.hmcl.util.logging.Logger.LOG;
 public final class Launcher extends Application {
     public static final CookieManager COOKIE_MANAGER = new CookieManager();
 
+    /// Process-wide shutdown state shared by UI close requests and launch Hook sessions.
+    private static final ApplicationShutdownCoordinator SHUTDOWN_COORDINATOR =
+            new ApplicationShutdownCoordinator(Launcher::performApplicationShutdown, Launcher::hideForDeferredShutdown);
+
     @Override
     public void start(Stage primaryStage) {
         Thread.currentThread().setUncaughtExceptionHandler(CRASH_REPORTER);
@@ -364,13 +368,40 @@ public final class Launcher extends Application {
         }
     }
 
+    /// Requests application shutdown, deferring irreversible cleanup while internal leases remain active.
     public static void stopApplication() {
         LOG.info("Stopping application.\n" + StringUtils.getStackTrace(Thread.currentThread().getStackTrace()));
 
+        SHUTDOWN_COORDINATOR.requestShutdown();
+    }
+
+    /// Acquires one process-wide shutdown lease for an internal asynchronous operation.
+    ///
+    /// This bridge is launcher infrastructure and is not part of the Plugin SDK contract.
+    ///
+    /// @param owner stable internal owner label
+    /// @return idempotently closeable shutdown lease
+    public static AutoCloseable acquireShutdownLease(String owner) {
+        return SHUTDOWN_COORDINATOR.acquireLease(owner);
+    }
+
+    /// Hides the primary stage while a requested shutdown waits for internal leases.
+    private static void hideForDeferredShutdown() {
         runInFX(() -> {
-            if (Controllers.getStage() == null)
+            @Nullable Stage stage = Controllers.getStage();
+            if (stage == null)
                 return;
-            Controllers.getStage().close();
+            stage.hide();
+        });
+    }
+
+    /// Performs the existing irreversible application shutdown sequence on the JavaFX thread.
+    private static void performApplicationShutdown() {
+        runInFX(() -> {
+            @Nullable Stage stage = Controllers.getStage();
+            if (stage == null)
+                return;
+            stage.close();
             Schedulers.shutdown();
             Controllers.shutdown();
             Platform.exit();

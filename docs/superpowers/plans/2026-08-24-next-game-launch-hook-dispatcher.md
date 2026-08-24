@@ -920,7 +920,7 @@ git commit -m "Dispatch after game launch hooks"
 - Modify: `HMCL/src/main/java/org/jackhuang/hmcl/Launcher.java`
 - Modify: `HMCL/src/main/java/org/jackhuang/hmcl/plugin/GameLaunchHookCoordinator.java`
 
-- [ ] **Step 1: Write the pure shutdown state-machine tests**
+- [x] **Step 1: Write the pure shutdown state-machine tests**
 
 ```java
 @Test
@@ -946,7 +946,7 @@ public void requestedShutdownWaitsForAllLeases() {
 Also test no-lease immediate shutdown, idempotent close/request, lease acquisition before a pending
 request, and concurrent close calls.
 
-- [ ] **Step 2: Run shutdown tests and verify RED**
+- [x] **Step 2: Run shutdown tests and verify RED**
 
 ```powershell
 .\gradlew.bat :HMCL:test --tests "org.jackhuang.hmcl.ApplicationShutdownCoordinatorTest" --no-daemon --stacktrace
@@ -954,7 +954,7 @@ request, and concurrent close calls.
 
 Expected: test compilation fails because the coordinator does not exist.
 
-- [ ] **Step 3: Implement leases and integrate Launcher.stopApplication**
+- [x] **Step 3: Implement leases and integrate Launcher.stopApplication**
 
 The pure coordinator synchronizes `leaseCount`, `shutdownRequested`, and `shutdownStarted`.
 `acquireLease(String owner)` returns an idempotent `AutoCloseable`. `requestShutdown()` hides the UI
@@ -969,7 +969,7 @@ a documented public `acquireShutdownLease(String)` bridge because the coordinato
 Java package; do not add it to the Plugin SDK API snapshots. Existing startup already sets
 `Platform.setImplicitExit(false)` and remains unchanged.
 
-- [ ] **Step 4: Acquire and release leases in direct launch sessions**
+- [x] **Step 4: Acquire and release leases in direct launch sessions**
 
 When a direct launch session has at least one eligible `after-game-launch` subscriber, acquire one
 lease before returning from `beforeLaunch`. Release it after all after subscribers complete or time
@@ -977,7 +977,7 @@ out and the post-exit command returns, and release it on process-creation failur
 no-subscriber sessions never acquire a lease. A timed-out Java callback retains only its
 plugin/class-loader lease, not this application lease.
 
-- [ ] **Step 5: Run shutdown and coordinator tests GREEN**
+- [x] **Step 5: Run shutdown and coordinator tests GREEN**
 
 ```powershell
 .\gradlew.bat :HMCL:test --tests "org.jackhuang.hmcl.ApplicationShutdownCoordinatorTest" --tests "org.jackhuang.hmcl.plugin.GameLaunchHookCoordinatorTest" --tests "org.jackhuang.hmcl.game.GameLaunchHookProcessListenerTest" --no-daemon --stacktrace
@@ -986,7 +986,7 @@ plugin/class-loader lease, not this application lease.
 
 Expected: both commands succeed; close requests are deferred only while an after event is owed.
 
-- [ ] **Step 6: Commit shutdown leases**
+- [x] **Step 6: Commit shutdown leases**
 
 ```powershell
 git add HMCL/src/main/java/org/jackhuang/hmcl/ApplicationShutdownCoordinator.java

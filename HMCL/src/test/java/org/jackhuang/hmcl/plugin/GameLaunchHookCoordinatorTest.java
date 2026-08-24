@@ -44,6 +44,8 @@ import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -116,6 +118,96 @@ public final class GameLaunchHookCoordinatorTest {
                 .beforeLaunch(preparation(LaunchExecutionMode.DIRECT), metadata("direct"));
 
         assertSame(NO_OP_LISTENER, session.processListener(NO_OP_LISTENER));
+    }
+
+    /// Acquires one direct-session shutdown lease and releases it idempotently at exit completion.
+    @Test
+    public void eligibleDirectSessionOwnsShutdownLeaseUntilFinishExit() {
+        List<String> owners = new ArrayList<>();
+        AtomicInteger releases = new AtomicInteger();
+        GameLaunchHookCoordinator coordinator = coordinator(
+                List.of(),
+                List.of(),
+                true,
+                owner -> {
+                    owners.add(owner);
+                    return releases::incrementAndGet;
+                }
+        );
+
+        GameLaunchHookCoordinator.LaunchSession session = coordinator.beforeLaunch(
+                preparation(LaunchExecutionMode.DIRECT), metadata("direct"));
+
+        assertEquals(List.of("after-game-launch:" + session.dispatchId()), owners);
+        assertEquals(0, releases.get());
+        session.finishExit();
+        session.finishExit();
+        assertEquals(1, releases.get());
+    }
+
+    /// Never acquires a shutdown lease for script generation even when an after subscriber is eligible.
+    @Test
+    public void scriptSessionNeverAcquiresShutdownLease() {
+        AtomicInteger acquisitions = new AtomicInteger();
+        GameLaunchHookCoordinator coordinator = coordinator(
+                List.of(),
+                List.of(),
+                true,
+                owner -> {
+                    acquisitions.incrementAndGet();
+                    return () -> {
+                    };
+                }
+        );
+
+        coordinator.beforeLaunch(preparation(LaunchExecutionMode.SCRIPT), metadata("script"));
+
+        assertEquals(0, acquisitions.get());
+    }
+
+    /// Never acquires a shutdown lease for a direct session without an eligible after subscriber.
+    @Test
+    public void directSessionWithoutAfterSubscriberNeverAcquiresShutdownLease() {
+        AtomicInteger acquisitions = new AtomicInteger();
+        GameLaunchHookCoordinator coordinator = coordinator(
+                List.of(),
+                List.of(),
+                false,
+                owner -> {
+                    acquisitions.incrementAndGet();
+                    return () -> {
+                    };
+                }
+        );
+
+        coordinator.beforeLaunch(preparation(LaunchExecutionMode.DIRECT), metadata("direct"));
+
+        assertEquals(0, acquisitions.get());
+    }
+
+    /// Releases the application lease only after the after callback has completed.
+    @Test
+    public void afterDispatchCompletesBeforeShutdownLeaseRelease() {
+        List<String> order = new ArrayList<>();
+        PluginHookSubscriber after = subscriber("dev.test.after-order", Set.of(), event -> {
+            order.add("after");
+            return PluginHookResult.unchanged();
+        });
+        GameLaunchHookCoordinator coordinator = coordinator(
+                List.of(),
+                List.of(after),
+                true,
+                owner -> () -> order.add("release")
+        );
+        GameLaunchHookCoordinator.LaunchSession session = coordinator.beforeLaunch(
+                preparation(LaunchExecutionMode.DIRECT), metadata("direct"));
+
+        session.afterLaunch(new GameLaunchHookProcessListener.ExitObservation(
+                42L, 0, "normal", STARTED_AT.plusSeconds(1), 1000L));
+
+        assertEquals(List.of("after"), order);
+        session.finishExit();
+        assertEquals(List.of("after", "release"), order);
     }
 
     /// Commits complete structured replacements in subscriber order, including every process-plan field.
@@ -367,6 +459,23 @@ public final class GameLaunchHookCoordinatorTest {
             List<PluginHookSubscriber> afterSubscribers,
             boolean afterEligible
     ) {
+        return coordinator(beforeSubscribers, afterSubscribers, afterEligible, owner -> () -> {
+        });
+    }
+
+    /// Creates a coordinator with deterministic subscribers and an injectable shutdown lease factory.
+    ///
+    /// @param beforeSubscribers before subscriber snapshot
+    /// @param afterSubscribers after subscriber snapshot
+    /// @param afterEligible whether an after subscriber is currently eligible
+    /// @param shutdownLeaseFactory factory for direct-session application shutdown leases
+    /// @return deterministic coordinator
+    private GameLaunchHookCoordinator coordinator(
+            List<PluginHookSubscriber> beforeSubscribers,
+            List<PluginHookSubscriber> afterSubscribers,
+            boolean afterEligible,
+            Function<String, AutoCloseable> shutdownLeaseFactory
+    ) {
         ExecutorService executor = Executors.newSingleThreadExecutor();
         executors.add(executor);
         PluginHookDispatcher dispatcher = new PluginHookDispatcher(
@@ -377,7 +486,7 @@ public final class GameLaunchHookCoordinatorTest {
                         ? beforeSubscribers
                         : afterSubscribers
         );
-        return new GameLaunchHookCoordinator(dispatcher, () -> afterEligible);
+        return new GameLaunchHookCoordinator(dispatcher, () -> afterEligible, shutdownLeaseFactory);
     }
 
     /// Creates one leased test subscriber with the launch-Hook permission.
