@@ -17,12 +17,14 @@
  */
 package org.jackhuang.hmcl.plugin;
 
+import org.jackhuang.hmcl.game.GameLaunchHookProcessListener;
 import org.jackhuang.hmcl.launch.LaunchAuxiliaryProcessPlan;
 import org.jackhuang.hmcl.launch.LaunchCommandPlan;
 import org.jackhuang.hmcl.launch.LaunchExecutionMode;
 import org.jackhuang.hmcl.launch.LaunchPlanText;
 import org.jackhuang.hmcl.launch.LaunchPreparation;
 import org.jackhuang.hmcl.launch.LaunchProcessPlan;
+import org.jackhuang.hmcl.launch.ProcessListener;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -57,6 +59,25 @@ public final class GameLaunchHookCoordinatorTest {
     /// Deterministic launch and callback time.
     private static final Instant STARTED_AT = Instant.parse("2026-08-24T02:03:04Z");
 
+    /// No-op delegate used to verify listener identity when no after event is owed.
+    private static final ProcessListener NO_OP_LISTENER = new ProcessListener() {
+        /// Ignores process logs.
+        ///
+        /// @param log log line
+        /// @param isErrorStream whether the line came from stderr
+        @Override
+        public void onLog(String log, boolean isErrorStream) {
+        }
+
+        /// Ignores process exits.
+        ///
+        /// @param exitCode process exit code
+        /// @param exitType classified exit type
+        @Override
+        public void onExit(int exitCode, ExitType exitType) {
+        }
+    };
+
     /// Executors owned by individual test coordinators.
     private final List<ExecutorService> executors = new ArrayList<>();
 
@@ -86,6 +107,15 @@ public final class GameLaunchHookCoordinatorTest {
         assertEquals(STARTED_AT, session.startedAt());
         assertEquals(session.dispatchId(), UUID.fromString(session.dispatchId()).toString());
         assertTrue(session.hasAfterSubscribers());
+    }
+
+    /// Returns the original listener when no after subscriber was eligible for the direct session.
+    @Test
+    public void noAfterSubscriberReturnsOriginalListener() {
+        GameLaunchHookCoordinator.LaunchSession session = coordinator(List.of(), false)
+                .beforeLaunch(preparation(LaunchExecutionMode.DIRECT), metadata("direct"));
+
+        assertSame(NO_OP_LISTENER, session.processListener(NO_OP_LISTENER));
     }
 
     /// Commits complete structured replacements in subscriber order, including every process-plan field.
@@ -278,19 +308,74 @@ public final class GameLaunchHookCoordinatorTest {
         assertNotEquals("must-not-commit", original.secrets().get("access-token"));
     }
 
+    /// Encodes one redacted exit event and continues after an invalid after result.
+    @Test
+    public void afterDispatchEncodesExitAndContinuesAfterInvalidResult() {
+        List<String> invoked = new ArrayList<>();
+        List<PluginHookEvent> observed = new ArrayList<>();
+        PluginHookSubscriber invalid = subscriber("dev.test.after-invalid", Set.of(), event -> {
+            invoked.add("invalid");
+            return PluginHookResult.replace(event.data().with(
+                    "exitCode", PluginDataValue.number(java.math.BigDecimal.valueOf(999))));
+        });
+        PluginHookSubscriber later = subscriber("dev.test.after-later", Set.of(), event -> {
+            invoked.add("later");
+            observed.add(event);
+            return PluginHookResult.unchanged();
+        });
+        GameLaunchHookCoordinator coordinator = coordinator(List.of(), List.of(invalid, later), true);
+        GameLaunchHookCoordinator.LaunchSession session = coordinator.beforeLaunch(
+                preparation(LaunchExecutionMode.DIRECT), metadata("direct"));
+        Instant endedAt = STARTED_AT.plusMillis(2500);
+
+        session.afterLaunch(new GameLaunchHookProcessListener.ExitObservation(
+                4242L, 137, "externally-killed", endedAt, 2500L));
+
+        assertEquals(List.of("invalid", "later"), invoked);
+        assertEquals(1, observed.size());
+        PluginHookEvent event = observed.get(0);
+        assertEquals(session.dispatchId(), event.dispatchId());
+        assertEquals(PluginHookPoint.AFTER_GAME_LAUNCH, event.point());
+        assertEquals(STARTED_AT, event.occurredAt());
+        assertEquals(new java.math.BigDecimal("4242"), event.data().requireNumber("pid"));
+        assertEquals(new java.math.BigDecimal("137"), event.data().requireNumber("exitCode"));
+        assertEquals("externally-killed", event.data().requireString("terminationKind"));
+        assertEquals(STARTED_AT.toString(), event.data().requireString("startedAt"));
+        assertEquals(endedAt.toString(), event.data().requireString("endedAt"));
+        assertEquals(new java.math.BigDecimal("2500"),
+                event.data().requireNumber("elapsedMilliseconds"));
+        assertFalse(event.data().toString().contains("top-secret"));
+    }
+
     /// Creates a coordinator with deterministic scheduling and ordered before subscribers.
     ///
     /// @param subscribers before subscriber snapshot
     /// @param afterEligible whether an after subscriber is currently eligible
     /// @return deterministic coordinator
     private GameLaunchHookCoordinator coordinator(List<PluginHookSubscriber> subscribers, boolean afterEligible) {
+        return coordinator(subscribers, List.of(), afterEligible);
+    }
+
+    /// Creates a coordinator with deterministic before and after subscriber snapshots.
+    ///
+    /// @param beforeSubscribers before subscriber snapshot
+    /// @param afterSubscribers after subscriber snapshot
+    /// @param afterEligible whether an after subscriber is currently eligible
+    /// @return deterministic coordinator
+    private GameLaunchHookCoordinator coordinator(
+            List<PluginHookSubscriber> beforeSubscribers,
+            List<PluginHookSubscriber> afterSubscribers,
+            boolean afterEligible
+    ) {
         ExecutorService executor = Executors.newSingleThreadExecutor();
         executors.add(executor);
         PluginHookDispatcher dispatcher = new PluginHookDispatcher(
                 executor,
                 Duration.ofSeconds(1),
                 Clock.fixed(STARTED_AT, ZoneOffset.UTC),
-                point -> point == PluginHookPoint.BEFORE_GAME_LAUNCH ? subscribers : List.of()
+                point -> point == PluginHookPoint.BEFORE_GAME_LAUNCH
+                        ? beforeSubscribers
+                        : afterSubscribers
         );
         return new GameLaunchHookCoordinator(dispatcher, () -> afterEligible);
     }

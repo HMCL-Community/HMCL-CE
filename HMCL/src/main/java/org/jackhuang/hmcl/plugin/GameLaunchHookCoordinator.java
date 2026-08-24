@@ -17,11 +17,13 @@
  */
 package org.jackhuang.hmcl.plugin;
 
+import org.jackhuang.hmcl.game.GameLaunchHookProcessListener;
 import org.jackhuang.hmcl.launch.LaunchAuxiliaryProcessPlan;
 import org.jackhuang.hmcl.launch.LaunchExecutionMode;
 import org.jackhuang.hmcl.launch.LaunchPlanText;
 import org.jackhuang.hmcl.launch.LaunchPreparation;
 import org.jackhuang.hmcl.launch.LaunchProcessPlan;
+import org.jackhuang.hmcl.launch.ProcessListener;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
@@ -33,6 +35,8 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.BooleanSupplier;
+
+import static org.jackhuang.hmcl.util.logging.Logger.LOG;
 
 /// Coordinates launch-scoped Hook envelopes, transactional plan transformations, and protected secrets.
 @NotNullByDefault
@@ -107,6 +111,7 @@ public final class GameLaunchHookCoordinator {
         boolean hasAfterSubscribers = finalPlan.executionMode() == LaunchExecutionMode.DIRECT
                 && afterSubscriberEligibility.getAsBoolean();
         return new LaunchSession(
+                this,
                 finalPreparation,
                 dispatchId,
                 startedAt,
@@ -114,6 +119,31 @@ public final class GameLaunchHookCoordinator {
                 finalPreparation.plan(),
                 secrets,
                 hasAfterSubscribers
+        );
+    }
+
+    /// Dispatches one best-effort after-game-launch notification for an owned process.
+    ///
+    /// @param session completed launch session
+    /// @param observation immutable process exit observation
+    private void afterLaunch(
+            LaunchSession session,
+            GameLaunchHookProcessListener.ExitObservation observation
+    ) {
+        PluginDataObject data = GameLaunchHookCodec.encodeAfter(
+                session.finalPlan,
+                session.metadata,
+                observation.pid(),
+                observation.exitCode(),
+                observation.terminationKind(),
+                session.startedAt,
+                observation.endedAt(),
+                observation.elapsedMilliseconds()
+        );
+        dispatcher.dispatchAfter(
+                PluginHookPoint.AFTER_GAME_LAUNCH,
+                data,
+                new AfterPolicy(session, data)
         );
     }
 
@@ -268,9 +298,100 @@ public final class GameLaunchHookCoordinator {
         }
     }
 
+    /// Implements the immutable notification-only after-game-launch policy.
+    @NotNullByDefault
+    private final class AfterPolicy implements PluginHookDispatcher.Policy {
+        /// Completed launch session whose secrets remain protected and permission-scoped.
+        private final LaunchSession session;
+
+        /// Immutable expected exit data that replacement results may not alter.
+        private final PluginDataObject expectedData;
+
+        /// Creates one after policy for a completed owned process.
+        ///
+        /// @param session completed launch session
+        /// @param expectedData immutable encoded exit data
+        private AfterPolicy(LaunchSession session, PluginDataObject expectedData) {
+            this.session = session;
+            this.expectedData = expectedData;
+        }
+
+        /// Creates one permission-scoped after event.
+        ///
+        /// @param subscriber current subscriber
+        /// @param currentData immutable exit data
+        /// @return immutable after event
+        @Override
+        public PluginHookEvent eventFor(
+                PluginHookSubscriber subscriber,
+                PluginDataObject currentData
+        ) {
+            boolean accountGranted = subscriber.permissions().contains(PluginPermission.ACCOUNT);
+            return new PluginHookEvent(
+                    PluginHookEvent.CURRENT_CONTRACT_VERSION,
+                    session.dispatchId,
+                    PluginHookPoint.AFTER_GAME_LAUNCH,
+                    dispatcher.clock().instant(),
+                    currentData,
+                    session.secrets.accessor(accountGranted)
+            );
+        }
+
+        /// Accepts unchanged or byte-for-byte equivalent notification data and rejects all state edits.
+        ///
+        /// @param subscriber current subscriber
+        /// @param currentData immutable exit data
+        /// @param result non-cancel endpoint result
+        /// @return validated notification candidate with a no-op commit
+        @Override
+        public PluginHookDispatcher.Candidate validate(
+                PluginHookSubscriber subscriber,
+                PluginDataObject currentData,
+                PluginHookResult result
+        ) throws PluginHookDispatchException {
+            if (result.action() == PluginHookResult.Action.UNCHANGED) {
+                return new PluginHookDispatcher.Candidate(currentData, () -> {
+                });
+            }
+            if (!result.protectedSecrets().isEmpty()
+                    || !expectedData.equals(Objects.requireNonNull(result.data(), "Replacement data"))) {
+                throw new PluginHookDispatchException(
+                        PluginHookPoint.AFTER_GAME_LAUNCH,
+                        subscriber.pluginId(),
+                        PluginHookDispatchException.Category.INVALID_RESULT
+                );
+            }
+            return new PluginHookDispatcher.Candidate(expectedData, () -> {
+            });
+        }
+
+        /// Rejects cancellation because an after Hook is notification-only.
+        ///
+        /// @return always `false`
+        @Override
+        public boolean cancellationAllowed() {
+            return false;
+        }
+
+        /// Logs one redacted after failure while dispatch continues to later subscribers.
+        ///
+        /// @param subscriber failed subscriber
+        /// @param failure categorized redacted failure
+        @Override
+        public void reportAfterFailure(
+                PluginHookSubscriber subscriber,
+                PluginHookDispatchException failure
+        ) {
+            LOG.warning(failure.getMessage());
+        }
+    }
+
     /// Holds immutable launch-scoped state passed from before coordination into process execution and exit handling.
     @NotNullByDefault
     public static final class LaunchSession {
+        /// Owning coordinator used for listener creation and after dispatch.
+        private final GameLaunchHookCoordinator coordinator;
+
         /// Transformed executable or renderable launch preparation.
         private final LaunchPreparation preparation;
 
@@ -302,6 +423,7 @@ public final class GameLaunchHookCoordinator {
         /// @param secrets protected secret store
         /// @param hasAfterSubscribers after subscriber eligibility snapshot
         private LaunchSession(
+                GameLaunchHookCoordinator coordinator,
                 LaunchPreparation preparation,
                 String dispatchId,
                 Instant startedAt,
@@ -310,6 +432,7 @@ public final class GameLaunchHookCoordinator {
                 GameLaunchSecretStore secrets,
                 boolean hasAfterSubscribers
         ) {
+            this.coordinator = coordinator;
             this.preparation = preparation;
             this.dispatchId = dispatchId;
             this.startedAt = startedAt;
@@ -359,6 +482,37 @@ public final class GameLaunchHookCoordinator {
         /// @return after subscriber eligibility snapshot
         public boolean hasAfterSubscribers() {
             return hasAfterSubscribers;
+        }
+
+        /// Returns the original listener when no after event is owed, or a composing exactly-once listener.
+        ///
+        /// @param delegate existing process listener, or `null`
+        /// @return original, composed, or `null` listener
+        public @Nullable ProcessListener processListener(@Nullable ProcessListener delegate) {
+            if (!hasAfterSubscribers) {
+                return delegate;
+            }
+            return new GameLaunchHookProcessListener(
+                    delegate,
+                    startedAt,
+                    coordinator.dispatcher.clock(),
+                    this::afterLaunch
+            );
+        }
+
+        /// Dispatches one exit observation through the owning coordinator.
+        ///
+        /// @param observation immutable process exit observation
+        void afterLaunch(GameLaunchHookProcessListener.ExitObservation observation) {
+            if (hasAfterSubscribers) {
+                coordinator.afterLaunch(this, observation);
+            }
+        }
+
+        /// Finishes exit-scoped resources after listener and post-exit processing.
+        ///
+        /// Task 9 attaches the application shutdown lease to this lifecycle boundary.
+        public void finishExit() {
         }
 
         /// Returns the protected store for package-internal after coordination.

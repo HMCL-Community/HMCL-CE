@@ -227,7 +227,16 @@ public final class HMCLGameLauncher extends DefaultLauncher {
     public ManagedProcess launch() throws IOException, InterruptedException {
         generateOptionsTxt();
         GameLaunchHookCoordinator.LaunchSession session = coordinateLaunch(LaunchExecutionMode.DIRECT);
-        return executeLaunch(session.preparation(), listener);
+        try {
+            return executeLaunch(
+                    session.preparation(),
+                    session.processListener(listener),
+                    session::finishExit
+            );
+        } catch (IOException | InterruptedException | RuntimeException | Error failure) {
+            session.finishExit();
+            throw failure;
+        }
     }
 
     /// Coordinates before Hooks and renders the resulting script process plan.
