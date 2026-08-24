@@ -27,15 +27,13 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 /// Composes one existing process listener with exactly-once after-game-launch exit observation.
 @NotNullByDefault
 public final class GameLaunchHookProcessListener implements ProcessListener {
     /// Existing application listener, or `null` when only Hook observation is required.
     private final @Nullable ProcessListener delegate;
-
-    /// Launch session start instant.
-    private final Instant startedAt;
 
     /// Coordinator clock used to capture process end time.
     private final Clock clock;
@@ -46,35 +44,37 @@ public final class GameLaunchHookProcessListener implements ProcessListener {
     /// Ensures delegate and Hook exit callbacks run at most once.
     private final AtomicBoolean exited = new AtomicBoolean();
 
-    /// Managed process supplied after successful process creation.
-    private volatile @Nullable ManagedProcess process;
+    /// First successfully created process and its atomically published start time.
+    private final AtomicReference<@Nullable ProcessStart> processStart = new AtomicReference<>();
 
     /// Creates one listener composition without creating a second process waiter.
     ///
     /// @param delegate existing process listener, or `null`
-    /// @param startedAt launch session start instant
-    /// @param clock clock used for process end time
+    /// @param clock clock used for process start and end time
     /// @param observer exactly-once exit observer
     public GameLaunchHookProcessListener(
             @Nullable ProcessListener delegate,
-            Instant startedAt,
             Clock clock,
             ExitObserver observer
     ) {
         this.delegate = delegate;
-        this.startedAt = Objects.requireNonNull(startedAt, "startedAt");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.observer = Objects.requireNonNull(observer, "observer");
     }
 
-    /// Stores the created process before forwarding it to the existing delegate.
+    /// Records the first created process and its start time before forwarding to the existing delegate.
+    ///
+    /// Repeated calls remain delegated but cannot replace the process identity or start time used by after Hooks.
     ///
     /// @param process managed process
     @Override
     public void setProcess(ManagedProcess process) {
-        this.process = Objects.requireNonNull(process, "process");
+        ManagedProcess createdProcess = Objects.requireNonNull(process, "process");
+        if (processStart.get() == null) {
+            processStart.compareAndSet(null, new ProcessStart(createdProcess, clock.instant()));
+        }
         if (delegate != null) {
-            delegate.setProcess(process);
+            delegate.setProcess(createdProcess);
         }
     }
 
@@ -100,16 +100,21 @@ public final class GameLaunchHookProcessListener implements ProcessListener {
             return;
         }
 
-        @Nullable ManagedProcess exitedProcess = process;
-        Instant endedAt = clock.instant();
-        long elapsedMilliseconds = Math.max(0L, Duration.between(startedAt, endedAt).toMillis());
-        @Nullable ExitObservation observation = exitedProcess == null ? null : new ExitObservation(
-                exitedProcess.getProcess().pid(),
-                exitCode,
-                terminationKind(exitCode, exitType),
-                endedAt,
-                elapsedMilliseconds
-        );
+        @Nullable ProcessStart start = processStart.get();
+        @Nullable ExitObservation observation = null;
+        if (start != null) {
+            Instant endedAt = clock.instant();
+            long elapsedMilliseconds = Math.max(
+                    0L, Duration.between(start.startedAt(), endedAt).toMillis());
+            observation = new ExitObservation(
+                    start.process().getProcess().pid(),
+                    exitCode,
+                    terminationKind(exitCode, exitType),
+                    start.startedAt(),
+                    endedAt,
+                    elapsedMilliseconds
+            );
+        }
         try {
             if (delegate != null) {
                 delegate.onExit(exitCode, exitType);
@@ -135,6 +140,19 @@ public final class GameLaunchHookProcessListener implements ProcessListener {
         };
     }
 
+    /// Atomically pairs the first created process with its start instant.
+    ///
+    /// @param process first managed process supplied to the listener
+    /// @param startedAt instant of the first `setProcess` call
+    @NotNullByDefault
+    private record ProcessStart(ManagedProcess process, Instant startedAt) {
+        /// Rejects incomplete process start state.
+        private ProcessStart {
+            Objects.requireNonNull(process, "process");
+            Objects.requireNonNull(startedAt, "startedAt");
+        }
+    }
+
     /// Receives one immutable exit observation after existing listener handling.
     @FunctionalInterface
     @NotNullByDefault
@@ -150,6 +168,7 @@ public final class GameLaunchHookProcessListener implements ProcessListener {
     /// @param pid owned process ID
     /// @param exitCode process exit code
     /// @param terminationKind stable termination identifier
+    /// @param startedAt process start instant captured at successful creation
     /// @param endedAt process end instant
     /// @param elapsedMilliseconds nonnegative elapsed process lifetime
     @NotNullByDefault
@@ -157,6 +176,7 @@ public final class GameLaunchHookProcessListener implements ProcessListener {
             long pid,
             int exitCode,
             String terminationKind,
+            Instant startedAt,
             Instant endedAt,
             long elapsedMilliseconds
     ) {
@@ -166,6 +186,7 @@ public final class GameLaunchHookProcessListener implements ProcessListener {
                 throw new IllegalArgumentException("Process ID must not be negative");
             }
             Objects.requireNonNull(terminationKind, "terminationKind");
+            Objects.requireNonNull(startedAt, "startedAt");
             Objects.requireNonNull(endedAt, "endedAt");
             if (elapsedMilliseconds < 0L) {
                 throw new IllegalArgumentException("Elapsed process lifetime must not be negative");

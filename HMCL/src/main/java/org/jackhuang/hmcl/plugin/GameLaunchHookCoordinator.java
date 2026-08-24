@@ -29,7 +29,6 @@ import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
 
-import java.time.Instant;
 import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Objects;
@@ -103,7 +102,6 @@ public final class GameLaunchHookCoordinator {
         Objects.requireNonNull(preparation, "preparation");
         PluginDataObject immutableMetadata = copyObject(metadata);
         String dispatchId = UUID.randomUUID().toString();
-        Instant startedAt = dispatcher.clock().instant();
         GameLaunchSecretStore secrets = new GameLaunchSecretStore(preparation.secrets());
         PluginDataObject initialData = GameLaunchHookCodec.encodeBefore(preparation.plan(), immutableMetadata);
         BeforePolicy policy = new BeforePolicy(dispatchId, immutableMetadata, secrets);
@@ -129,7 +127,6 @@ public final class GameLaunchHookCoordinator {
                 this,
                 finalPreparation,
                 dispatchId,
-                startedAt,
                 immutableMetadata,
                 finalPreparation.plan(),
                 secrets,
@@ -152,7 +149,7 @@ public final class GameLaunchHookCoordinator {
                 observation.pid(),
                 observation.exitCode(),
                 observation.terminationKind(),
-                session.startedAt,
+                observation.startedAt(),
                 observation.endedAt(),
                 observation.elapsedMilliseconds()
         );
@@ -433,9 +430,6 @@ public final class GameLaunchHookCoordinator {
         /// Opaque dispatch ID shared by before and after events.
         private final String dispatchId;
 
-        /// Launch session start instant.
-        private final Instant startedAt;
-
         /// Immutable launch metadata.
         private final PluginDataObject metadata;
 
@@ -459,7 +453,6 @@ public final class GameLaunchHookCoordinator {
         /// @param coordinator owning Hook coordinator
         /// @param preparation transformed launch preparation
         /// @param dispatchId opaque dispatch ID
-        /// @param startedAt session start instant
         /// @param metadata immutable launch metadata
         /// @param finalPlan redacted final plan
         /// @param secrets protected secret store
@@ -469,7 +462,6 @@ public final class GameLaunchHookCoordinator {
                 GameLaunchHookCoordinator coordinator,
                 LaunchPreparation preparation,
                 String dispatchId,
-                Instant startedAt,
                 PluginDataObject metadata,
                 LaunchProcessPlan finalPlan,
                 GameLaunchSecretStore secrets,
@@ -479,7 +471,6 @@ public final class GameLaunchHookCoordinator {
             this.coordinator = coordinator;
             this.preparation = preparation;
             this.dispatchId = dispatchId;
-            this.startedAt = startedAt;
             this.metadata = metadata;
             this.finalPlan = finalPlan;
             this.secrets = secrets;
@@ -499,13 +490,6 @@ public final class GameLaunchHookCoordinator {
         /// @return dispatch ID
         public String dispatchId() {
             return dispatchId;
-        }
-
-        /// Returns the launch session start instant.
-        ///
-        /// @return session start instant
-        public Instant startedAt() {
-            return startedAt;
         }
 
         /// Returns an immutable metadata copy.
@@ -539,7 +523,6 @@ public final class GameLaunchHookCoordinator {
             }
             return new GameLaunchHookProcessListener(
                     delegate,
-                    startedAt,
                     coordinator.dispatcher.clock(),
                     this::afterLaunch
             );

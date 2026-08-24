@@ -48,14 +48,18 @@ public final class GameLaunchHookProcessListenerTest {
     /// Forwards process, log, and one exit callback while emitting one after-Hook observation.
     @Test
     public void exitDispatchesAfterOnceAndPreservesDelegate() {
-        MutableClock clock = new MutableClock(STARTED_AT.plusMillis(2500));
+        MutableClock clock = new MutableClock(STARTED_AT);
         ListenerProbe delegate = new ListenerProbe();
         List<GameLaunchHookProcessListener.ExitObservation> observations = new ArrayList<>();
         GameLaunchHookProcessListener listener = new GameLaunchHookProcessListener(
-                delegate, STARTED_AT, clock, observations::add);
+                delegate, clock, observations::add);
         ManagedProcess process = managedProcess(4242L);
 
+        clock.setInstant(STARTED_AT.plusSeconds(1));
         listener.setProcess(process);
+        clock.setInstant(STARTED_AT.plusMillis(1500));
+        listener.setProcess(process);
+        clock.setInstant(STARTED_AT.plusMillis(2500));
         listener.onLog("game log", true);
         listener.onExit(137, ProcessListener.ExitType.SIGKILL);
         listener.onExit(137, ProcessListener.ExitType.SIGKILL);
@@ -71,7 +75,7 @@ public final class GameLaunchHookProcessListenerTest {
         assertEquals(137, observation.exitCode());
         assertEquals("externally-killed", observation.terminationKind());
         assertEquals(STARTED_AT.plusMillis(2500), observation.endedAt());
-        assertEquals(2500L, observation.elapsedMilliseconds());
+        assertEquals(1500L, observation.elapsedMilliseconds());
     }
 
     /// Maps every existing exit type and normal nonzero exit to stable Hook termination identifiers.
@@ -110,7 +114,6 @@ public final class GameLaunchHookProcessListenerTest {
         };
         GameLaunchHookProcessListener listener = new GameLaunchHookProcessListener(
                 delegate,
-                STARTED_AT,
                 Clock.fixed(STARTED_AT.plusSeconds(1), ZoneOffset.UTC),
                 observation -> observations.incrementAndGet()
         );
@@ -128,10 +131,10 @@ public final class GameLaunchHookProcessListenerTest {
     public void exitWithoutCreatedProcessNotifiesOnlyDelegate() {
         ListenerProbe delegate = new ListenerProbe();
         AtomicInteger observations = new AtomicInteger();
+        MutableClock clock = new MutableClock(STARTED_AT.plusSeconds(1));
         GameLaunchHookProcessListener listener = new GameLaunchHookProcessListener(
                 delegate,
-                STARTED_AT,
-                Clock.fixed(STARTED_AT.plusSeconds(1), ZoneOffset.UTC),
+                clock,
                 observation -> observations.incrementAndGet()
         );
 
@@ -139,6 +142,7 @@ public final class GameLaunchHookProcessListenerTest {
 
         assertEquals(1, delegate.exitCalls.get());
         assertEquals(0, observations.get());
+        assertEquals(0, clock.instantCalls());
     }
 
     /// Supports an absent delegate while retaining after observation and nonnegative elapsed time.
@@ -147,7 +151,6 @@ public final class GameLaunchHookProcessListenerTest {
         List<GameLaunchHookProcessListener.ExitObservation> observations = new ArrayList<>();
         GameLaunchHookProcessListener listener = new GameLaunchHookProcessListener(
                 null,
-                STARTED_AT,
                 Clock.fixed(STARTED_AT.minusSeconds(1), ZoneOffset.UTC),
                 observations::add
         );
@@ -173,7 +176,6 @@ public final class GameLaunchHookProcessListenerTest {
         List<GameLaunchHookProcessListener.ExitObservation> observations = new ArrayList<>();
         GameLaunchHookProcessListener listener = new GameLaunchHookProcessListener(
                 null,
-                STARTED_AT,
                 Clock.fixed(STARTED_AT.plusMillis(10), ZoneOffset.UTC),
                 observations::add
         );
@@ -246,11 +248,28 @@ public final class GameLaunchHookProcessListenerTest {
         /// Current clock instant.
         private Instant instant;
 
+        /// Number of instant reads.
+        private int instantCalls;
+
         /// Creates a UTC clock at one instant.
         ///
         /// @param instant initial instant
         private MutableClock(Instant instant) {
             this.instant = instant;
+        }
+
+        /// Moves the deterministic clock to a new instant.
+        ///
+        /// @param instant new current instant
+        private void setInstant(Instant instant) {
+            this.instant = instant;
+        }
+
+        /// Returns the number of instant reads.
+        ///
+        /// @return instant read count
+        private int instantCalls() {
+            return instantCalls;
         }
 
         /// Returns UTC as the fixed zone.
@@ -278,6 +297,7 @@ public final class GameLaunchHookProcessListenerTest {
         /// @return current instant
         @Override
         public Instant instant() {
+            instantCalls++;
             return instant;
         }
     }

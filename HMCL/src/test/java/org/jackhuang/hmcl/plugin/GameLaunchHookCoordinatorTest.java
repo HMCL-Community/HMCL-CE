@@ -27,16 +27,22 @@ import org.jackhuang.hmcl.launch.LaunchPreparation;
 import org.jackhuang.hmcl.launch.LaunchProcessPlan;
 import org.jackhuang.hmcl.launch.ProcessListener;
 import org.jackhuang.hmcl.util.StringUtils;
+import org.jackhuang.hmcl.util.platform.ManagedProcess;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -111,7 +117,6 @@ public final class GameLaunchHookCoordinatorTest {
         assertSame(original.plan(), session.finalPlan());
         assertEquals(metadata, session.metadata());
         assertNotSame(metadata, session.metadata());
-        assertEquals(STARTED_AT, session.startedAt());
         assertEquals(session.dispatchId(), UUID.fromString(session.dispatchId()).toString());
         assertTrue(session.hasAfterSubscribers());
     }
@@ -149,10 +154,18 @@ public final class GameLaunchHookCoordinatorTest {
     public void productionCompositionCloseWithAfterSubscriberDefersUntilNoProcessClose() {
         AtomicInteger shutdowns = new AtomicInteger();
         AtomicInteger hides = new AtomicInteger();
+        AtomicInteger afterCalls = new AtomicInteger();
         ApplicationShutdownCoordinator shutdownCoordinator =
                 new ApplicationShutdownCoordinator(shutdowns::incrementAndGet, hides::incrementAndGet);
         GameLaunchHookCoordinator hookCoordinator = coordinator(
-                List.of(), List.of(), true, shutdownCoordinator::acquireLease);
+                List.of(),
+                List.of(subscriber("dev.test.after-close", Set.of(), event -> {
+                    afterCalls.incrementAndGet();
+                    return PluginHookResult.unchanged();
+                })),
+                true,
+                shutdownCoordinator::acquireLease
+        );
 
         GameLaunchHookCoordinator.LaunchSession session = hookCoordinator.beforeLaunch(
                 preparation(LaunchExecutionMode.DIRECT), metadata("direct"));
@@ -163,6 +176,7 @@ public final class GameLaunchHookCoordinatorTest {
         assertEquals(1, hides.get());
         session.closeWithoutProcess();
         assertEquals(1, shutdowns.get());
+        assertEquals(0, afterCalls.get());
     }
 
     /// Keeps script generation free of process listeners and shutdown leases.
@@ -268,7 +282,7 @@ public final class GameLaunchHookCoordinatorTest {
                 preparation(LaunchExecutionMode.DIRECT), metadata("direct"));
 
         session.afterLaunch(new GameLaunchHookProcessListener.ExitObservation(
-                42L, 0, "normal", STARTED_AT.plusSeconds(1), 1000L));
+                42L, 0, "normal", STARTED_AT, STARTED_AT.plusSeconds(1), 1000L));
 
         assertEquals(List.of("after"), order);
         session.finishExit();
@@ -607,7 +621,7 @@ public final class GameLaunchHookCoordinatorTest {
         Instant endedAt = STARTED_AT.plusMillis(2500);
 
         session.afterLaunch(new GameLaunchHookProcessListener.ExitObservation(
-                4242L, 137, "externally-killed", endedAt, 2500L));
+                4242L, 137, "externally-killed", STARTED_AT, endedAt, 2500L));
 
         assertEquals(List.of("invalid", "later"), invoked);
         assertEquals(1, observed.size());
@@ -623,6 +637,41 @@ public final class GameLaunchHookCoordinatorTest {
         assertEquals(new java.math.BigDecimal("2500"),
                 event.data().requireNumber("elapsedMilliseconds"));
         assertFalse(event.data().toString().contains("top-secret"));
+    }
+
+    /// Starts after timing at successful process creation instead of before-Hook session creation.
+    @Test
+    public void afterDispatchUsesProcessStartTimeAndElapsedLifetime() {
+        Instant processStartedAt = STARTED_AT.plusSeconds(5);
+        Instant endedAt = processStartedAt.plusMillis(2500);
+        MutableClock clock = new MutableClock(STARTED_AT);
+        List<PluginHookEvent> observed = new ArrayList<>();
+        PluginHookSubscriber after = subscriber("dev.test.after-timing", Set.of(), event -> {
+            observed.add(event);
+            return PluginHookResult.unchanged();
+        });
+        GameLaunchHookCoordinator coordinator = coordinator(
+                List.of(),
+                List.of(after),
+                true,
+                owner -> () -> {
+                },
+                clock
+        );
+
+        GameLaunchHookCoordinator.LaunchSession session = coordinator.beforeLaunch(
+                preparation(LaunchExecutionMode.DIRECT), metadata("direct"));
+        ProcessListener listener = Objects.requireNonNull(session.processListener(null), "processListener");
+        clock.setInstant(processStartedAt);
+        listener.setProcess(managedProcess(4242L));
+        clock.setInstant(endedAt);
+        listener.onExit(0, ProcessListener.ExitType.NORMAL);
+
+        assertEquals(1, observed.size());
+        PluginDataObject data = observed.get(0).data();
+        assertEquals(processStartedAt.toString(), data.requireString("startedAt"));
+        assertEquals(endedAt.toString(), data.requireString("endedAt"));
+        assertEquals(new java.math.BigDecimal("2500"), data.requireNumber("elapsedMilliseconds"));
     }
 
     /// Creates a coordinator with deterministic scheduling and ordered before subscribers.
@@ -662,17 +711,49 @@ public final class GameLaunchHookCoordinatorTest {
             boolean afterEligible,
             Function<String, AutoCloseable> shutdownLeaseFactory
     ) {
+        return coordinator(
+                beforeSubscribers,
+                afterSubscribers,
+                afterEligible,
+                shutdownLeaseFactory,
+                Clock.fixed(STARTED_AT, ZoneOffset.UTC)
+        );
+    }
+
+    /// Creates a coordinator with deterministic subscribers, shutdown leases, and an injectable clock.
+    ///
+    /// @param beforeSubscribers before subscriber snapshot
+    /// @param afterSubscribers after subscriber snapshot
+    /// @param afterEligible whether an after subscriber is currently eligible
+    /// @param shutdownLeaseFactory factory for direct-session application shutdown leases
+    /// @param clock event and process timing clock
+    /// @return deterministic coordinator
+    private GameLaunchHookCoordinator coordinator(
+            List<PluginHookSubscriber> beforeSubscribers,
+            List<PluginHookSubscriber> afterSubscribers,
+            boolean afterEligible,
+            Function<String, AutoCloseable> shutdownLeaseFactory,
+            Clock clock
+    ) {
         ExecutorService executor = Executors.newSingleThreadExecutor();
         executors.add(executor);
         PluginHookDispatcher dispatcher = new PluginHookDispatcher(
                 executor,
                 Duration.ofSeconds(1),
-                Clock.fixed(STARTED_AT, ZoneOffset.UTC),
+                clock,
                 point -> point == PluginHookPoint.BEFORE_GAME_LAUNCH
                         ? beforeSubscribers
                         : afterSubscribers
         );
         return new GameLaunchHookCoordinator(dispatcher, () -> afterEligible, shutdownLeaseFactory);
+    }
+
+    /// Wraps one deterministic fake process.
+    ///
+    /// @param pid fake process ID
+    /// @return managed fake process
+    private static ManagedProcess managedProcess(long pid) {
+        return new ManagedProcess(new FakeProcess(pid), List.of("java"));
     }
 
     /// Creates one leased test subscriber with the launch-Hook permission.
@@ -807,5 +888,121 @@ public final class GameLaunchHookCoordinatorTest {
                 new LaunchPlanText.LiteralSegment(prefix),
                 new LaunchPlanText.SecretSegment(secretSlot)
         ));
+    }
+
+    /// Supplies deterministic mutable instants to coordinator and listener code.
+    @NotNullByDefault
+    private static final class MutableClock extends Clock {
+        /// Current clock instant.
+        private Instant instant;
+
+        /// Creates a UTC clock at one instant.
+        ///
+        /// @param instant initial instant
+        private MutableClock(Instant instant) {
+            this.instant = instant;
+        }
+
+        /// Moves the deterministic clock to a new instant.
+        ///
+        /// @param instant new current instant
+        private void setInstant(Instant instant) {
+            this.instant = instant;
+        }
+
+        /// Returns UTC as the fixed zone.
+        ///
+        /// @return UTC zone
+        @Override
+        public ZoneId getZone() {
+            return ZoneOffset.UTC;
+        }
+
+        /// Returns this clock for UTC and rejects other zones.
+        ///
+        /// @param zone requested zone
+        /// @return this clock
+        @Override
+        public Clock withZone(ZoneId zone) {
+            if (!ZoneOffset.UTC.equals(zone)) {
+                throw new IllegalArgumentException("Only UTC is supported");
+            }
+            return this;
+        }
+
+        /// Returns the current deterministic instant.
+        ///
+        /// @return current instant
+        @Override
+        public Instant instant() {
+            return instant;
+        }
+    }
+
+    /// Implements the minimum deterministic process surface required by `ManagedProcess`.
+    @NotNullByDefault
+    private static final class FakeProcess extends Process {
+        /// Stable fake process ID.
+        private final long pid;
+
+        /// Creates one exited fake process.
+        ///
+        /// @param pid fake process ID
+        private FakeProcess(long pid) {
+            this.pid = pid;
+        }
+
+        /// Returns a writable in-memory stdin stream.
+        ///
+        /// @return fake stdin
+        @Override
+        public OutputStream getOutputStream() {
+            return new ByteArrayOutputStream();
+        }
+
+        /// Returns an empty stdout stream.
+        ///
+        /// @return fake stdout
+        @Override
+        public InputStream getInputStream() {
+            return new ByteArrayInputStream(new byte[0]);
+        }
+
+        /// Returns an empty stderr stream.
+        ///
+        /// @return fake stderr
+        @Override
+        public InputStream getErrorStream() {
+            return new ByteArrayInputStream(new byte[0]);
+        }
+
+        /// Returns a successful exit code immediately.
+        ///
+        /// @return zero
+        @Override
+        public int waitFor() {
+            return 0;
+        }
+
+        /// Returns a successful exit code.
+        ///
+        /// @return zero
+        @Override
+        public int exitValue() {
+            return 0;
+        }
+
+        /// Performs no work because the fake process is already exited.
+        @Override
+        public void destroy() {
+        }
+
+        /// Returns the stable fake process ID.
+        ///
+        /// @return fake process ID
+        @Override
+        public long pid() {
+            return pid;
+        }
     }
 }
