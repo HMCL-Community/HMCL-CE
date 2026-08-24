@@ -14,13 +14,9 @@
 
 - Development is paused before Task 9 while the `main` and `next` relationship is normalized.
 - Tasks 1-7 are complete on `next`; Task 7 is commit `60c3388` (`Execute before game launch hooks`).
-- Task 8 implementation and focused verification are complete but not yet committed. Its five changed
-  files are `HMCLGameLauncher.java`, `GameLaunchHookCoordinator.java`,
-  `GameLaunchHookProcessListener.java`, `GameLaunchHookCoordinatorTest.java`, and
-  `GameLaunchHookProcessListenerTest.java`.
-- Task 8 passed its listener/coordinator tests, `:HMCLCore:test`, HMCL main/test Checkstyle, and
-  `git diff --check`. Re-run these checks immediately before committing because this snapshot records
-  earlier evidence rather than replacing fresh verification.
+- Task 8 is complete in commit `80abe23` (`Dispatch after game launch hooks`). Its listener/coordinator
+  tests, `:HMCLCore:test`, HMCL main/test Checkstyle, and `git diff --check` were re-run immediately
+  before the commit and passed.
 - HMCL refs at the pause: `main`/`origin/main` = `aa11f6c`, `next` = `60c3388`,
   `origin/next` = `d597972`, merge base = `dbde134`; `main...next` contains 1 main-only and
   29 next-only commits. `next` must absorb committed `main`; `next` must not be merged into stable
@@ -29,8 +25,7 @@
   exactly and merge only the committed `main` ref from the `next` checkout.
 - SDK refs are already normalized and clean: default branch `schema-v4` = `3a86706`, future branch
   `schema-v5` = `e11dac2`; both match their remote tracking branches. No SDK ref operation is pending.
-- Do not start Task 9 until Task 8 is committed, `next` has absorbed `main`, and the post-merge checks
-  pass.
+- Do not start Task 9 until `next` has absorbed `main` and the post-merge checks pass.
 
 ---
 
@@ -902,7 +897,7 @@ and resolved post-exit command have both completed.
 
 Expected: all commands succeed and no second process waiter is created.
 
-- [ ] **Step 5: Commit after-game-launch execution**
+- [x] **Step 5: Commit after-game-launch execution**
 
 ```powershell
 git add HMCL/src/main/java/org/jackhuang/hmcl/game/GameLaunchHookProcessListener.java
