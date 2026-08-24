@@ -23,8 +23,12 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.google.gson.annotations.SerializedName;
 import org.jackhuang.hmcl.plugin.runtime.PluginAbi;
+import org.jackhuang.hmcl.plugin.runtime.PluginExecutionMode;
 import org.jackhuang.hmcl.plugin.runtime.PluginPlatformTarget;
 import org.jackhuang.hmcl.plugin.runtime.PluginRuntimeTypes;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeFeature;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderDeclaration;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeRequirement;
 import org.jackhuang.hmcl.util.gson.JsonUtils;
 import org.jackhuang.hmcl.util.gson.LowerCaseEnumTypeAdapter;
 import org.jetbrains.annotations.NotNullByDefault;
@@ -163,6 +167,34 @@ public final class PluginManifest {
     /// Whether the source JSON explicitly contained the schema-v5 `patches` property.
     private transient boolean patchesDeclared;
 
+    /// Schema-v5 package role; absent declarations describe ordinary plugins.
+    @SerializedName("pluginKind")
+    private @Nullable PluginKind pluginKind;
+
+    /// Whether the source JSON explicitly contained the schema-v5 `pluginKind` property.
+    private transient boolean pluginKindDeclared;
+
+    /// Schema-v5 execution boundary; absent declarations use the embedded launcher bridge.
+    @SerializedName("executionMode")
+    private @Nullable PluginExecutionMode executionMode;
+
+    /// Whether the source JSON explicitly contained the schema-v5 `executionMode` property.
+    private transient boolean executionModeDeclared;
+
+    /// Optional schema-v5 provider plugin ID pin used by ordinary runtime consumers.
+    @SerializedName("runtimeProvider")
+    private @Nullable String runtimeProvider;
+
+    /// Whether the source JSON explicitly contained the schema-v5 `runtimeProvider` property.
+    private transient boolean runtimeProviderDeclared;
+
+    /// Schema-v5 runtime implementations supplied by a runtime-provider plugin.
+    @SerializedName("providesRuntimes")
+    private @Nullable List<@Nullable RuntimeProviderDeclaration> providesRuntimes = List.of();
+
+    /// Whether the source JSON explicitly contained the schema-v5 `providesRuntimes` property.
+    private transient boolean providesRuntimesDeclared;
+
     /// Mixin configuration resources contributed by Java or Kotlin plugins.
     @SerializedName("mixins")
     private @Nullable List<@Nullable String> mixins = List.of();
@@ -193,6 +225,8 @@ public final class PluginManifest {
         this.runtimeDeclared = true;
         this.abi = PluginAbi.ABI_2;
         this.abiDeclared = true;
+        this.pluginKind = PluginKind.NORMAL;
+        this.executionMode = PluginExecutionMode.EMBEDDED;
     }
 
     /// Returns the manifest schema version.
@@ -425,6 +459,10 @@ public final class PluginManifest {
                 && getPlatforms().equals(manifest.getPlatforms())
                 && getHooks().equals(manifest.getHooks())
                 && getPatches().equals(manifest.getPatches())
+                && getPluginKind() == manifest.getPluginKind()
+                && getExecutionMode() == manifest.getExecutionMode()
+                && Objects.equals(getRuntimeProvider(), manifest.getRuntimeProvider())
+                && getProvidesRuntimes().equals(manifest.getProvidesRuntimes())
                 && getMixins().equals(manifest.getMixins());
     }
 
@@ -452,6 +490,10 @@ public final class PluginManifest {
                 getPlatforms(),
                 getHooks(),
                 getPatches(),
+                getPluginKind(),
+                getExecutionMode(),
+                getRuntimeProvider(),
+                getProvidesRuntimes(),
                 getMixins()
         );
     }
@@ -464,6 +506,62 @@ public final class PluginManifest {
     /// Returns the HMCL Plugin ABI generation required by this package; ABI 1 when omitted.
     public int getAbi() {
         return abi;
+    }
+
+    /// Returns the schema-v5 package role, defaulting absent declarations to an ordinary plugin.
+    ///
+    /// @return plugin package role
+    public PluginKind getPluginKind() {
+        return Objects.requireNonNullElse(pluginKind, PluginKind.NORMAL);
+    }
+
+    /// Returns the schema-v5 execution boundary, defaulting absent declarations to the embedded bridge.
+    ///
+    /// @return execution boundary
+    public PluginExecutionMode getExecutionMode() {
+        return Objects.requireNonNullElse(executionMode, PluginExecutionMode.EMBEDDED);
+    }
+
+    /// Returns the optional runtime-provider plugin ID pin for an ordinary runtime consumer.
+    ///
+    /// @return pinned provider ID, or `null` when provider selection is unpinned
+    public @Nullable String getRuntimeProvider() {
+        return runtimeProvider;
+    }
+
+    /// Returns an immutable snapshot of runtime declarations supplied by a runtime-provider package.
+    ///
+    /// @return supplied runtime declarations
+    public @Unmodifiable List<RuntimeProviderDeclaration> getProvidesRuntimes() {
+        @Nullable List<@Nullable RuntimeProviderDeclaration> values = providesRuntimes;
+        if (values == null || values.isEmpty()) {
+            return List.of();
+        }
+        return values.stream().map(Objects::requireNonNull).toList();
+    }
+
+    /// Derives the runtime-provider selection contract for this manifest's normalized schema-v5 declarations.
+    ///
+    /// Runtime bridge requirements are derived from the public declaration rather than serialized separately. The
+    /// `raw-jvm` feature is deliberately absent until its permission is introduced by a later schema-v5 task.
+    ///
+    /// @return immutable runtime requirement
+    public RuntimeRequirement getRuntimeRequirement() {
+        Set<RuntimeFeature> features = EnumSet.of(RuntimeFeature.BRIDGE);
+        if (hasHooks()) {
+            features.add(RuntimeFeature.HOOKS);
+        }
+        if (hasPatches()) {
+            features.add(RuntimeFeature.PATCHES);
+        }
+        return new RuntimeRequirement(
+                getRuntime(),
+                getAbi(),
+                1,
+                getExecutionMode(),
+                features,
+                getRuntimeProvider()
+        );
     }
 
     /// Returns whether this package is restricted to at least one declared platform target.
@@ -542,7 +640,8 @@ public final class PluginManifest {
         requireValidIconResource(icon);
 
         if (schemaVersion < 5
-                && (runtimeDeclared || abiDeclared || platformsDeclared || hooksDeclared || patchesDeclared)) {
+                && (runtimeDeclared || abiDeclared || platformsDeclared || hooksDeclared || patchesDeclared
+                || pluginKindDeclared || executionModeDeclared || runtimeProviderDeclared || providesRuntimesDeclared)) {
             throw new IOException("Plugin manifest schemaVersion " + schemaVersion
                     + " cannot declare schema-v5 runtime capabilities");
         }
@@ -569,6 +668,15 @@ public final class PluginManifest {
         } else if (runtime != null) {
             throw new IOException("Plugin manifest schemaVersion " + schemaVersion
                     + " cannot declare runtime");
+        }
+        if (pluginKindDeclared && pluginKind == null) {
+            throw new IOException("Plugin kind cannot be null or unknown");
+        }
+        if (executionModeDeclared && executionMode == null) {
+            throw new IOException("Plugin execution mode cannot be null or unknown");
+        }
+        if (providesRuntimesDeclared && providesRuntimes == null) {
+            throw new IOException("Plugin provided runtime declarations cannot be null");
         }
         if (platformsDeclared) {
             if (schemaVersion < 5) {
@@ -705,6 +813,10 @@ public final class PluginManifest {
             throw new IOException("Plugin patches require launcher-patch in permissions and requiredPermissions");
         }
 
+        if (schemaVersion >= 5) {
+            validateRuntimeProviderContract(declaredPermissions);
+        }
+
         if (schemaVersion >= 4) {
             if (!launcherVersionDeclared) {
                 throw new IOException("Schema-v4 plugin manifest must declare launcherVersion");
@@ -771,6 +883,50 @@ public final class PluginManifest {
         }
     }
 
+    /// Validates schema-v5 runtime-provider roles after permission declarations have been normalized.
+    ///
+    /// @param declaredPermissions permissions declared by this manifest
+    /// @throws IOException if role-specific declarations are incomplete or incompatible
+    private void validateRuntimeProviderContract(Set<PluginPermission> declaredPermissions) throws IOException {
+        @Unmodifiable List<RuntimeProviderDeclaration> providedRuntimes = getProvidesRuntimes();
+        if (getPluginKind() == PluginKind.NORMAL) {
+            if (!providedRuntimes.isEmpty()) {
+                throw new IOException("Normal plugins cannot provide runtimes");
+            }
+            try {
+                getRuntimeRequirement();
+            } catch (IllegalArgumentException exception) {
+                throw new IOException("Invalid runtime provider requirement: " + exception.getMessage(), exception);
+            }
+            return;
+        }
+
+        if (!PluginRuntimeTypes.JAVA.equals(getRuntime())) {
+            throw new IOException("Runtime-provider plugins must use the java runtime");
+        }
+        if (getExecutionMode() != PluginExecutionMode.EMBEDDED) {
+            throw new IOException("Runtime-provider plugins must use embedded Java bootstrap execution");
+        }
+        if (getRuntimeProvider() != null) {
+            throw new IOException("Runtime-provider plugins cannot pin another runtime provider");
+        }
+        if (providedRuntimes.isEmpty()) {
+            throw new IOException("Runtime-provider plugins must provide at least one runtime");
+        }
+        Set<String> providedRuntimeIds = new HashSet<>();
+        boolean requiresNativeCode = false;
+        for (RuntimeProviderDeclaration declaration : providedRuntimes) {
+            if (!providedRuntimeIds.add(declaration.getRuntime())) {
+                throw new IOException("Duplicate provided runtime: " + declaration.getRuntime());
+            }
+            requiresNativeCode |= declaration.getFeatures().contains(RuntimeFeature.NATIVE)
+                    || declaration.getFeatures().contains(RuntimeFeature.RAW_JVM);
+        }
+        if (requiresNativeCode && !declaredPermissions.contains(PluginPermission.NATIVE_CODE)) {
+            throw new IOException("Native runtime providers must declare permission native-code");
+        }
+    }
+
     /// Reads and validates a plugin manifest from JSON.
     ///
     /// @param reader UTF-8 JSON reader
@@ -793,6 +949,10 @@ public final class PluginManifest {
         manifest.platformsDeclared = root != null && root.has("platforms");
         manifest.hooksDeclared = root != null && root.has("hooks");
         manifest.patchesDeclared = root != null && root.has("patches");
+        manifest.pluginKindDeclared = root != null && root.has("pluginKind");
+        manifest.executionModeDeclared = root != null && root.has("executionMode");
+        manifest.runtimeProviderDeclared = root != null && root.has("runtimeProvider");
+        manifest.providesRuntimesDeclared = root != null && root.has("providesRuntimes");
         if (manifest.schemaVersion == CURRENT_SCHEMA_VERSION && root != null) {
             if (root.has("abi") && root.get("abi").isJsonNull()) {
                 throw new IOException("Plugin manifest abi cannot be null");
@@ -854,7 +1014,7 @@ public final class PluginManifest {
     ///
     /// @param value candidate ID
     /// @return whether the ID is valid
-    static boolean isValidId(@Nullable String value) {
+    public static boolean isValidId(@Nullable String value) {
         return value != null && ID_PATTERN.matcher(value).matches();
     }
 

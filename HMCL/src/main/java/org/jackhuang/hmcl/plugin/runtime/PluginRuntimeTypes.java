@@ -33,9 +33,17 @@ public final class PluginRuntimeTypes {
     /// Built-in JVM runtime loaded directly by the launcher; never provided by an external plugin.
     public static final String JAVA = "java";
 
-    /// Runtime identifiers reserved for the official runtime repository.
-    public static final @Unmodifiable Set<String> RESERVED = Set.of(JAVA, "dotnet", "python", "javascript", "native");
+    /// Official Rust runtime identifier, distinct from the `native` runtime category.
+    public static final String RUST = "rust";
 
+    /// Official WebAssembly runtime identifier.
+    public static final String WASM = "wasm";
+
+    /// Runtime identifiers reserved for the official runtime repository.
+    public static final @Unmodifiable Set<String> RESERVED = Set.of(
+            JAVA, "dotnet", "python", "javascript", "native", RUST, WASM);
+
+    /// Prevents construction of the runtime identifier utility class.
     private PluginRuntimeTypes() {
     }
 

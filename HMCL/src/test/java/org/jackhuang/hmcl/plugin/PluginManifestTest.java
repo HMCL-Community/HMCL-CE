@@ -18,7 +18,10 @@
 package org.jackhuang.hmcl.plugin;
 
 import org.jackhuang.hmcl.plugin.runtime.PluginAbi;
+import org.jackhuang.hmcl.plugin.runtime.PluginExecutionMode;
 import org.jackhuang.hmcl.plugin.runtime.PluginRuntimeTypes;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeFeature;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeRequirement;
 import org.jackhuang.hmcl.util.gson.JsonUtils;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.junit.jupiter.api.Test;
@@ -27,6 +30,7 @@ import java.io.IOException;
 import java.io.StringReader;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
@@ -180,6 +184,161 @@ public final class PluginManifestTest {
         assertEquals(PluginAbi.ABI_2, manifest.getAbi());
         assertEquals(List.of(), manifest.getPlatforms());
         assertFalse(manifest.isPlatformRestricted());
+    }
+
+    /// Treats Rust and WebAssembly as canonical official runtime identifiers rather than native code aliases.
+    @Test
+    public void recognizeRustAndWasmRuntimeIdentifiers() {
+        assertEquals(PluginRuntimeTypes.RUST, PluginRuntimeTypes.requireValid("rust"));
+        assertEquals(PluginRuntimeTypes.WASM, PluginRuntimeTypes.requireValid("wasm"));
+        assertTrue(PluginRuntimeTypes.RESERVED.contains(PluginRuntimeTypes.RUST));
+        assertTrue(PluginRuntimeTypes.RESERVED.contains(PluginRuntimeTypes.WASM));
+    }
+
+    /// Defaults an ordinary schema-v5 manifest to embedded execution and derives its runtime bridge requirement.
+    @Test
+    public void defaultSchemaVersionFiveExecutionModeAndRuntimeRequirement() throws IOException {
+        PluginManifest manifest = PluginManifest.fromJson(new StringReader(schemaFiveWithDeclarations(
+                "\"runtime\": \"rust\", \"abi\": 2")));
+
+        assertEquals(PluginKind.NORMAL, manifest.getPluginKind());
+        assertEquals(PluginExecutionMode.EMBEDDED, manifest.getExecutionMode());
+        RuntimeRequirement requirement = manifest.getRuntimeRequirement();
+        assertEquals(PluginRuntimeTypes.RUST, requirement.getRuntime());
+        assertEquals(PluginExecutionMode.EMBEDDED, requirement.getExecutionMode());
+        assertEquals(Set.of(RuntimeFeature.BRIDGE), requirement.getRequiredFeatures());
+    }
+
+    /// Parses canonical embedded and isolated execution mode vocabulary for schema-v5 packages.
+    @Test
+    public void parseSchemaVersionFiveExecutionModes() throws IOException {
+        PluginManifest embedded = PluginManifest.fromJson(new StringReader(schemaFiveWithDeclarations(
+                "\"runtime\": \"java\", \"abi\": 2, \"executionMode\": \"embedded\"")));
+        PluginManifest isolated = PluginManifest.fromJson(new StringReader(schemaFiveWithDeclarations(
+                "\"runtime\": \"java\", \"abi\": 2, \"executionMode\": \"isolated\"")));
+
+        assertEquals(PluginExecutionMode.EMBEDDED, embedded.getExecutionMode());
+        assertEquals(PluginExecutionMode.ISOLATED, isolated.getExecutionMode());
+    }
+
+    /// Parses a Java bootstrap package that publishes an isolated Rust runtime implementation.
+    @Test
+    public void parseSchemaVersionFiveRuntimeProviderManifest() throws IOException {
+        PluginManifest manifest = PluginManifest.fromJson(new StringReader(schemaFiveWithDeclarations("""
+                "runtime": "java",
+                "abi": 2,
+                "pluginKind": "runtime-provider",
+                "providesRuntimes": [{"runtime": "rust", "abis": [1, 2], "bridgeAbi": 1,
+                                      "executionModes": ["isolated"], "features": ["bridge", "hooks"]}]
+                """)));
+
+        assertEquals(PluginKind.RUNTIME_PROVIDER, manifest.getPluginKind());
+        assertEquals(PluginExecutionMode.EMBEDDED, manifest.getExecutionMode());
+        assertEquals(1, manifest.getProvidesRuntimes().size());
+        assertEquals(PluginRuntimeTypes.RUST, manifest.getProvidesRuntimes().get(0).getRuntime());
+        assertEquals(Set.of(PluginAbi.ABI_1, PluginAbi.ABI_2), manifest.getProvidesRuntimes().get(0).getAbis());
+        assertEquals("\"runtime-provider\"", JsonUtils.GSON.toJson(PluginKind.RUNTIME_PROVIDER));
+        assertEquals("\"isolated\"", JsonUtils.GSON.toJson(PluginExecutionMode.ISOLATED));
+        assertEquals("\"raw-jvm\"", JsonUtils.GSON.toJson(RuntimeFeature.RAW_JVM));
+    }
+
+    /// Rejects schema-v5 declarations that are structurally incompatible with provider selection.
+    @Test
+    public void rejectInvalidSchemaVersionFiveRuntimeProviderDeclarations() {
+        assertManifestRejected(schemaFiveWithDeclarations(
+                "\"runtime\": \"rust\", \"abi\": 2, \"pluginKind\": \"runtime-provider\","
+                        + " \"providesRuntimes\": [{\"runtime\": \"rust\", \"abis\": [2], \"bridgeAbi\": 1,"
+                        + " \"executionModes\": [\"isolated\"], \"features\": [\"bridge\"]}]"));
+        assertManifestRejected(schemaFiveWithDeclarations(
+                "\"runtime\": \"java\", \"abi\": 2, \"pluginKind\": \"runtime-provider\","
+                        + " \"runtimeProvider\": \"dev.hmclce.test.provider\", \"providesRuntimes\": []"));
+        assertManifestRejected(schemaFiveWithDeclarations(
+                "\"runtime\": \"java\", \"abi\": 2, \"pluginKind\": \"runtime-provider\","
+                        + " \"providesRuntimes\": [{\"runtime\": \"rust\", \"abis\": [2], \"bridgeAbi\": 1,"
+                        + " \"executionModes\": [\"isolated\"], \"features\": [\"bridge\"]},"
+                        + " {\"runtime\": \"rust\", \"abis\": [2], \"bridgeAbi\": 1,"
+                        + " \"executionModes\": [\"isolated\"], \"features\": [\"bridge\"]}]"));
+        assertManifestRejected(schemaFiveWithDeclarations(
+                "\"runtime\": \"java\", \"abi\": 2, \"providesRuntimes\":"
+                        + " [{\"runtime\": \"rust\", \"abis\": [2], \"bridgeAbi\": 1,"
+                        + " \"executionModes\": [\"isolated\"], \"features\": [\"bridge\"]}]"));
+        assertManifestRejected(schemaFiveWithDeclarations(
+                "\"runtime\": \"java\", \"abi\": 2, \"pluginKind\": \"runtime-provider\","
+                        + " \"executionMode\": \"isolated\", \"providesRuntimes\": [{\"runtime\": \"rust\","
+                        + " \"abis\": [2], \"bridgeAbi\": 1, \"executionModes\": [\"isolated\"],"
+                        + " \"features\": [\"bridge\"]}]"));
+    }
+
+    /// Rejects isolated raw-JVM runtime requirements before a provider can be selected.
+    @Test
+    public void rejectIsolatedRawJvmRuntimeRequirement() {
+        assertThrows(IllegalArgumentException.class, () -> new RuntimeRequirement(
+                PluginRuntimeTypes.JAVA,
+                PluginAbi.ABI_2,
+                1,
+                PluginExecutionMode.ISOLATED,
+                Set.of(RuntimeFeature.BRIDGE, RuntimeFeature.RAW_JVM),
+                null));
+    }
+
+    /// Includes the schema-v5 provider vocabulary in manifest value identity.
+    @Test
+    public void compareSchemaVersionFiveRuntimeProviderIdentity() throws IOException {
+        String base = schemaFiveWithDeclarations("""
+                "runtime": "java",
+                "abi": 2,
+                "executionMode": "embedded",
+                "runtimeProvider": "dev.hmclce.test.provider"
+                """);
+        PluginManifest provider = PluginManifest.fromJson(new StringReader(base));
+        PluginManifest identical = PluginManifest.fromJson(new StringReader(base));
+
+        assertEquals(provider, identical);
+        assertEquals(provider.hashCode(), identical.hashCode());
+        assertNotEquals(provider, PluginManifest.fromJson(new StringReader(
+                base.replace("\"executionMode\": \"embedded\"", "\"executionMode\": \"isolated\""))));
+        assertNotEquals(provider, PluginManifest.fromJson(new StringReader(
+                base.replace("dev.hmclce.test.provider", "dev.hmclce.test.other-provider"))));
+        String providerBase = schemaFiveWithDeclarations("""
+                "runtime": "java",
+                "abi": 2,
+                "pluginKind": "runtime-provider",
+                "providesRuntimes": [{"runtime": "rust", "abis": [2], "bridgeAbi": 1,
+                                      "executionModes": ["isolated"], "features": ["bridge"]}]
+                """);
+        assertNotEquals(
+                PluginManifest.fromJson(new StringReader(providerBase)),
+                PluginManifest.fromJson(new StringReader(providerBase.replace("\"rust\"", "\"wasm\"")))
+        );
+        assertNotEquals(
+                PluginManifest.fromJson(new StringReader(providerBase)),
+                PluginManifest.fromJson(new StringReader(schemaFiveWithDeclarations("""
+                        "runtime": "java",
+                        "abi": 2
+                        """)))
+        );
+    }
+
+    /// Rejects all schema-v5 provider declarations when attached to schema-v4 manifests.
+    @Test
+    public void rejectSchemaVersionFiveProviderFieldsInSchemaVersionFour() {
+        assertManifestRejected(schemaFourWithDeclarations("""
+                "permissions": [], "requiredPermissions": [], "launcherVersion": "*",
+                "pluginKind": "normal", "executionMode": "embedded",
+                "runtimeProvider": "dev.hmclce.test.provider", "providesRuntimes": []
+                """));
+        assertManifestRejected(schemaFourWithDeclarations("""
+                "permissions": [], "requiredPermissions": [], "launcherVersion": "*",
+                "executionMode": "embedded"
+                """));
+        assertManifestRejected(schemaFourWithDeclarations("""
+                "permissions": [], "requiredPermissions": [], "launcherVersion": "*",
+                "runtimeProvider": "dev.hmclce.test.provider"
+                """));
+        assertManifestRejected(schemaFourWithDeclarations("""
+                "permissions": [], "requiredPermissions": [], "launcherVersion": "*",
+                "providesRuntimes": []
+                """));
     }
 
     /// Rejects missing, null, blank, and non-canonical schema-v5 runtime identifiers.
