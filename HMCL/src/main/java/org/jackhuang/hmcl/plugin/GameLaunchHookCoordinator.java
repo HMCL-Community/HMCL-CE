@@ -255,7 +255,7 @@ public final class GameLaunchHookCoordinator {
             );
         }
 
-        /// Validates one complete replacement against an isolated protected-state fork.
+        /// Validates one complete replacement against both committed and staged protected values.
         ///
         /// @param subscriber current subscriber
         /// @param currentData currently committed data
@@ -274,6 +274,7 @@ public final class GameLaunchHookCoordinator {
 
             PluginDataObject candidateData = Objects.requireNonNull(result.data(), "Replacement data");
             boolean accountGranted = subscriber.permissions().contains(PluginPermission.ACCOUNT);
+            secrets.validateOrdinaryData(subscriber.pluginId(), candidateData, accountGranted);
             GameLaunchSecretStore stagedSecrets = secrets.fork();
             stagedSecrets.applyProtectedUpdates(
                     subscriber.pluginId(), result.protectedSecrets(), accountGranted);

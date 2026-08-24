@@ -38,6 +38,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -388,6 +389,42 @@ public final class GameLaunchHookCoordinatorTest {
         assertFalse(original.secrets().containsKey("rotated-token"));
         assertEquals(List.of("runtime-host", "rotated-secret"),
                 session.finalPlan().command().resolve(session.preparation().secrets()::get));
+    }
+
+    /// Rejects a slot rotation that copies its previously visible secret into ordinary replacement data.
+    @Test
+    public void rotatedSecretCannotEscapeThroughOrdinaryReplacementData() {
+        LaunchPreparation original = preparation(LaunchExecutionMode.DIRECT);
+        AtomicBoolean laterInvoked = new AtomicBoolean();
+        GameLaunchHookCoordinator coordinator = coordinator(List.of(
+                accountSubscriber("dev.test.rotating-leak", event -> {
+                    String oldSecret = event.secrets().resolve("access-token");
+                    LaunchProcessPlan current = decode(event, original.secrets().keySet());
+                    Map<String, LaunchPlanText> environment = new LinkedHashMap<>(current.environmentSet());
+                    environment.put("LEAKED_SECRET", LaunchPlanText.literal(oldSecret));
+                    LaunchProcessPlan replacement = current.withEnvironment(
+                            current.inheritEnvironment(), environment, current.environmentUnset());
+                    return PluginHookResult.replace(
+                            GameLaunchHookCodec.encodeBefore(
+                                    replacement, event.data().requireObject("metadata")),
+                            Map.of("access-token", "rotated-secret"));
+                }),
+                subscriber("dev.test.after-rotating-leak", Set.of("dev.test.rotating-leak"), event -> {
+                    laterInvoked.set(true);
+                    return PluginHookResult.unchanged();
+                })
+        ), false);
+
+        PluginHookDispatchException failure = assertThrows(PluginHookDispatchException.class,
+                () -> coordinator.beforeLaunch(original, metadata("direct")));
+
+        assertEquals(PluginHookDispatchException.Category.INVALID_RESULT, failure.category());
+        assertEquals("dev.test.rotating-leak", failure.pluginId());
+        assertFalse(failure.getMessage().contains("top-secret"));
+        assertFalse(failure.getMessage().contains("rotated-secret"));
+        assertFalse(laterInvoked.get());
+        assertEquals("top-secret", original.secrets().get("access-token"));
+        assertFalse(original.plan().environmentSet().containsKey("LEAKED_SECRET"));
     }
 
     /// Coordinates script plans without allocating direct-execution after state.
