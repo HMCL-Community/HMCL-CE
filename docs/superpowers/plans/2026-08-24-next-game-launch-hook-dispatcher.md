@@ -12,7 +12,7 @@
 
 ## Progress Snapshot (2026-08-24)
 
-- Development is paused before Task 9 while the `main` and `next` relationship is normalized.
+- Development is paused before Task 9. The `main` and `next` relationship has been normalized.
 - Tasks 1-7 are complete on `next`; Task 7 is commit `60c3388` (`Execute before game launch hooks`).
 - Task 8 is complete in commit `80abe23` (`Dispatch after game launch hooks`). Its listener/coordinator
   tests, `:HMCLCore:test`, HMCL main/test Checkstyle, and `git diff --check` were re-run immediately
@@ -21,11 +21,16 @@
   `origin/next` = `d597972`, merge base = `dbde134`; `main...next` contains 1 main-only and
   29 next-only commits. `next` must absorb committed `main`; `next` must not be merged into stable
   `main`.
+- Normalization completed in merge commit `421f67e` (`Merge branch 'main' into next`). The resolved
+  tree matches the pre-merge `next` tree because `next` already contained the final `main` behavior.
+  After the merge, `main` is an ancestor of `next` and `main...next` contains 0 main-only and 33
+  next-only commits. The forced focused HMCL tests, full `:HMCLCore:test`, HMCL main/test Checkstyle,
+  translation checks, and `git diff --check origin/next...next` passed.
 - The `main-release` worktree has an unrelated uncommitted `HMCL/build.gradle.kts` change. Preserve it
   exactly and merge only the committed `main` ref from the `next` checkout.
 - SDK refs are already normalized and clean: default branch `schema-v4` = `3a86706`, future branch
   `schema-v5` = `e11dac2`; both match their remote tracking branches. No SDK ref operation is pending.
-- Do not start Task 9 until `next` has absorbed `main` and the post-merge checks pass.
+- Task 9 remains intentionally paused until development is explicitly resumed.
 
 ---
 
