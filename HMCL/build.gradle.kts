@@ -34,6 +34,10 @@ val isOfficial = GitHubActionUtils.IS_ON_OFFICIAL_REPO
 val versionType = System.getenv("VERSION_TYPE") ?: if (isOfficial) "nightly" else "unofficial"
 val versionRoot = System.getenv("VERSION_ROOT") ?: projectConfig.getProperty("versionRoot") ?: "3"
 val buildVersion = System.getenv("BUILD_VERSION")?.takeIf(String::isNotBlank)
+val nextVersionSuffix = "-next"
+
+fun String.withNextVersionSuffix(): String =
+    if (endsWith(nextVersionSuffix)) this else "$this$nextVersionSuffix"
 
 val microsoftAuthId = System.getenv("MICROSOFT_AUTH_ID") ?: ""
 val curseForgeApiKey = System.getenv("CURSEFORGE_API_KEY") ?: ""
@@ -42,11 +46,11 @@ val launcherExe = System.getenv("HMCL_LAUNCHER_EXE")
     ?.takeIf(String::isNotBlank)
     ?: layout.projectDirectory.file("launcher/HMCLauncher.exe").asFile.path
 
-if (buildVersion != null) {
-    version = buildVersion
+val selectedVersion = if (buildVersion != null) {
+    buildVersion
 } else {
     val shortCommit = System.getenv("GITHUB_SHA")?.lowercase()?.substring(0, 7)
-    version = if (shortCommit.isNullOrBlank()) {
+    if (shortCommit.isNullOrBlank()) {
         "$versionRoot.SNAPSHOT"
     } else if (isOfficial) {
         "$versionRoot.dev-$shortCommit"
@@ -54,6 +58,7 @@ if (buildVersion != null) {
         "$versionRoot.unofficial-$shortCommit"
     }
 }
+version = selectedVersion.withNextVersionSuffix()
 
 val embedResources = configurations.register("embedResources")
 
