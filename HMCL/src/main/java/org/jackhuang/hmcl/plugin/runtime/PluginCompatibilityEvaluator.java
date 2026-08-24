@@ -20,10 +20,12 @@ package org.jackhuang.hmcl.plugin.runtime;
 import org.jackhuang.hmcl.plugin.PluginManifest;
 import org.jackhuang.hmcl.plugin.PluginVersionConstraint;
 import org.jetbrains.annotations.NotNullByDefault;
+import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 
 /// Evaluates plugin package requirements against launcher, platform, runtime, and ABI capabilities.
 @NotNullByDefault
@@ -99,20 +101,84 @@ public final class PluginCompatibilityEvaluator {
             );
         }
         String runtime = requirements.runtime();
-        Optional<RuntimeProvider> runtimeProvider = runtimeProviders.find(runtime);
-        if (runtimeProvider.isEmpty()) {
+        @Unmodifiable List<RuntimeProviderDescriptor> candidates = runtimeProviders.candidates(runtime);
+        @Nullable String pinnedProviderId = requirements.pinnedProviderId();
+        if (pinnedProviderId != null) {
+            Optional<RuntimeProviderDescriptor> pinnedDescriptor = candidates.stream()
+                    .filter(candidate -> pinnedProviderId.equals(candidate.providerId()))
+                    .findFirst();
+            if (pinnedDescriptor.isEmpty()) {
+                return new PluginCompatibilityResult(
+                        PluginCompatibilityStatus.MISSING_RUNTIME,
+                        "Pinned runtime provider " + pinnedProviderId + " does not advertise " + runtime
+                );
+            }
+            candidates = List.of(pinnedDescriptor.orElseThrow());
+        }
+        if (candidates.isEmpty()) {
             return new PluginCompatibilityResult(
                     PluginCompatibilityStatus.MISSING_RUNTIME,
                     "No plugin runtime provider is registered for " + runtime
             );
         }
-        RuntimeProvider provider = runtimeProvider.orElseThrow();
         int requiredAbi = requirements.abi();
-        if (!provider.supportsAbi(requiredAbi)) {
+        @Unmodifiable List<RuntimeProviderDeclaration> runtimeCapabilities = capabilities(candidates, runtime);
+        @Unmodifiable List<RuntimeProviderDescriptor> abiCandidates = candidates.stream()
+                .filter(candidate -> runtimeProviders.findById(candidate.providerId())
+                        .map(provider -> provider.supportsAbi(runtime, requiredAbi))
+                        .orElse(false))
+                .toList();
+        if (abiCandidates.isEmpty()) {
+            String implementedAbis = runtimeCapabilities.size() == 1
+                    ? "provider implements ABIs " + runtimeCapabilities.get(0).getAbis()
+                    : "providers implement ABI sets " + runtimeCapabilities.stream()
+                            .map(RuntimeProviderDeclaration::getAbis)
+                            .toList();
             return new PluginCompatibilityResult(
                     PluginCompatibilityStatus.UNSUPPORTED_ABI,
                     "Plugin runtime " + runtime + " does not support requested ABI " + requiredAbi
-                            + "; provider implements ABIs " + provider.implementedPluginAbis()
+                            + "; " + implementedAbis
+            );
+        }
+        PluginExecutionMode executionMode = requirements.executionMode();
+        @Unmodifiable List<RuntimeProviderDescriptor> modeCandidates = abiCandidates.stream()
+                .filter(candidate -> candidate.capability(runtime).orElseThrow()
+                        .getExecutionModes().contains(executionMode))
+                .toList();
+        if (modeCandidates.isEmpty()) {
+            return new PluginCompatibilityResult(
+                    PluginCompatibilityStatus.UNSUPPORTED_EXECUTION_MODE,
+                    "Plugin runtime " + runtime + " does not support execution mode " + executionMode
+            );
+        }
+        int requiredBridgeAbi = requirements.bridgeAbi();
+        @Unmodifiable List<RuntimeProviderDescriptor> bridgeCandidates = modeCandidates.stream()
+                .filter(candidate -> candidate.capability(runtime).orElseThrow().getBridgeAbi() == requiredBridgeAbi)
+                .toList();
+        if (bridgeCandidates.isEmpty()) {
+            return new PluginCompatibilityResult(
+                    PluginCompatibilityStatus.UNSUPPORTED_BRIDGE_ABI,
+                    "Plugin runtime " + runtime + " does not support Bridge ABI " + requiredBridgeAbi
+            );
+        }
+        @Unmodifiable Set<RuntimeFeature> requiredFeatures = requirements.requiredFeatures();
+        @Unmodifiable List<RuntimeProviderDescriptor> featureCandidates = bridgeCandidates.stream()
+                .filter(candidate -> candidate.capability(runtime).orElseThrow()
+                        .getFeatures().containsAll(requiredFeatures))
+                .toList();
+        if (featureCandidates.isEmpty()) {
+            return new PluginCompatibilityResult(
+                    PluginCompatibilityStatus.UNSUPPORTED_RUNTIME_FEATURE,
+                    "Plugin runtime " + runtime + " does not implement required features " + requiredFeatures
+            );
+        }
+        RuntimeProviderDescriptor selected = new RuntimeProviderSelector()
+                .select(requirements.runtimeRequirement(), featureCandidates)
+                .orElseThrow();
+        if (runtimeProviders.findById(selected.providerId()).isEmpty()) {
+            return new PluginCompatibilityResult(
+                    PluginCompatibilityStatus.MISSING_RUNTIME,
+                    "No plugin runtime provider is registered for " + runtime
             );
         }
         return new PluginCompatibilityResult(
@@ -120,5 +186,18 @@ public final class PluginCompatibilityEvaluator {
                 "All plugin compatibility requirements are satisfied for launcher "
                         + launcherVersion + " on " + hostPlatform.getId()
         );
+    }
+
+    /// Extracts the advertised capability for one runtime from every candidate descriptor.
+    ///
+    /// @param candidates provider candidates known to advertise the runtime
+    /// @param runtime canonical runtime identifier
+    /// @return immutable capability list in candidate order
+    private static @Unmodifiable List<RuntimeProviderDeclaration> capabilities(
+            @Unmodifiable List<RuntimeProviderDescriptor> candidates,
+            String runtime) {
+        return candidates.stream()
+                .map(candidate -> candidate.capability(runtime).orElseThrow())
+                .toList();
     }
 }

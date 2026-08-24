@@ -83,8 +83,8 @@ public final class RuntimeProviderDeclaration {
                 throw new IllegalArgumentException("Runtime provider ABI must be positive: " + abi);
             }
         }
-        if (bridgeAbi != 1) {
-            throw new IllegalArgumentException("Unsupported runtime bridge ABI: " + bridgeAbi);
+        if (bridgeAbi <= 0) {
+            throw new IllegalArgumentException("Runtime provider bridge ABI must be positive: " + bridgeAbi);
         }
         this.bridgeAbi = bridgeAbi;
         this.executionModes = Set.copyOf(executionModes);

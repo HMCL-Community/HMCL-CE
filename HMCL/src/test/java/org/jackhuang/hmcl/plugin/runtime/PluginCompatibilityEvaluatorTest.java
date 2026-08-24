@@ -178,6 +178,23 @@ public final class PluginCompatibilityEvaluatorTest {
         assertTrue(result.isCompatible());
     }
 
+    /// Preserves schema-v5 Java Hook and Patch compatibility through the reserved built-in provider.
+    @Test
+    public void acceptBuiltInJavaRuntimeFeatures() {
+        PluginCompatibilityEvaluator evaluator = new PluginCompatibilityEvaluator(
+                new RuntimeProviderRegistry(), PluginPlatformTarget.parse("windows"));
+        PluginCompatibilityRequirements requirements = requirements(new RuntimeRequirement(
+                PluginRuntimeTypes.JAVA,
+                PluginAbi.ABI_2,
+                1,
+                PluginExecutionMode.EMBEDDED,
+                Set.of(RuntimeFeature.BRIDGE, RuntimeFeature.HOOKS, RuntimeFeature.PATCHES),
+                null
+        ));
+
+        assertStatus(PluginCompatibilityStatus.COMPATIBLE, evaluator.evaluate(requirements, "26.8"));
+    }
+
     /// Rejects manifest schemas below or above the launcher's executable range.
     @Test
     public void rejectUnsupportedManifestSchema() {
@@ -287,6 +304,67 @@ public final class PluginCompatibilityEvaluatorTest {
         assertTrue(result.detail().contains("provider implements ABIs [1]"));
     }
 
+    /// Reports execution-mode incompatibility independently from runtime and ABI availability.
+    @Test
+    public void rejectUnsupportedRuntimeExecutionMode() {
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        registry.register(provider("dev.host.rust.mode", "rust", 1,
+                Set.of(PluginExecutionMode.ISOLATED), Set.of(RuntimeFeature.BRIDGE)));
+        PluginCompatibilityEvaluator evaluator = new PluginCompatibilityEvaluator(
+                registry, PluginPlatformTarget.parse("windows"));
+        PluginCompatibilityRequirements requirements = requirements(new RuntimeRequirement(
+                "rust", PluginAbi.ABI_2, 1, PluginExecutionMode.EMBEDDED,
+                Set.of(RuntimeFeature.BRIDGE), null));
+
+        assertStatus(PluginCompatibilityStatus.UNSUPPORTED_EXECUTION_MODE,
+                evaluator.evaluate(requirements, "26.8"));
+    }
+
+    /// Reports Bridge ABI incompatibility independently from other provider capabilities.
+    @Test
+    public void rejectUnsupportedRuntimeBridgeAbi() {
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        registry.register(provider("dev.host.rust.bridge", "rust", 2,
+                Set.of(PluginExecutionMode.EMBEDDED), Set.of(RuntimeFeature.BRIDGE)));
+        PluginCompatibilityEvaluator evaluator = new PluginCompatibilityEvaluator(
+                registry, PluginPlatformTarget.parse("windows"));
+
+        assertStatus(PluginCompatibilityStatus.UNSUPPORTED_BRIDGE_ABI,
+                evaluator.evaluate(requirements(new RuntimeRequirement(
+                        "rust", PluginAbi.ABI_2, 1, PluginExecutionMode.EMBEDDED,
+                        Set.of(RuntimeFeature.BRIDGE), null)), "26.8"));
+    }
+
+    /// Reports missing runtime features after ABI, mode, and Bridge compatibility succeed.
+    @Test
+    public void rejectUnsupportedRuntimeFeatures() {
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        registry.register(provider("dev.host.rust.features", "rust", 1,
+                Set.of(PluginExecutionMode.EMBEDDED), Set.of(RuntimeFeature.BRIDGE)));
+        PluginCompatibilityEvaluator evaluator = new PluginCompatibilityEvaluator(
+                registry, PluginPlatformTarget.parse("windows"));
+
+        assertStatus(PluginCompatibilityStatus.UNSUPPORTED_RUNTIME_FEATURE,
+                evaluator.evaluate(requirements(new RuntimeRequirement(
+                        "rust", PluginAbi.ABI_2, 1, PluginExecutionMode.EMBEDDED,
+                        Set.of(RuntimeFeature.BRIDGE, RuntimeFeature.HOOKS), null)), "26.8"));
+    }
+
+    /// Treats an absent or incompatible explicit provider pin as a missing provider without fallback.
+    @Test
+    public void rejectUnavailablePinnedRuntimeProvider() {
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        registry.register(provider("dev.host.rust.other", "rust", 1,
+                Set.of(PluginExecutionMode.EMBEDDED), Set.of(RuntimeFeature.BRIDGE)));
+        PluginCompatibilityEvaluator evaluator = new PluginCompatibilityEvaluator(
+                registry, PluginPlatformTarget.parse("windows"));
+
+        assertStatus(PluginCompatibilityStatus.MISSING_RUNTIME,
+                evaluator.evaluate(requirements(new RuntimeRequirement(
+                        "rust", PluginAbi.ABI_2, 1, PluginExecutionMode.EMBEDDED,
+                        Set.of(RuntimeFeature.BRIDGE), "dev.host.rust.missing")), "26.8"));
+    }
+
     /// Reports only the earliest incompatible dimension in the fixed diagnostic order.
     @Test
     public void prioritizeCompatibilityDiagnostics() {
@@ -360,6 +438,37 @@ public final class PluginCompatibilityEvaluatorTest {
                 return "Test " + runtimeType + " runtime";
             }
         };
+    }
+
+    /// Creates a descriptor-backed provider for schema-v5 compatibility diagnostics.
+    private static RuntimeProvider provider(
+            String providerId,
+            String runtime,
+            int bridgeAbi,
+            @Unmodifiable Set<PluginExecutionMode> modes,
+            @Unmodifiable Set<RuntimeFeature> features) {
+        RuntimeProviderDescriptor descriptor = new RuntimeProviderDescriptor(
+                providerId,
+                "1.0.0",
+                List.of(new RuntimeProviderDeclaration(
+                        runtime, Set.of(PluginAbi.ABI_2), bridgeAbi, modes, features)),
+                true,
+                true,
+                0,
+                false
+        );
+        return new RuntimeProvider() {
+            /// Returns the immutable provider descriptor.
+            @Override
+            public RuntimeProviderDescriptor descriptor() {
+                return descriptor;
+            }
+        };
+    }
+
+    /// Wraps one schema-v5 runtime requirement in package-level compatibility requirements.
+    private static PluginCompatibilityRequirements requirements(RuntimeRequirement runtimeRequirement) {
+        return new PluginCompatibilityRequirements(5, "*", runtimeRequirement, List.of());
     }
 
     /// Asserts a compatibility status and its required nonempty diagnostic detail.

@@ -243,6 +243,29 @@ public final class PluginManifestTest {
         assertEquals("\"raw-jvm\"", JsonUtils.GSON.toJson(RuntimeFeature.RAW_JVM));
     }
 
+    /// Preserves future positive Bridge ABI declarations so compatibility can diagnose negotiation mismatches.
+    ///
+    /// @throws IOException if the valid future-ABI provider manifest cannot be parsed
+    @Test
+    public void parseFuturePositiveRuntimeProviderBridgeAbi() throws IOException {
+        PluginManifest manifest = PluginManifest.fromJson(new StringReader(schemaFiveWithDeclarations("""
+                "runtime": "java",
+                "abi": 2,
+                "pluginKind": "runtime-provider",
+                "providesRuntimes": [{"runtime": "rust", "abis": [2], "bridgeAbi": 2,
+                                      "executionModes": ["embedded"], "features": ["bridge"]}]
+                """)));
+
+        assertEquals(2, manifest.getProvidesRuntimes().get(0).getBridgeAbi());
+        assertManifestRejectedAtParsingOrValidation(schemaFiveWithDeclarations("""
+                "runtime": "java",
+                "abi": 2,
+                "pluginKind": "runtime-provider",
+                "providesRuntimes": [{"runtime": "rust", "abis": [2], "bridgeAbi": 0,
+                                      "executionModes": ["embedded"], "features": ["bridge"]}]
+                """));
+    }
+
     /// Rejects schema-v5 declarations that are structurally incompatible with provider selection.
     @Test
     public void rejectInvalidSchemaVersionFiveRuntimeProviderDeclarations() {

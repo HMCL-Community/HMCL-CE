@@ -28,6 +28,35 @@ import java.util.Set;
 /// the Java plugin system keeps working even when every external runtime is missing.
 @NotNullByDefault
 public final class JavaRuntimeProvider implements RuntimeProvider {
+    /// Immutable reserved descriptor for the launcher-supplied Java runtime.
+    private static final RuntimeProviderDescriptor DESCRIPTOR = new RuntimeProviderDescriptor(
+            RuntimeProviderDescriptor.BUILTIN_JAVA_PROVIDER_ID,
+            "1.0.0",
+            java.util.List.of(new RuntimeProviderDeclaration(
+                    PluginRuntimeTypes.JAVA,
+                    Set.of(PluginAbi.ABI_1, PluginAbi.ABI_2),
+                    1,
+                    Set.of(PluginExecutionMode.EMBEDDED),
+                    Set.of(
+                            RuntimeFeature.BRIDGE,
+                            RuntimeFeature.HOOKS,
+                            RuntimeFeature.PATCHES,
+                            RuntimeFeature.RAW_JVM,
+                            RuntimeFeature.NATIVE
+                    )
+            )),
+            true,
+            true,
+            0,
+            true
+    );
+
+    /// Returns the reserved built-in Java provider descriptor.
+    @Override
+    public RuntimeProviderDescriptor descriptor() {
+        return DESCRIPTOR;
+    }
+
     @Override
     public String runtimeType() {
         return PluginRuntimeTypes.JAVA;

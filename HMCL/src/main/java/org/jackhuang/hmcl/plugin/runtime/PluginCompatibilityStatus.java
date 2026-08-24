@@ -38,5 +38,14 @@ public enum PluginCompatibilityStatus {
     MISSING_RUNTIME,
 
     /// The registered runtime provider does not implement the required ABI.
-    UNSUPPORTED_ABI
+    UNSUPPORTED_ABI,
+
+    /// Registered providers do not support the requested execution boundary.
+    UNSUPPORTED_EXECUTION_MODE,
+
+    /// Registered providers do not implement the required launcher-to-provider Bridge ABI.
+    UNSUPPORTED_BRIDGE_ABI,
+
+    /// Registered providers lack at least one required runtime feature.
+    UNSUPPORTED_RUNTIME_FEATURE
 }
