@@ -10,6 +10,30 @@
 
 ---
 
+## Progress Snapshot (2026-08-24)
+
+- Development is paused before Task 9 while the `main` and `next` relationship is normalized.
+- Tasks 1-7 are complete on `next`; Task 7 is commit `60c3388` (`Execute before game launch hooks`).
+- Task 8 implementation and focused verification are complete but not yet committed. Its five changed
+  files are `HMCLGameLauncher.java`, `GameLaunchHookCoordinator.java`,
+  `GameLaunchHookProcessListener.java`, `GameLaunchHookCoordinatorTest.java`, and
+  `GameLaunchHookProcessListenerTest.java`.
+- Task 8 passed its listener/coordinator tests, `:HMCLCore:test`, HMCL main/test Checkstyle, and
+  `git diff --check`. Re-run these checks immediately before committing because this snapshot records
+  earlier evidence rather than replacing fresh verification.
+- HMCL refs at the pause: `main`/`origin/main` = `aa11f6c`, `next` = `60c3388`,
+  `origin/next` = `d597972`, merge base = `dbde134`; `main...next` contains 1 main-only and
+  29 next-only commits. `next` must absorb committed `main`; `next` must not be merged into stable
+  `main`.
+- The `main-release` worktree has an unrelated uncommitted `HMCL/build.gradle.kts` change. Preserve it
+  exactly and merge only the committed `main` ref from the `next` checkout.
+- SDK refs are already normalized and clean: default branch `schema-v4` = `3a86706`, future branch
+  `schema-v5` = `e11dac2`; both match their remote tracking branches. No SDK ref operation is pending.
+- Do not start Task 9 until Task 8 is committed, `next` has absorbed `main`, and the post-merge checks
+  pass.
+
+---
+
 ## File And Ownership Map
 
 ### HMCLCore launch model
@@ -84,7 +108,7 @@
 - Create: `HMCL/src/main/java/org/jackhuang/hmcl/plugin/PluginSecretAccess.java`
 - Modify: `HMCL/src/main/java/org/jackhuang/hmcl/plugin/Plugin.java`
 
-- [ ] **Step 1: Write the contract tests first**
+- [x] **Step 1: Write the contract tests first**
 
 Test immutable object replacement, recursive value validation, unchanged/replacement/cancel result factories, cancellation code validation, event metadata, denied secret access, and the default plugin callback:
 
@@ -112,7 +136,7 @@ public void defaultHookCallbackPreservesPayload() {
 }
 ```
 
-- [ ] **Step 2: Run the test and verify RED**
+- [x] **Step 2: Run the test and verify RED**
 
 ```powershell
 .\gradlew.bat :HMCL:test --tests "org.jackhuang.hmcl.plugin.PluginHookContractTest" --no-daemon --stacktrace
@@ -120,7 +144,7 @@ public void defaultHookCallbackPreservesPayload() {
 
 Expected: test compilation fails because the five public Hook contract types and `Plugin.onHook` do not exist.
 
-- [ ] **Step 3: Implement the minimal neutral DOM and callback shapes**
+- [x] **Step 3: Implement the minimal neutral DOM and callback shapes**
 
 Use a sealed value hierarchy whose public factories copy every input collection:
 
@@ -164,7 +188,7 @@ default PluginHookResult onHook(PluginHookEvent event) {
 }
 ```
 
-- [ ] **Step 4: Run tests and Checkstyle GREEN**
+- [x] **Step 4: Run tests and Checkstyle GREEN**
 
 ```powershell
 .\gradlew.bat :HMCL:test --tests "org.jackhuang.hmcl.plugin.PluginHookContractTest" --no-daemon --stacktrace
@@ -174,7 +198,7 @@ default PluginHookResult onHook(PluginHookEvent event) {
 Expected: both commands succeed; reflection assertions confirm no public Hook member mentions Gson,
 JavaFX, `LaunchOptions`, or `ManagedProcess`.
 
-- [ ] **Step 5: Commit the public Hook contract**
+- [x] **Step 5: Commit the public Hook contract**
 
 ```powershell
 git add HMCL/src/main/java/org/jackhuang/hmcl/plugin/Plugin.java
@@ -197,7 +221,7 @@ git commit -m "Add neutral plugin hook value contract"
 - Create: `HMCLCore/src/main/java/org/jackhuang/hmcl/launch/LaunchAuxiliaryProcessPlan.java`
 - Create: `HMCLCore/src/main/java/org/jackhuang/hmcl/launch/LaunchProcessPlan.java`
 
-- [ ] **Step 1: Write plan-mode, rendering, and validation tests**
+- [x] **Step 1: Write plan-mode, rendering, and validation tests**
 
 Cover structured Java rendering, raw replacement, template resolution, environment set/unset,
 auxiliary commands, immutable copies, and every invalid state:
@@ -228,7 +252,7 @@ public void structuredAndRawModesHaveOneAuthoritativeSource() {
 Validation tests reject blank executable/main class/raw command, null/NUL text, invalid environment
 keys, contradictory mode fields, unknown secret slots, and non-absolute working directories.
 
-- [ ] **Step 2: Run the model test and verify RED**
+- [x] **Step 2: Run the model test and verify RED**
 
 ```powershell
 .\gradlew.bat :HMCLCore:test --tests "org.jackhuang.hmcl.launch.LaunchProcessPlanTest" --no-daemon --stacktrace
@@ -236,7 +260,7 @@ keys, contradictory mode fields, unknown secret slots, and non-absolute working 
 
 Expected: test compilation fails because the launch-plan types do not exist.
 
-- [ ] **Step 3: Implement literal/template text and command modes**
+- [x] **Step 3: Implement literal/template text and command modes**
 
 `LaunchPlanText` stores an immutable ordered segment list:
 
@@ -256,7 +280,7 @@ public String resolve(Function<String, @Nullable String> resolver);
 only `rawCommand`. Its constructor validates exclusivity, all accessors return immutable copies, and
 `replaceWithRawCommand` is the only mode switch.
 
-- [ ] **Step 4: Implement the complete process plan**
+- [x] **Step 4: Implement the complete process plan**
 
 `LaunchProcessPlan` owns:
 
@@ -279,7 +303,7 @@ Provide copy-on-write `withCommand`, `withWorkingDirectory`, `withEnvironment`,
 availableSecretSlots)` traverses every text value and produces a path-specific
 `IllegalArgumentException` without resolving secrets.
 
-- [ ] **Step 5: Run model tests and style checks GREEN**
+- [x] **Step 5: Run model tests and style checks GREEN**
 
 ```powershell
 .\gradlew.bat :HMCLCore:test --tests "org.jackhuang.hmcl.launch.LaunchProcessPlanTest" --no-daemon --stacktrace
@@ -288,7 +312,7 @@ availableSecretSlots)` traverses every text value and produces a path-specific
 
 Expected: both commands succeed and mutation attempts against every returned collection throw.
 
-- [ ] **Step 6: Commit the launch-plan model**
+- [x] **Step 6: Commit the launch-plan model**
 
 ```powershell
 git add HMCLCore/src/main/java/org/jackhuang/hmcl/launch/LaunchExecutionMode.java
@@ -308,7 +332,7 @@ git commit -m "Model complete game launch process plans"
 - Create: `HMCLCore/src/test/java/org/jackhuang/hmcl/launch/LaunchScriptRendererTest.java`
 - Modify: `HMCLCore/src/main/java/org/jackhuang/hmcl/launch/DefaultLauncher.java`
 
-- [ ] **Step 1: Write renderer parity tests**
+- [x] **Step 1: Write renderer parity tests**
 
 Build one resolved plan containing prefix/Java/JVM/classpath/main/game tokens, environment set/unset,
 pre-launch, and post-exit commands. Assert each supported renderer emits those exact values once:
@@ -332,7 +356,7 @@ public void scriptUsesTheSameResolvedPlanAsDirectExecution(LaunchScriptRenderer.
 Add BAT, PowerShell, Bash, and macOS command tests for quoting, `APPDATA`, unset variables, working
 directory, long Windows commands, BOM, executable permission, and secret resolution only at render.
 
-- [ ] **Step 2: Run renderer tests and verify RED**
+- [x] **Step 2: Run renderer tests and verify RED**
 
 ```powershell
 .\gradlew.bat :HMCLCore:test --tests "org.jackhuang.hmcl.launch.LaunchScriptRendererTest" --no-daemon --stacktrace
@@ -340,7 +364,7 @@ directory, long Windows commands, BOM, executable permission, and secret resolut
 
 Expected: test compilation fails because `LaunchPreparation` and `LaunchScriptRenderer` do not exist.
 
-- [ ] **Step 3: Extract the script renderer without changing behavior**
+- [x] **Step 3: Extract the script renderer without changing behavior**
 
 Move the current BAT/PowerShell/Bash quoting branches from `DefaultLauncher.makeLaunchScript` into
 `LaunchScriptRenderer`. Its production API is:
@@ -358,7 +382,7 @@ specifications exclusively from `LaunchProcessPlan`; never read `LaunchOptions` 
 Provide package-private `renderToString(Kind, LaunchProcessPlan, Function)` and `quoteForTest` helpers
 for deterministic tests; the public file-writing method selects `Kind` from the target extension.
 
-- [ ] **Step 4: Refactor preparation and execution around one plan**
+- [x] **Step 4: Refactor preparation and execution around one plan**
 
 Replace private `Command` with immutable `LaunchPreparation`, containing:
 
@@ -399,7 +423,7 @@ existing exit waiter. The three-argument execution overload invokes `exitCleanup
 block after the ordinary listener and post-exit command complete; the two-argument overload supplies
 a no-op cleanup and preserves existing callers.
 
-- [ ] **Step 5: Run focused and regression tests GREEN**
+- [x] **Step 5: Run focused and regression tests GREEN**
 
 ```powershell
 .\gradlew.bat :HMCLCore:test --tests "org.jackhuang.hmcl.launch.LaunchProcessPlanTest" --tests "org.jackhuang.hmcl.launch.LaunchScriptRendererTest" --no-daemon --stacktrace
@@ -410,7 +434,7 @@ a no-op cleanup and preserves existing callers.
 Expected: all commands succeed; the focused tests prove direct and script paths use one resolved
 plan and no test/log representation includes the access token.
 
-- [ ] **Step 6: Commit the unified launcher pipeline**
+- [x] **Step 6: Commit the unified launcher pipeline**
 
 ```powershell
 git add HMCLCore/src/main/java/org/jackhuang/hmcl/launch/DefaultLauncher.java
@@ -427,7 +451,7 @@ git commit -m "Unify direct and script launch plans"
 - Create: `HMCL/src/main/java/org/jackhuang/hmcl/plugin/GameLaunchSecretStore.java`
 - Create: `HMCL/src/main/java/org/jackhuang/hmcl/plugin/GameLaunchHookCodec.java`
 
-- [ ] **Step 1: Write full round-trip and secret isolation tests**
+- [x] **Step 1: Write full round-trip and secret isolation tests**
 
 ```java
 @Test
@@ -452,7 +476,7 @@ Cover structured/raw plans, templates, environment unset, auxiliary commands, im
 rewrite rejection, denied versus granted `account` access, protected secret creation/update, unknown
 slot rejection, removed slots, substring leakage, and redacted exception text.
 
-- [ ] **Step 2: Run codec tests and verify RED**
+- [x] **Step 2: Run codec tests and verify RED**
 
 ```powershell
 .\gradlew.bat :HMCL:test --tests "org.jackhuang.hmcl.plugin.GameLaunchHookCodecTest" --no-daemon --stacktrace
@@ -460,7 +484,7 @@ slot rejection, removed slots, substring leakage, and redacted exception text.
 
 Expected: test compilation fails because the codec and store do not exist.
 
-- [ ] **Step 3: Implement the scoped secret store**
+- [x] **Step 3: Implement the scoped secret store**
 
 Use synchronized package-private state with immutable snapshots:
 
@@ -478,7 +502,7 @@ non-null values, and a matching reference in the returned plan. Scan all ordinar
 every secret visible to that callback and reject exact or substring disclosure. Exception messages
 contain plugin ID and data path but never the offending value.
 
-- [ ] **Step 4: Implement a complete symmetric codec**
+- [x] **Step 4: Implement a complete symmetric codec**
 
 The before payload has immutable `metadata` and mutable `plan`. Encode/decode all process-plan
 fields with explicit `contractVersion: 1`; represent `LaunchPlanText` as literal or template/segment
@@ -487,7 +511,7 @@ value kind, preserve unknown future fields only outside version 1, and invoke
 `LaunchProcessPlan.validate(secretSlots)` before commit. The after encoder contains the redacted
 final plan plus PID, nullable exit code, exit kind, start/end ISO instants, and elapsed milliseconds.
 
-- [ ] **Step 5: Run codec tests and Checkstyle GREEN**
+- [x] **Step 5: Run codec tests and Checkstyle GREEN**
 
 ```powershell
 .\gradlew.bat :HMCL:test --tests "org.jackhuang.hmcl.plugin.GameLaunchHookCodecTest" --no-daemon --stacktrace
@@ -497,7 +521,7 @@ final plan plus PID, nullable exit code, exit kind, start/end ISO instants, and 
 Expected: both commands succeed and a recursive assertion finds no access token in encoded before or
 after data.
 
-- [ ] **Step 6: Commit codec and secret isolation**
+- [x] **Step 6: Commit codec and secret isolation**
 
 ```powershell
 git add HMCL/src/main/java/org/jackhuang/hmcl/plugin/GameLaunchSecretStore.java
@@ -516,7 +540,7 @@ git commit -m "Protect secrets in game launch hook data"
 - Modify: `HMCL/src/main/java/org/jackhuang/hmcl/plugin/PluginContainer.java`
 - Modify: `HMCL/src/main/java/org/jackhuang/hmcl/plugin/PluginAdministrativeGuard.java`
 
-- [ ] **Step 1: Write subscriber snapshot tests**
+- [x] **Step 1: Write subscriber snapshot tests**
 
 Create isolated prepared containers for a dependency diamond plus schema-v4, disabled, undeclared,
 and permission-revoked plugins. Assert:
@@ -533,7 +557,7 @@ does not authorize the loaded artifact, and snapshot iteration does not hold `st
 endpoint callback. `hasEligibleHookSubscriber(point)` performs the same eligibility predicate without
 acquiring callback leases and supports the close-mode lifetime decision made before process creation.
 
-- [ ] **Step 2: Run ordering tests and verify RED**
+- [x] **Step 2: Run ordering tests and verify RED**
 
 ```powershell
 .\gradlew.bat :HMCL:test --tests "org.jackhuang.hmcl.plugin.PluginHookSubscriberOrderTest" --no-daemon --stacktrace
@@ -541,7 +565,7 @@ acquiring callback leases and supports the close-mode lifetime decision made bef
 
 Expected: test compilation fails because endpoint/subscriber types and the snapshot method do not exist.
 
-- [ ] **Step 3: Add a runtime-neutral endpoint and guarded value callback**
+- [x] **Step 3: Add a runtime-neutral endpoint and guarded value callback**
 
 ```java
 @FunctionalInterface
@@ -573,7 +597,7 @@ URLClassLoader. The close path logs an `IOException` without throwing into plugi
 Add tests proving an unload request cannot close a class loader while a Hook lease is active and
 that the last release performs the deferred close exactly once.
 
-- [ ] **Step 4: Implement deterministic snapshot selection and topological sorting**
+- [x] **Step 4: Implement deterministic snapshot selection and topological sorting**
 
 Under `stateLock.readLock`, copy only containers that are loaded, enabled, schema v5, declare the
 point, and whose exact loaded `PluginContext.getGrantedPermissions()` contains `LAUNCHER_HOOK`.
@@ -583,7 +607,7 @@ otherwise eligible loaded plugin is represented by an endpoint that throws a cat
 infrastructure error; it is never silently filtered. Acquire each container lease while taking the
 snapshot. If snapshot construction or sorting fails, close every lease already acquired.
 
-- [ ] **Step 5: Run ordering/lifecycle tests and Checkstyle GREEN**
+- [x] **Step 5: Run ordering/lifecycle tests and Checkstyle GREEN**
 
 ```powershell
 .\gradlew.bat :HMCL:test --tests "org.jackhuang.hmcl.plugin.PluginHookSubscriberOrderTest" --tests "org.jackhuang.hmcl.plugin.PluginManagerContextClassLoaderTest" --tests "org.jackhuang.hmcl.plugin.PluginManagerLifecycleStateTest" --no-daemon --stacktrace
@@ -592,7 +616,7 @@ snapshot. If snapshot construction or sorting fails, close every lease already a
 
 Expected: both commands succeed and the established enable/disable dependency behavior is unchanged.
 
-- [ ] **Step 6: Commit subscriber snapshots**
+- [x] **Step 6: Commit subscriber snapshots**
 
 ```powershell
 git add HMCL/src/main/java/org/jackhuang/hmcl/plugin/PluginAdministrativeGuard.java
@@ -611,7 +635,7 @@ git commit -m "Order eligible plugin hook subscribers"
 - Create: `HMCL/src/main/java/org/jackhuang/hmcl/plugin/PluginHookDispatchException.java`
 - Create: `HMCL/src/main/java/org/jackhuang/hmcl/plugin/PluginHookDispatcher.java`
 
-- [ ] **Step 1: Write dispatcher behavior tests**
+- [x] **Step 1: Write dispatcher behavior tests**
 
 Use direct subscriber doubles rather than Plugin Manager. Cover ordered chaining, unchanged,
 replacement, cancellation, invalid cancellation on after, exception, null result, malformed data,
@@ -634,7 +658,7 @@ public void beforeDispatchCommitsOnlyValidatedCompleteResults() throws Exception
 }
 ```
 
-- [ ] **Step 2: Run dispatcher tests and verify RED**
+- [x] **Step 2: Run dispatcher tests and verify RED**
 
 ```powershell
 .\gradlew.bat :HMCL:test --tests "org.jackhuang.hmcl.plugin.PluginHookDispatcherTest" --no-daemon --stacktrace
@@ -642,7 +666,7 @@ public void beforeDispatchCommitsOnlyValidatedCompleteResults() throws Exception
 
 Expected: test compilation fails because dispatcher and categorized exception types do not exist.
 
-- [ ] **Step 3: Implement the dispatcher and injected policy**
+- [x] **Step 3: Implement the dispatcher and injected policy**
 
 The constructor accepts a daemon `ExecutorService`, `Duration timeout`, `Clock`, and subscriber
 source. Production uses a bounded executor and 30 seconds. Use these package-private generic policy
@@ -693,7 +717,7 @@ idempotent subscriber close so a task cancelled before it starts releases immedi
 failure or cancellation closes every subscriber not yet submitted. The outer dispatch `finally`
 also closes untouched entries, preventing snapshot leases from escaping any path.
 
-- [ ] **Step 4: Run dispatcher tests and Checkstyle GREEN**
+- [x] **Step 4: Run dispatcher tests and Checkstyle GREEN**
 
 ```powershell
 .\gradlew.bat :HMCL:test --tests "org.jackhuang.hmcl.plugin.PluginHookDispatcherTest" --no-daemon --stacktrace
@@ -703,7 +727,7 @@ also closes untouched entries, preventing snapshot leases from escaping any path
 Expected: both commands succeed, timeout tests complete under two seconds, and the non-cooperative
 callback runs on a daemon worker without mutating committed output.
 
-- [ ] **Step 5: Commit transactional dispatch**
+- [x] **Step 5: Commit transactional dispatch**
 
 ```powershell
 git add HMCL/src/main/java/org/jackhuang/hmcl/plugin/PluginHookDispatchException.java
@@ -720,7 +744,7 @@ git commit -m "Dispatch plugin hooks transactionally"
 - Modify: `HMCL/src/main/java/org/jackhuang/hmcl/game/HMCLGameLauncher.java`
 - Modify: `HMCL/src/main/java/org/jackhuang/hmcl/plugin/PluginHookPoint.java`
 
-- [ ] **Step 1: Write before-policy coordinator tests**
+- [x] **Step 1: Write before-policy coordinator tests**
 
 Test no-subscriber identity, structured edit, raw replacement, environment/working-directory/
 pre/post/visibility edits, sequential plugin transforms, permission-specific secret access, script
@@ -741,7 +765,7 @@ public void cancellationReturnsNoExecutablePreparation() {
 }
 ```
 
-- [ ] **Step 2: Run coordinator tests and verify RED**
+- [x] **Step 2: Run coordinator tests and verify RED**
 
 ```powershell
 .\gradlew.bat :HMCL:test --tests "org.jackhuang.hmcl.plugin.GameLaunchHookCoordinatorTest" --no-daemon --stacktrace
@@ -749,7 +773,7 @@ public void cancellationReturnsNoExecutablePreparation() {
 
 Expected: test compilation fails because the coordinator does not exist.
 
-- [ ] **Step 3: Implement a launch-scoped coordinator session**
+- [x] **Step 3: Implement a launch-scoped coordinator session**
 
 `beforeLaunch` creates a UUID dispatch ID, captures start `Instant`, initializes
 `GameLaunchSecretStore` from `LaunchPreparation.secrets()`, encodes immutable metadata, runs
@@ -761,7 +785,7 @@ preparation.
 Update `PluginHookPoint` documentation to state that both game-launch points are now executable and
 the other ten remain declaration-only.
 
-- [ ] **Step 4: Compose the coordinator in HMCLGameLauncher**
+- [x] **Step 4: Compose the coordinator in HMCLGameLauncher**
 
 Add a package-private injectable constructor for tests and preserve public constructors by using the
 process-wide coordinator. Override direct and script methods as:
@@ -787,7 +811,7 @@ public void makeLaunchScript(Path scriptFile) throws IOException {
 Translate Hook cancellation into an `IOException` subtype whose message is shown by the existing
 launch task. Script sessions never allocate an after observer or shutdown lease.
 
-- [ ] **Step 5: Run before integration tests GREEN**
+- [x] **Step 5: Run before integration tests GREEN**
 
 ```powershell
 .\gradlew.bat :HMCL:test --tests "org.jackhuang.hmcl.plugin.GameLaunchHookCoordinatorTest" --no-daemon --stacktrace
@@ -798,7 +822,7 @@ launch task. Script sessions never allocate an after observer or shutdown lease.
 Expected: all commands succeed; direct and script sessions consume the coordinator's returned plan,
 and cancellation happens before native extraction, auxiliary commands, or process creation.
 
-- [ ] **Step 6: Commit before-game-launch execution**
+- [x] **Step 6: Commit before-game-launch execution**
 
 ```powershell
 git add HMCL/src/main/java/org/jackhuang/hmcl/plugin/GameLaunchHookCoordinator.java
@@ -816,7 +840,7 @@ git commit -m "Execute before game launch hooks"
 - Modify: `HMCL/src/main/java/org/jackhuang/hmcl/plugin/GameLaunchHookCoordinator.java`
 - Modify: `HMCL/src/main/java/org/jackhuang/hmcl/game/HMCLGameLauncher.java`
 
-- [ ] **Step 1: Write process-listener composition tests**
+- [x] **Step 1: Write process-listener composition tests**
 
 Use a fake `Process` wrapped by `ManagedProcess` and a delegate probe. Assert delegate `setProcess`,
 logs, and exit callbacks are preserved; PID/start/end/duration/exit kind are encoded; normal,
@@ -838,7 +862,7 @@ public void exitDispatchesAfterOnceAndPreservesDelegate() {
 }
 ```
 
-- [ ] **Step 2: Run listener tests and verify RED**
+- [x] **Step 2: Run listener tests and verify RED**
 
 ```powershell
 .\gradlew.bat :HMCL:test --tests "org.jackhuang.hmcl.game.GameLaunchHookProcessListenerTest" --no-daemon --stacktrace
@@ -846,7 +870,7 @@ public void exitDispatchesAfterOnceAndPreservesDelegate() {
 
 Expected: test compilation fails because the composing listener does not exist.
 
-- [ ] **Step 3: Implement listener composition and after policy**
+- [x] **Step 3: Implement listener composition and after policy**
 
 The listener stores process/PID and an `AtomicBoolean exited`. It delegates `setProcess` and `onLog`.
 On the first exit it invokes the original delegate in `try`, then coordinator after dispatch in
@@ -868,7 +892,7 @@ If there is no eligible after subscriber, return the original listener unchanged
 not performed by the listener: `DefaultLauncher` calls `session.finishExit()` only after the listener
 and resolved post-exit command have both completed.
 
-- [ ] **Step 4: Run listener, coordinator, and core exit tests GREEN**
+- [x] **Step 4: Run listener, coordinator, and core exit tests GREEN**
 
 ```powershell
 .\gradlew.bat :HMCL:test --tests "org.jackhuang.hmcl.game.GameLaunchHookProcessListenerTest" --tests "org.jackhuang.hmcl.plugin.GameLaunchHookCoordinatorTest" --no-daemon --stacktrace
