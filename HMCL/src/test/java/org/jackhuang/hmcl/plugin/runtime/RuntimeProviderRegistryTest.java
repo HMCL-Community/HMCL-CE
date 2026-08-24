@@ -26,13 +26,22 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// Verifies multi-provider registration, deterministic selection, and dependent-scoped bindings.
@@ -60,6 +69,108 @@ public final class RuntimeProviderRegistryTest {
         registry.unbind("dev.plugin.pinned");
         registry.unregister("dev.host.rust.a");
         assertFalse(registry.findById("dev.host.rust.a").isPresent());
+    }
+
+    /// Skips a statically compatible provider whose live ABI check fails and binds the next ranked provider.
+    @Test
+    public void fallBackWhenPreferredProviderFailsLiveAbiCheck() {
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        AtomicInteger preferredChecks = new AtomicInteger();
+        AtomicInteger fallbackChecks = new AtomicInteger();
+        registry.register(liveProvider("dev.host.rust.preferred", "2.0.0", () -> {
+            preferredChecks.incrementAndGet();
+            return false;
+        }));
+        registry.register(liveProvider("dev.host.rust.fallback", "1.0.0", () -> {
+            fallbackChecks.incrementAndGet();
+            return true;
+        }));
+
+        RuntimeProviderBinding binding = registry.bind("dev.plugin.dynamic", requirement("rust", null));
+
+        assertEquals("dev.host.rust.fallback", binding.providerId());
+        assertEquals(1, preferredChecks.get());
+        assertEquals(1, fallbackChecks.get());
+    }
+
+    /// Makes a live-incompatible explicit provider pin fail closed without probing a compatible fallback.
+    @Test
+    public void failClosedWhenPinnedProviderFailsLiveAbiCheck() {
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        AtomicInteger fallbackChecks = new AtomicInteger();
+        registry.register(liveProvider("dev.host.rust.pinned", "1.0.0", () -> false));
+        registry.register(liveProvider("dev.host.rust.fallback", "2.0.0", () -> {
+            fallbackChecks.incrementAndGet();
+            return true;
+        }));
+
+        assertThrows(IllegalStateException.class, () -> registry.bind(
+                "dev.plugin.pinned.dynamic", requirement("rust", "dev.host.rust.pinned")));
+        assertEquals(0, fallbackChecks.get());
+        assertTrue(registry.bindingFor("dev.plugin.pinned.dynamic").isEmpty());
+    }
+
+    /// Retries selection when a live ABI callback unregisters its own candidate before binding publication.
+    @Test
+    public void retryWhenLiveAbiCallbackUnregistersProvider() {
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        RuntimeProvider selfRemoving = liveProvider("dev.host.rust.removed", "2.0.0", () -> {
+            registry.unregister("dev.host.rust.removed");
+            return true;
+        });
+        registry.register(selfRemoving);
+        registry.register(liveProvider("dev.host.rust.fallback", "1.0.0", () -> true));
+
+        RuntimeProviderBinding binding = assertTimeoutPreemptively(Duration.ofSeconds(5),
+                () -> registry.bind("dev.plugin.self-removing", requirement("rust", null)));
+
+        assertEquals("dev.host.rust.fallback", binding.providerId());
+        assertTrue(registry.findById("dev.host.rust.removed").isEmpty());
+        assertThrows(IllegalStateException.class, () -> registry.unregister("dev.host.rust.fallback"));
+    }
+
+    /// Revalidates provider identity when the registered instance changes during an unlocked live ABI callback.
+    @Test
+    public void retryWhenProviderInstanceChangesDuringLiveAbiCheck() throws Exception {
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        CountDownLatch checkStarted = new CountDownLatch(1);
+        CountDownLatch allowCheckToFinish = new CountDownLatch(1);
+        AtomicInteger originalChecks = new AtomicInteger();
+        AtomicInteger replacementChecks = new AtomicInteger();
+        RuntimeProvider original = liveProvider("dev.host.rust.racing", "1.0.0", () -> {
+            originalChecks.incrementAndGet();
+            checkStarted.countDown();
+            try {
+                return allowCheckToFinish.await(5, TimeUnit.SECONDS);
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        });
+        RuntimeProvider replacement = liveProvider("dev.host.rust.racing", "1.0.0", () -> {
+            replacementChecks.incrementAndGet();
+            return true;
+        });
+        registry.register(original);
+
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<RuntimeProviderBinding> result = executor.submit(
+                    () -> registry.bind("dev.plugin.racing", requirement("rust", null)));
+            assertTrue(checkStarted.await(5, TimeUnit.SECONDS));
+            registry.unregister("dev.host.rust.racing");
+            registry.register(replacement);
+            allowCheckToFinish.countDown();
+
+            assertEquals("dev.host.rust.racing", result.get(5, TimeUnit.SECONDS).providerId());
+        } finally {
+            allowCheckToFinish.countDown();
+            executor.shutdownNow();
+        }
+
+        assertEquals(1, originalChecks.get());
+        assertEquals(1, replacementChecks.get());
+        assertSame(replacement, registry.findById("dev.host.rust.racing").orElseThrow());
     }
 
     /// Prefers enabled installed providers before disabled installed and remote candidates.
@@ -332,6 +443,30 @@ public final class RuntimeProviderRegistryTest {
             @Override
             public RuntimeProviderDescriptor descriptor() {
                 return descriptor;
+            }
+        };
+    }
+
+    /// Creates one descriptor-backed Rust provider with a caller-controlled live ABI response.
+    ///
+    /// @param providerId provider plugin ID
+    /// @param version provider version
+    /// @param liveSupport current live ABI response
+    /// @return test runtime provider
+    private static RuntimeProvider liveProvider(String providerId, String version, BooleanSupplier liveSupport) {
+        RuntimeProviderDescriptor descriptor = provider(providerId, "rust", version, true, true, 0, 1,
+                Set.of(PluginExecutionMode.EMBEDDED), Set.of(RuntimeFeature.BRIDGE)).descriptor();
+        return new RuntimeProvider() {
+            /// Returns the immutable test descriptor.
+            @Override
+            public RuntimeProviderDescriptor descriptor() {
+                return descriptor;
+            }
+
+            /// Returns the caller-controlled live ABI availability.
+            @Override
+            public boolean supportsAbi(String runtime, int requiredAbi) {
+                return liveSupport.getAsBoolean();
             }
         };
     }

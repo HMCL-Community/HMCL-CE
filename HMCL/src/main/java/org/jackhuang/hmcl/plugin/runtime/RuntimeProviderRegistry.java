@@ -27,6 +27,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.stream.Collectors;
 
@@ -47,6 +48,9 @@ public final class RuntimeProviderRegistry {
 
     /// Immutable descriptors captured once when each provider is registered.
     private final Map<String, RuntimeProviderDescriptor> descriptorsById = new LinkedHashMap<>();
+
+    /// Monotonic generation changed after every successful provider registration mutation.
+    private long registrationGeneration;
 
     /// Immutable candidate snapshots keyed by canonical runtime identifier.
     private volatile @Unmodifiable Map<String, @Unmodifiable List<RuntimeProviderDescriptor>> candidatesByRuntime =
@@ -89,6 +93,7 @@ public final class RuntimeProviderRegistry {
         }
         descriptorsById.put(descriptor.providerId(), descriptor);
         rebuildCandidateSnapshots();
+        registrationGeneration++;
     }
 
     /// Removes one provider by provider plugin ID after confirming no dependent remains bound.
@@ -113,6 +118,7 @@ public final class RuntimeProviderRegistry {
         providersById.remove(canonicalProviderId);
         descriptorsById.remove(canonicalProviderId);
         rebuildCandidateSnapshots();
+        registrationGeneration++;
     }
 
     /// Binds one dependent plugin to its pinned or highest-ranked compatible registered provider.
@@ -121,22 +127,44 @@ public final class RuntimeProviderRegistry {
     /// @param requirement runtime capability requirement
     /// @return immutable selected binding
     /// @throws IllegalStateException if the dependent is already bound or no compatible provider exists
-    public synchronized RuntimeProviderBinding bind(
+    public RuntimeProviderBinding bind(
             String dependentPluginId,
             RuntimeRequirement requirement) {
         if (!PluginManifest.isCanonicalExecutableId(dependentPluginId)) {
             throw new IllegalArgumentException("Dependent plugin ID must be canonical: " + dependentPluginId);
         }
-        if (bindingsByDependent.containsKey(dependentPluginId)) {
-            throw new IllegalStateException("Plugin already has a runtime provider binding: " + dependentPluginId);
+        while (true) {
+            BindingSnapshot snapshot = snapshotBindingCandidates(dependentPluginId, requirement);
+            if (snapshot.candidates().isEmpty()) {
+                throw noCompatibleProvider(requirement);
+            }
+
+            boolean retry = false;
+            for (BindingCandidate candidate : snapshot.candidates()) {
+                boolean supportsAbi = candidate.provider()
+                        .supportsAbi(requirement.getRuntime(), requirement.getPluginAbi());
+                synchronized (this) {
+                    ensureUnbound(dependentPluginId);
+                    if (!isCurrent(snapshot, candidate, requirement)) {
+                        retry = true;
+                        break;
+                    }
+                    if (!supportsAbi) {
+                        if (requirement.getPinnedProviderId() != null) {
+                            throw noCompatibleProvider(requirement);
+                        }
+                        continue;
+                    }
+                    RuntimeProviderBinding binding = new RuntimeProviderBinding(
+                            dependentPluginId, candidate.descriptor().providerId(), requirement.getRuntime());
+                    bindingsByDependent.put(dependentPluginId, binding);
+                    return binding;
+                }
+            }
+            if (!retry) {
+                throw noCompatibleProvider(requirement);
+            }
         }
-        RuntimeProviderDescriptor selected = selector.select(requirement, candidates(requirement.getRuntime()))
-                .orElseThrow(() -> new IllegalStateException(
-                        "No compatible runtime provider is registered for " + requirement.getRuntime()));
-        RuntimeProviderBinding binding = new RuntimeProviderBinding(
-                dependentPluginId, selected.providerId(), requirement.getRuntime());
-        bindingsByDependent.put(dependentPluginId, binding);
-        return binding;
     }
 
     /// Removes and returns one dependent plugin binding.
@@ -203,6 +231,69 @@ public final class RuntimeProviderRegistry {
         return providersById.size();
     }
 
+    /// Captures statically compatible providers and their exact registered instances for one binding attempt.
+    ///
+    /// @param dependentPluginId dependent plugin ID
+    /// @param requirement runtime requirement
+    /// @return immutable binding-attempt snapshot
+    private synchronized BindingSnapshot snapshotBindingCandidates(
+            String dependentPluginId,
+            RuntimeRequirement requirement) {
+        ensureUnbound(dependentPluginId);
+        @Unmodifiable List<RuntimeProviderDescriptor> compatibleDescriptors;
+        if (requirement.getPinnedProviderId() != null) {
+            compatibleDescriptors = selector.select(requirement, candidates(requirement.getRuntime()))
+                    .map(List::of)
+                    .orElseGet(List::of);
+        } else {
+            compatibleDescriptors = selector.ordered(candidates(requirement.getRuntime())).stream()
+                    .filter(descriptor -> selector.isCompatible(descriptor, requirement))
+                    .toList();
+        }
+        @Unmodifiable List<BindingCandidate> candidates = compatibleDescriptors.stream()
+                .map(descriptor -> new BindingCandidate(
+                        descriptor, Objects.requireNonNull(providersById.get(descriptor.providerId()),
+                                "Registered runtime provider disappeared: " + descriptor.providerId())))
+                .toList();
+        return new BindingSnapshot(registrationGeneration, candidates);
+    }
+
+    /// Returns whether a callback result still describes the same registered and statically compatible candidate.
+    ///
+    /// @param snapshot binding-attempt snapshot
+    /// @param candidate candidate whose callback completed
+    /// @param requirement runtime requirement
+    /// @return whether the candidate can be considered for binding publication
+    private synchronized boolean isCurrent(
+            BindingSnapshot snapshot,
+            BindingCandidate candidate,
+            RuntimeRequirement requirement) {
+        String providerId = candidate.descriptor().providerId();
+        return registrationGeneration == snapshot.registrationGeneration()
+                && providersById.get(providerId) == candidate.provider()
+                && descriptorsById.get(providerId) == candidate.descriptor()
+                && selector.isCompatible(candidate.descriptor(), requirement);
+    }
+
+    /// Rejects a binding attempt when the dependent already owns a published binding.
+    ///
+    /// @param dependentPluginId dependent plugin ID
+    /// @throws IllegalStateException if the dependent is already bound
+    private synchronized void ensureUnbound(String dependentPluginId) {
+        if (bindingsByDependent.containsKey(dependentPluginId)) {
+            throw new IllegalStateException("Plugin already has a runtime provider binding: " + dependentPluginId);
+        }
+    }
+
+    /// Creates the consistent failure used when no static and live-compatible provider remains.
+    ///
+    /// @param requirement unsatisfied runtime requirement
+    /// @return binding failure
+    private static IllegalStateException noCompatibleProvider(RuntimeRequirement requirement) {
+        return new IllegalStateException(
+                "No compatible runtime provider is registered for " + requirement.getRuntime());
+    }
+
     /// Rebuilds immutable runtime candidate lists after a provider registration mutation.
     private void rebuildCandidateSnapshots() {
         Map<String, List<RuntimeProviderDescriptor>> mutable = new LinkedHashMap<>();
@@ -226,5 +317,21 @@ public final class RuntimeProviderRegistry {
             throw new IllegalArgumentException("Invalid runtime provider ID: " + providerId);
         }
         return canonical;
+    }
+
+    /// Captures one immutable descriptor and the exact provider instance registered for it.
+    ///
+    /// @param descriptor registered immutable descriptor
+    /// @param provider registered provider instance
+    private record BindingCandidate(RuntimeProviderDescriptor descriptor, RuntimeProvider provider) {
+    }
+
+    /// Captures ordered candidates under one provider-registration generation.
+    ///
+    /// @param registrationGeneration provider-registration generation
+    /// @param candidates immutable ordered binding candidates
+    private record BindingSnapshot(
+            long registrationGeneration,
+            @Unmodifiable List<BindingCandidate> candidates) {
     }
 }
