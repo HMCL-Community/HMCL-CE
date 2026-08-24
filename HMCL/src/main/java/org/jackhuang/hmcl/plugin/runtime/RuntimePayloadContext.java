@@ -18,8 +18,10 @@
 package org.jackhuang.hmcl.plugin.runtime;
 
 import org.jackhuang.hmcl.plugin.PluginArtifactIdentity;
+import org.jackhuang.hmcl.plugin.internal.VerifiedPluginPackage;
 import org.jetbrains.annotations.NotNullByDefault;
 
+import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Objects;
 import java.util.function.Supplier;
@@ -62,9 +64,7 @@ public final class RuntimePayloadContext {
             PluginExecutionMode executionMode,
             Path dataDirectory,
             Supplier<?> capabilityTokenSupplier) {
-        if (entrypoint.isBlank() || !entrypoint.equals(entrypoint.trim())) {
-            throw new IllegalArgumentException("Runtime payload entrypoint must be normalized and non-blank");
-        }
+        validateEntrypoint(entrypoint);
         this.artifactIdentity = Objects.requireNonNull(artifactIdentity, "artifactIdentity");
         this.packagePath = packagePath.toAbsolutePath().normalize();
         this.entrypoint = entrypoint;
@@ -101,5 +101,20 @@ public final class RuntimePayloadContext {
     /// Returns the supplier of current plugin-scoped capability authority.
     public Supplier<?> capabilityTokenSupplier() {
         return capabilityTokenSupplier;
+    }
+
+    /// Validates one runtime-owned entrypoint against the shared package-relative path contract.
+    ///
+    /// @param entrypoint runtime-owned package path
+    /// @throws IllegalArgumentException if the path is absolute, platform-specific, escaping, or non-normalized
+    private static void validateEntrypoint(String entrypoint) {
+        if (!entrypoint.equals(entrypoint.trim())) {
+            throw new IllegalArgumentException("Runtime payload entrypoint must not contain outer whitespace");
+        }
+        try {
+            VerifiedPluginPackage.parseSafeRelativePath(entrypoint);
+        } catch (IOException exception) {
+            throw new IllegalArgumentException("Unsafe runtime payload entrypoint: " + entrypoint, exception);
+        }
     }
 }

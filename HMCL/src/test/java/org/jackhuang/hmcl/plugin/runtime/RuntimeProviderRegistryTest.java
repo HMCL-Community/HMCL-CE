@@ -22,6 +22,8 @@ import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Unmodifiable;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Path;
 import java.util.List;
@@ -226,6 +228,42 @@ public final class RuntimeProviderRegistryTest {
         assertEquals(PluginExecutionMode.EMBEDDED, context.executionMode());
         assertEquals(temporaryDirectory.toAbsolutePath().normalize(), context.dataDirectory());
         assertSame(token, context.capabilityTokenSupplier().get());
+    }
+
+    /// Rejects absolute, platform-specific, escaping, empty-segment, and non-normalized payload entrypoints.
+    ///
+    /// @param entrypoint unsafe runtime-owned package path
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "",
+            " ",
+            "/payload/plugin.dll",
+            "C:/payload/plugin.dll",
+            "C:\\payload\\plugin.dll",
+            "\\\\server\\share\\plugin.dll",
+            "payload\\plugin.dll",
+            ".",
+            "..",
+            "./payload.dll",
+            "payload/./plugin.dll",
+            "payload/../plugin.dll",
+            "payload//plugin.dll",
+            "payload/",
+            " payload/plugin.dll",
+            "payload/plugin.dll "
+    })
+    public void rejectUnsafeRuntimePayloadEntrypoint(String entrypoint) {
+        PluginArtifactIdentity identity = new PluginArtifactIdentity(
+                "dev.plugin.payload", "1.0.0", "a".repeat(64));
+
+        assertThrows(IllegalArgumentException.class, () -> new RuntimePayloadContext(
+                identity,
+                Path.of("package"),
+                entrypoint,
+                PluginExecutionMode.EMBEDDED,
+                Path.of("data"),
+                Object::new
+        ));
     }
 
     /// Keeps runtime payload handles opaque and rejects malformed owner identities.

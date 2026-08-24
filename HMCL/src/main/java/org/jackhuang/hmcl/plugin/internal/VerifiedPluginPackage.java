@@ -606,7 +606,7 @@ public final class VerifiedPluginPackage {
     /// @param value manifest path
     /// @return safe relative path
     /// @throws IOException if the path is absolute, empty, malformed, or escapes the package
-    private static Path parseSafeRelativePath(String value) throws IOException {
+    public static Path parseSafeRelativePath(String value) throws IOException {
         try {
             if (value.isBlank()
                     || value.indexOf('\\') >= 0
