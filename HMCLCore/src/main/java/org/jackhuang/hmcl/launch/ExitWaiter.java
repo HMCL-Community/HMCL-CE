@@ -25,70 +25,104 @@ import org.jackhuang.hmcl.util.Log4jLevel;
 import org.jackhuang.hmcl.util.StringUtils;
 import org.jackhuang.hmcl.util.platform.ManagedProcess;
 import org.jackhuang.hmcl.util.platform.OperatingSystem;
+import org.jetbrains.annotations.NotNullByDefault;
+import org.jetbrains.annotations.Unmodifiable;
 
 import java.util.Collection;
 import java.util.List;
 import java.util.function.BiConsumer;
 
-/**
- * @author huangyuhui
- */
+/// Waits for raw process termination, joins its stream pumps, and emits one terminal callback.
+///
+/// @author huangyuhui
+@NotNullByDefault
 final class ExitWaiter implements Runnable {
-
+    /// Managed process whose raw lifetime is observed.
     private final ManagedProcess process;
-    private final Collection<Thread> joins;
+    /// Immutable stream-pump threads that must finish before the exit callback.
+    private final @Unmodifiable List<Thread> joins;
+    /// Consumer invoked exactly once after raw process exit and stream completion.
     private final BiConsumer<Integer, ProcessListener.ExitType> watcher;
 
-    /**
-     * Constructor.
-     *
-     * @param process the process to wait for
-     * @param watcher the callback that will be called after process stops.
-     */
+    /// Creates an exit waiter.
+    ///
+    /// @param process process to wait for
+    /// @param joins stream-pump threads to join after raw process exit
+    /// @param watcher callback invoked after the process and stream pumps stop
     public ExitWaiter(ManagedProcess process, Collection<Thread> joins, BiConsumer<Integer, ProcessListener.ExitType> watcher) {
         this.process = process;
-        this.joins = joins;
+        this.joins = List.copyOf(joins);
         this.watcher = watcher;
     }
 
+    /// Waits through launcher interruptions until the raw process and stream pumps have terminated.
     @Override
     public void run() {
-        try {
-            int exitCode = process.getProcess().waitFor();
+        boolean interrupted = false;
+        int exitCode;
 
-            for (Thread thread : joins)
-                thread.join();
+        while (true) {
+            try {
+                exitCode = process.getProcess().waitFor();
+                break;
+            } catch (InterruptedException e) {
+                interrupted = true;
+            }
+        }
 
-            List<String> errorLines = process.getLines(Log4jLevel::guessLogLineError);
-            ProcessListener.ExitType exitType;
-
-            // LaunchWrapper will catch the exception logged and will exit normally.
-            if (exitCode != 0 && StringUtils.containsOne(errorLines,
-                    "Could not create the Java Virtual Machine.",
-                    "Error occurred during initialization of VM",
-                    "A fatal exception has occurred. Program will exit.")) {
-                EventBus.EVENT_BUS.fireEvent(new JVMLaunchFailedEvent(this, process));
-                exitType = ProcessListener.ExitType.JVM_ERROR;
-            } else if (exitCode != 0 || StringUtils.containsOne(errorLines,
-                    "Crash report saved to", "Could not save crash report to", "This crash report has been saved to:",
-                    "Unable to launch", "An exception was thrown, the game will display an error screen and halt.")) {
-                EventBus.EVENT_BUS.fireEvent(new ProcessExitedAbnormallyEvent(this, process));
-
-                if (exitCode == 137 && OperatingSystem.CURRENT_OS.isLinuxOrBSD()) {
-                    exitType = ProcessListener.ExitType.SIGKILL;
-                } else {
-                    exitType = ProcessListener.ExitType.APPLICATION_ERROR;
+        for (Thread thread : joins) {
+            while (thread.isAlive()) {
+                try {
+                    thread.join();
+                } catch (InterruptedException e) {
+                    interrupted = true;
                 }
+            }
+        }
+
+        try {
+            ProcessListener.ExitType exitType;
+            if (process.isLauncherStopRequested() || interrupted) {
+                exitType = ProcessListener.ExitType.INTERRUPTED;
             } else {
-                exitType = ProcessListener.ExitType.NORMAL;
+                exitType = classifyNaturalExit(exitCode);
             }
 
             EventBus.EVENT_BUS.fireEvent(new ProcessStoppedEvent(this, process));
-
             watcher.accept(exitCode, exitType);
-        } catch (InterruptedException e) {
-            watcher.accept(1, ProcessListener.ExitType.INTERRUPTED);
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
+    /// Classifies a raw process that was not stopped by launcher intent or waiter interruption.
+    ///
+    /// @param exitCode raw process exit code
+    /// @return natural process exit classification
+    private ProcessListener.ExitType classifyNaturalExit(int exitCode) {
+        List<String> errorLines = process.getLines(Log4jLevel::guessLogLineError);
+
+        // LaunchWrapper catches these logged VM failures and may otherwise exit normally.
+        if (exitCode != 0 && StringUtils.containsOne(errorLines,
+                "Could not create the Java Virtual Machine.",
+                "Error occurred during initialization of VM",
+                "A fatal exception has occurred. Program will exit.")) {
+            EventBus.EVENT_BUS.fireEvent(new JVMLaunchFailedEvent(this, process));
+            return ProcessListener.ExitType.JVM_ERROR;
+        } else if (exitCode != 0 || StringUtils.containsOne(errorLines,
+                "Crash report saved to", "Could not save crash report to", "This crash report has been saved to:",
+                "Unable to launch", "An exception was thrown, the game will display an error screen and halt.")) {
+            EventBus.EVENT_BUS.fireEvent(new ProcessExitedAbnormallyEvent(this, process));
+
+            if (exitCode == 137 && OperatingSystem.CURRENT_OS.isLinuxOrBSD()) {
+                return ProcessListener.ExitType.SIGKILL;
+            } else {
+                return ProcessListener.ExitType.APPLICATION_ERROR;
+            }
+        } else {
+            return ProcessListener.ExitType.NORMAL;
+        }
+    }
 }
