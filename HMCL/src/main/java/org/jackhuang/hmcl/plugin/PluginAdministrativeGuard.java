@@ -24,6 +24,7 @@ import org.jetbrains.annotations.Unmodifiable;
 import java.io.IOException;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.Callable;
 import java.util.function.Supplier;
 
 /// Rejects launcher-administrative calls made from ordinary plugin execution.
@@ -88,7 +89,7 @@ final class PluginAdministrativeGuard {
     ///
     /// @param callback plugin-owned callback
     void runPluginCallback(Runnable callback) {
-        callPluginCallback(() -> {
+        callPluginCallback((Supplier<Boolean>) () -> {
             callback.run();
             return Boolean.TRUE;
         });
@@ -120,6 +121,22 @@ final class PluginAdministrativeGuard {
         pluginCallbackDepth.set(previousDepth + 1);
         try {
             return callback.get();
+        } finally {
+            restoreCallbackDepth(previousDepth);
+        }
+    }
+
+    /// Calls one checked plugin-owned operation while administrative entry points are denied on the current thread.
+    ///
+    /// @param callback plugin-owned operation
+    /// @param <T> result type
+    /// @return callback result
+    /// @throws Exception if the plugin-owned operation fails
+    <T> T callPluginCallback(Callable<T> callback) throws Exception {
+        int previousDepth = pluginCallbackDepth.get();
+        pluginCallbackDepth.set(previousDepth + 1);
+        try {
+            return callback.call();
         } finally {
             restoreCallbackDepth(previousDepth);
         }

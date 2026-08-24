@@ -53,9 +53,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.PriorityQueue;
 import java.util.Set;
+import java.util.concurrent.Callable;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import static org.jackhuang.hmcl.util.logging.Logger.LOG;
@@ -802,6 +805,162 @@ public final class PluginManager {
     private void runPluginCallback(ClassLoader classLoader, Runnable callback) {
         administrativeGuard.runPluginCallback(() ->
                 JavaPluginLoader.runWithPluginContextClassLoader(classLoader, callback));
+    }
+
+    /// Calls one plugin callback with administrative APIs denied and the exact plugin loader installed as TCCL.
+    ///
+    /// @param classLoader loader that owns the plugin callback and resources
+    /// @param callback plugin-owned value callback
+    /// @param <T> callback result type
+    /// @return callback result
+    /// @throws Exception if the callback fails
+    <T> T runPluginCallback(ClassLoader classLoader, Callable<T> callback) throws Exception {
+        return administrativeGuard.callPluginCallback((Callable<T>) () -> {
+            Thread thread = Thread.currentThread();
+            @Nullable ClassLoader previousClassLoader = thread.getContextClassLoader();
+            thread.setContextClassLoader(classLoader);
+            try {
+                return callback.call();
+            } finally {
+                thread.setContextClassLoader(previousClassLoader);
+            }
+        });
+    }
+
+    /// Takes an immutable, leased snapshot of currently eligible subscribers in deterministic dependency order.
+    ///
+    /// The manager state lock is released before sorting and before any returned endpoint can execute. Callers must
+    /// close every returned subscriber after the endpoint has completed or permanently timed out.
+    ///
+    /// @param point dispatched Hook point
+    /// @return ordered immutable subscriber snapshot
+    @Unmodifiable List<PluginHookSubscriber> snapshotHookSubscribers(PluginHookPoint point) {
+        List<PluginHookSubscriber> subscribers = new ArrayList<>();
+        try {
+            stateLock.readLock().lock();
+            try {
+                for (PluginContainer container : pluginMap.values()) {
+                    PluginManifest manifest = container.getManifest();
+                    @Unmodifiable Set<PluginPermission> permissions =
+                            container.getContext().getGrantedPermissions();
+                    if (!isEligibleHookSubscriber(container, manifest, permissions, point)) {
+                        continue;
+                    }
+                    Runnable releaseLease = container.acquireHookLease();
+                    @Unmodifiable Set<String> dependencyIds = manifest.getPluginDependencies().stream()
+                            .map(PluginDependency::getId)
+                            .collect(Collectors.toUnmodifiableSet());
+                    PluginHookEndpoint endpoint = event -> runPluginCallback(
+                            container.getContext().getClassLoader(),
+                            () -> container.getPlugin().onHook(event)
+                    );
+                    subscribers.add(new PluginHookSubscriber(
+                            manifest.getId(),
+                            dependencyIds,
+                            permissions,
+                            endpoint,
+                            releaseLease
+                    ));
+                }
+            } finally {
+                stateLock.readLock().unlock();
+            }
+            return List.copyOf(orderHookSubscribers(subscribers));
+        } catch (RuntimeException | Error exception) {
+            subscribers.forEach(PluginHookSubscriber::close);
+            throw exception;
+        }
+    }
+
+    /// Returns whether at least one current plugin is eligible without retaining a callback or class-loader lease.
+    ///
+    /// @param point Hook point used for the eligibility decision
+    /// @return whether at least one eligible subscriber exists
+    boolean hasEligibleHookSubscriber(PluginHookPoint point) {
+        stateLock.readLock().lock();
+        try {
+            for (PluginContainer container : pluginMap.values()) {
+                PluginManifest manifest = container.getManifest();
+                @Unmodifiable Set<PluginPermission> permissions =
+                        container.getContext().getGrantedPermissions();
+                if (isEligibleHookSubscriber(container, manifest, permissions, point)) {
+                    return true;
+                }
+            }
+            return false;
+        } finally {
+            stateLock.readLock().unlock();
+        }
+    }
+
+    /// Applies the common loaded-container Hook eligibility predicate.
+    ///
+    /// @param container loaded plugin container
+    /// @param manifest authoritative loaded manifest
+    /// @param permissions exact-artifact effective permissions
+    /// @param point Hook point being queried
+    /// @return whether the plugin must participate
+    private static boolean isEligibleHookSubscriber(
+            PluginContainer container,
+            PluginManifest manifest,
+            Set<PluginPermission> permissions,
+            PluginHookPoint point
+    ) {
+        return container.isEnabled()
+                && manifest.getSchemaVersion() == PluginManifest.CURRENT_SCHEMA_VERSION
+                && manifest.getHooks().contains(point)
+                && permissions.contains(PluginPermission.LAUNCHER_HOOK);
+    }
+
+    /// Orders subscribers by dependency topology and canonical ID for every unrelated ready node.
+    ///
+    /// Dependencies absent from the eligible snapshot do not form dispatch edges.
+    ///
+    /// @param subscribers unordered leased snapshot
+    /// @return ordered subscriber list
+    private static List<PluginHookSubscriber> orderHookSubscribers(List<PluginHookSubscriber> subscribers) {
+        Map<String, PluginHookSubscriber> subscribersById = new HashMap<>();
+        Map<String, Integer> incomingEdges = new HashMap<>();
+        Map<String, List<String>> dependentsById = new HashMap<>();
+        for (PluginHookSubscriber subscriber : subscribers) {
+            if (subscribersById.put(subscriber.pluginId(), subscriber) != null) {
+                throw new IllegalStateException("Duplicate eligible plugin Hook subscriber: "
+                        + subscriber.pluginId());
+            }
+            incomingEdges.put(subscriber.pluginId(), 0);
+        }
+        for (PluginHookSubscriber subscriber : subscribers) {
+            for (String dependencyId : subscriber.dependencyIds()) {
+                if (!subscribersById.containsKey(dependencyId)) {
+                    continue;
+                }
+                incomingEdges.merge(subscriber.pluginId(), 1, Integer::sum);
+                dependentsById.computeIfAbsent(dependencyId, ignored -> new ArrayList<>())
+                        .add(subscriber.pluginId());
+            }
+        }
+
+        PriorityQueue<String> ready = new PriorityQueue<>();
+        incomingEdges.forEach((pluginId, incoming) -> {
+            if (incoming == 0) {
+                ready.add(pluginId);
+            }
+        });
+        List<PluginHookSubscriber> ordered = new ArrayList<>(subscribers.size());
+        while (!ready.isEmpty()) {
+            String pluginId = ready.remove();
+            ordered.add(Objects.requireNonNull(subscribersById.get(pluginId)));
+            for (String dependentId : dependentsById.getOrDefault(pluginId, List.of())) {
+                int remaining = incomingEdges.merge(dependentId, -1, Integer::sum);
+                if (remaining == 0) {
+                    ready.add(dependentId);
+                }
+            }
+        }
+        if (ordered.size() != subscribers.size()) {
+            throw new IllegalStateException("Eligible plugin Hook dependency graph contains a cycle");
+        }
+        return ordered;
     }
 
     /// Registers a prepared plugin and invokes `onLoad` on the JavaFX thread.

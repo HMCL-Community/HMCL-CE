@@ -25,6 +25,9 @@ import org.jetbrains.annotations.Nullable;
 import java.io.IOException;
 import java.net.URLClassLoader;
 import java.nio.file.Path;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import static org.jackhuang.hmcl.util.logging.Logger.LOG;
 
 /// Holds one loaded plugin instance together with its runtime state and package location.
 @NotNullByDefault
@@ -46,6 +49,15 @@ public final class PluginContainer {
 
     /// Optional plugin-owned value retained for compatibility with existing integrations.
     private @Nullable Object userData;
+
+    /// Number of dispatch snapshots currently retaining this container's callback endpoint.
+    private int activeHookLeases;
+
+    /// Whether unload requested that the dedicated class loader close after active callbacks finish.
+    private boolean classLoaderCloseRequested;
+
+    /// Whether the dedicated class loader close path has already been selected once.
+    private boolean classLoaderClosed;
 
     /// Creates a plugin container.
     ///
@@ -151,16 +163,78 @@ public final class PluginContainer {
         this.userData = userData;
     }
 
+    /// Acquires one callback lease that prevents the dedicated class loader from closing during Hook dispatch.
+    ///
+    /// @return idempotent lease release action
+    Runnable acquireHookLease() {
+        synchronized (this) {
+            if (classLoaderCloseRequested || classLoaderClosed) {
+                throw new IllegalStateException("Plugin class loader is already closing: " + getManifest().getId());
+            }
+            activeHookLeases++;
+        }
+        AtomicBoolean released = new AtomicBoolean();
+        return () -> {
+            if (released.compareAndSet(false, true)) {
+                releaseHookLease();
+            }
+        };
+    }
+
     /// Closes a dedicated plugin URL class loader when the plugin is unloadable.
     ///
     /// Startup Mixin plugins share HMCL's transforming loader and are intentionally left open for the process lifetime.
     ///
     /// @throws IOException if closing a dedicated loader fails
     void closeClassLoader() throws IOException {
-        ClassLoader pluginClassLoader = context.getClassLoader();
-        if (pluginClassLoader != PluginContainer.class.getClassLoader()
-                && pluginClassLoader instanceof URLClassLoader urlClassLoader) {
-            urlClassLoader.close();
+        @Nullable URLClassLoader classLoader;
+        synchronized (this) {
+            if (classLoaderCloseRequested || classLoaderClosed) {
+                return;
+            }
+            classLoaderCloseRequested = true;
+            if (activeHookLeases > 0) {
+                return;
+            }
+            classLoaderClosed = true;
+            classLoader = dedicatedClassLoader();
         }
+        if (classLoader != null) {
+            classLoader.close();
+        }
+    }
+
+    /// Releases one callback lease and performs a pending close after the final callback exits.
+    private void releaseHookLease() {
+        @Nullable URLClassLoader classLoader = null;
+        synchronized (this) {
+            if (activeHookLeases <= 0) {
+                throw new IllegalStateException("Plugin Hook lease count underflow: " + getManifest().getId());
+            }
+            activeHookLeases--;
+            if (activeHookLeases == 0 && classLoaderCloseRequested && !classLoaderClosed) {
+                classLoaderClosed = true;
+                classLoader = dedicatedClassLoader();
+            }
+        }
+        if (classLoader != null) {
+            try {
+                classLoader.close();
+            } catch (IOException exception) {
+                LOG.warning("Failed to close plugin class loader after Hook callback: "
+                        + getManifest().getId(), exception);
+            }
+        }
+    }
+
+    /// Returns the dedicated closeable loader, excluding HMCL's shared application loader.
+    ///
+    /// @return dedicated URL class loader, or `null` when the loader is shared or not closeable
+    private @Nullable URLClassLoader dedicatedClassLoader() {
+        ClassLoader pluginClassLoader = context.getClassLoader();
+        return pluginClassLoader != PluginContainer.class.getClassLoader()
+                && pluginClassLoader instanceof URLClassLoader urlClassLoader
+                ? urlClassLoader
+                : null;
     }
 }
