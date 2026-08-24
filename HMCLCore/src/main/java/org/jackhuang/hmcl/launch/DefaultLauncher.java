@@ -30,16 +30,18 @@ import org.jackhuang.hmcl.util.platform.*;
 import org.jackhuang.hmcl.util.platform.macos.HomebrewUtils;
 import org.jackhuang.hmcl.util.versioning.GameVersionNumber;
 import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.Unmodifiable;
 
 import java.io.*;
 import java.nio.charset.Charset;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.util.*;
+import java.util.function.Function;
 import java.util.function.Supplier;
+import java.util.regex.Pattern;
 
 import static org.jackhuang.hmcl.util.Lang.mapOf;
 import static org.jackhuang.hmcl.util.Pair.pair;
@@ -50,6 +52,10 @@ import static org.jackhuang.hmcl.util.logging.Logger.LOG;
  */
 public class DefaultLauncher extends Launcher {
 
+    /// Canonical launch-scoped slot that protects the authentication access token.
+    private static final String ACCESS_TOKEN_SECRET = "access-token";
+
+    /// Library feature analysis used while preparing the launch command and environment.
     private final LibraryAnalyzer analyzer;
 
     public DefaultLauncher(GameRepository repository, GameInstanceManifest manifest, AuthInfo authInfo, LaunchOptions options) {
@@ -66,7 +72,14 @@ public class DefaultLauncher extends Launcher {
         this.analyzer = LibraryAnalyzer.analyze(manifest, repository.getGameVersion(manifest).orElse(null));
     }
 
-    private Command generateCommandLine(Path nativeFolder) throws IOException {
+    /// Generates an immutable launch preparation without performing launch side effects.
+    ///
+    /// @param mode direct execution or script rendering
+    /// @param nativeFolder selected native-library directory
+    /// @return complete immutable preparation
+    /// @throws IOException if required launch inputs cannot be read
+    private LaunchPreparation generateLaunchPreparation(LaunchExecutionMode mode, Path nativeFolder)
+            throws IOException {
         CommandBuilder res = new CommandBuilder();
 
         switch (options.getProcessPriority()) {
@@ -107,6 +120,7 @@ public class DefaultLauncher extends Launcher {
         if (StringUtils.isNotBlank(options.getWrapper()))
             res.addAllWithoutParsing(StringUtils.tokenize(options.getWrapper(), getEnvVars(nativeFolder)));
 
+        int prefixTokenCount = res.asList().size();
         res.add(options.getJava().getBinary().toString());
 
         res.addAllWithoutParsingAndReadExternal(options.getOverrideJavaArguments());
@@ -355,6 +369,7 @@ public class DefaultLauncher extends Launcher {
             throw new IllegalStateException("Main class is null for instance " + manifest.id());
         }
 
+        int mainClassIndex = res.asList().size();
         res.add(manifest.mainClass());
 
         res.addAll(Arguments.parseStringArguments(Optional.ofNullable(manifest.minecraftArguments()).map(StringUtils::tokenize).orElseGet(ArrayList::new), configuration));
@@ -419,8 +434,181 @@ public class DefaultLauncher extends Launcher {
 
         res.addAllWithoutParsing(Arguments.parseStringArguments(options.getGameArguments(), configuration));
 
-        res.removeIf(it -> getForbiddens().containsKey(it) && getForbiddens().get(it).get());
-        return new Command(res, tempNativeFolder, javaNativeFolder, encoding);
+        List<String> generatedTokens = res.asList();
+        List<String> prefixTokens = filterForbidden(generatedTokens.subList(0, prefixTokenCount));
+        List<String> resolvedJvmArguments = filterForbidden(
+                generatedTokens.subList(prefixTokenCount + 1, mainClassIndex));
+        List<String> gameArguments = filterForbidden(generatedTokens.subList(mainClassIndex + 1,
+                generatedTokens.size()));
+        if (isForbidden(generatedTokens.get(prefixTokenCount))
+                || isForbidden(generatedTokens.get(mainClassIndex))) {
+            throw new IllegalStateException("Java executable and main class cannot be forbidden");
+        }
+
+        List<String> classpathEntries = extractTrailingClasspath(resolvedJvmArguments);
+        String accessToken = authInfo.getAccessToken();
+        LaunchCommandPlan command = LaunchCommandPlan.structuredJava(
+                protectSecrets(prefixTokens, accessToken),
+                protectSecret(generatedTokens.get(prefixTokenCount), accessToken),
+                protectSecrets(resolvedJvmArguments, accessToken),
+                protectSecrets(classpathEntries, accessToken),
+                protectSecret(generatedTokens.get(mainClassIndex), accessToken),
+                protectSecrets(gameArguments, accessToken)
+        );
+
+        Path runDirectory = FileUtils.toAbsolute(repository.getRunDirectory(manifest.id()));
+        Map<String, String> auxiliaryEnvironment = getEnvVars(nativeFolder);
+        @Nullable LaunchAuxiliaryProcessPlan preLaunch = auxiliaryProcess(
+                options.getPreLaunchCommand(), runDirectory, auxiliaryEnvironment, accessToken);
+        @Nullable LaunchAuxiliaryProcessPlan postExit = auxiliaryProcess(
+                options.getPostExitCommand(), FileUtils.toAbsolute(options.getGameDir()),
+                auxiliaryEnvironment, accessToken);
+
+        Map<String, String> processEnvironment = new LinkedHashMap<>(auxiliaryEnvironment);
+        @Nullable Path appdata = options.getGameDir().toAbsolutePath().getParent();
+        if (appdata != null) {
+            processEnvironment.put("APPDATA", appdata.toString());
+        }
+        LaunchProcessPlan plan = new LaunchProcessPlan(
+                LaunchProcessPlan.CURRENT_PLAN_VERSION,
+                mode,
+                command,
+                runDirectory,
+                true,
+                protectEnvironment(processEnvironment, accessToken),
+                Set.of(),
+                preLaunch,
+                postExit,
+                daemon ? "keep" : "close",
+                listener == null,
+                daemon
+        );
+        Map<String, String> secrets = Map.of(ACCESS_TOKEN_SECRET, accessToken);
+        plan.validate(secrets.keySet());
+        return new LaunchPreparation(plan, secrets, tempNativeFolder, FileUtils.toAbsolute(nativeFolder),
+                javaNativeFolder, encoding);
+    }
+
+    /// Filters launcher-forbidden tokens while preserving encounter order.
+    ///
+    /// @param tokens generated command tokens
+    /// @return mutable filtered token list
+    private List<String> filterForbidden(List<String> tokens) {
+        List<String> filtered = new ArrayList<>(tokens.size());
+        for (String token : tokens) {
+            if (!isForbidden(token)) {
+                filtered.add(token);
+            }
+        }
+        return filtered;
+    }
+
+    /// Returns whether one generated token is forbidden for the selected Java runtime.
+    ///
+    /// @param token generated token
+    /// @return whether the token must be removed
+    private boolean isForbidden(String token) {
+        @Nullable Supplier<Boolean> condition = getForbiddens().get(token);
+        return condition != null && condition.get();
+    }
+
+    /// Extracts a trailing `-cp` pair without changing the final command order.
+    ///
+    /// A non-trailing classpath pair remains among the JVM arguments because moving it would change
+    /// the existing command token order.
+    ///
+    /// @param jvmArguments mutable generated JVM arguments
+    /// @return mutable classpath entry list
+    private static List<String> extractTrailingClasspath(List<String> jvmArguments) {
+        int optionIndex = jvmArguments.size() - 2;
+        if (optionIndex < 0 || !"-cp".equals(jvmArguments.get(optionIndex))) {
+            return new ArrayList<>();
+        }
+        String classpath = jvmArguments.remove(optionIndex + 1);
+        jvmArguments.remove(optionIndex);
+        return new ArrayList<>(Arrays.asList(classpath.split(Pattern.quote(File.pathSeparator), -1)));
+    }
+
+    /// Creates an optional immutable auxiliary process from one configured command string.
+    ///
+    /// @param command configured command string
+    /// @param workingDirectory process working directory
+    /// @param environment inherited launcher environment additions
+    /// @param accessToken launch access token
+    /// @return auxiliary process plan, or `null` for a blank command
+    private static @Nullable LaunchAuxiliaryProcessPlan auxiliaryProcess(
+            @Nullable String command,
+            Path workingDirectory,
+            Map<String, String> environment,
+            String accessToken
+    ) {
+        if (StringUtils.isBlank(command)) {
+            return null;
+        }
+        return new LaunchAuxiliaryProcessPlan(
+                protectSecrets(StringUtils.tokenize(command, environment), accessToken),
+                workingDirectory,
+                true,
+                protectEnvironment(environment, accessToken),
+                Set.of()
+        );
+    }
+
+    /// Converts resolved environment values into immutable secret-aware plan text.
+    ///
+    /// @param environment resolved environment values
+    /// @param accessToken launch access token
+    /// @return immutable protected environment map
+    private static @Unmodifiable Map<String, LaunchPlanText> protectEnvironment(
+            Map<String, String> environment,
+            String accessToken
+    ) {
+        Map<String, LaunchPlanText> protectedEnvironment = new LinkedHashMap<>();
+        for (Map.Entry<String, String> entry : environment.entrySet()) {
+            protectedEnvironment.put(entry.getKey(), protectSecret(entry.getValue(), accessToken));
+        }
+        return Collections.unmodifiableMap(protectedEnvironment);
+    }
+
+    /// Converts resolved tokens into immutable secret-aware plan text.
+    ///
+    /// @param tokens resolved tokens
+    /// @param accessToken launch access token
+    /// @return immutable protected tokens
+    private static @Unmodifiable List<LaunchPlanText> protectSecrets(
+            List<String> tokens,
+            String accessToken
+    ) {
+        List<LaunchPlanText> protectedTokens = new ArrayList<>(tokens.size());
+        for (String token : tokens) {
+            protectedTokens.add(protectSecret(token, accessToken));
+        }
+        return List.copyOf(protectedTokens);
+    }
+
+    /// Replaces every access-token occurrence with an opaque secret segment.
+    ///
+    /// @param value resolved text
+    /// @param accessToken launch access token
+    /// @return immutable secret-aware text
+    private static LaunchPlanText protectSecret(String value, String accessToken) {
+        if (accessToken.isEmpty() || !value.contains(accessToken)) {
+            return LaunchPlanText.literal(value);
+        }
+        List<LaunchPlanText.Segment> segments = new ArrayList<>();
+        int offset = 0;
+        int match;
+        while ((match = value.indexOf(accessToken, offset)) >= 0) {
+            if (match > offset) {
+                segments.add(new LaunchPlanText.LiteralSegment(value.substring(offset, match)));
+            }
+            segments.add(new LaunchPlanText.SecretSegment(ACCESS_TOKEN_SECRET));
+            offset = match + accessToken.length();
+        }
+        if (offset < value.length()) {
+            segments.add(new LaunchPlanText.LiteralSegment(value.substring(offset)));
+        }
+        return LaunchPlanText.template(segments);
     }
 
     public Map<String, Boolean> getFeatures() {
@@ -564,56 +752,143 @@ public class DefaultLauncher extends Launcher {
 
     @Override
     public ManagedProcess launch() throws IOException, InterruptedException {
-        Path nativeFolder = getNativeFolder();
+        return executeLaunch(prepareLaunch(LaunchExecutionMode.DIRECT), listener);
+    }
 
-        final Command command = generateCommandLine(nativeFolder);
+    /// Prepares one immutable launch without extracting resources or starting processes.
+    ///
+    /// @param mode direct execution or script rendering
+    /// @return complete immutable launch preparation
+    /// @throws IOException if required launch inputs cannot be read
+    protected LaunchPreparation prepareLaunch(LaunchExecutionMode mode) throws IOException {
+        return generateLaunchPreparation(mode, getNativeFolder());
+    }
 
-        // To guarantee that when failed to generate launch command line, we will not call pre-launch command
-        List<String> rawCommandLine = command.commandLine.asList();
+    /// Executes one prepared direct launch with no additional exit cleanup.
+    ///
+    /// @param preparation immutable validated launch preparation
+    /// @param processListener optional process listener
+    /// @return managed game process
+    /// @throws IOException if resource preparation or process creation fails
+    /// @throws InterruptedException if an auxiliary process is interrupted
+    protected ManagedProcess executeLaunch(
+            LaunchPreparation preparation,
+            @Nullable ProcessListener processListener
+    ) throws IOException, InterruptedException {
+        return executeLaunch(preparation, processListener, () -> {
+        });
+    }
 
-        if (command.tempNativeFolder != null) {
-            Files.deleteIfExists(command.tempNativeFolder);
-            Files.createSymbolicLink(command.tempNativeFolder, nativeFolder.toAbsolutePath());
+    /// Executes one prepared direct launch and runs cleanup after listener and post-exit handling.
+    ///
+    /// @param preparation immutable validated launch preparation
+    /// @param processListener optional process listener
+    /// @param exitCleanup cleanup invoked after observed process exit handling
+    /// @return managed game process
+    /// @throws IOException if resource preparation or process creation fails
+    /// @throws InterruptedException if an auxiliary process is interrupted
+    protected ManagedProcess executeLaunch(
+            LaunchPreparation preparation,
+            @Nullable ProcessListener processListener,
+            Runnable exitCleanup
+    ) throws IOException, InterruptedException {
+        Objects.requireNonNull(preparation, "preparation");
+        Objects.requireNonNull(exitCleanup, "exitCleanup");
+        LaunchProcessPlan plan = preparation.plan();
+        if (plan.executionMode() != LaunchExecutionMode.DIRECT) {
+            throw new IllegalArgumentException("Direct execution requires a direct launch plan");
         }
+        plan.validate(preparation.secrets().keySet());
+        Function<String, @Nullable String> secretResolver = preparation.secrets()::get;
+        List<String> rawCommandLine = plan.command().resolve(secretResolver);
 
-        if (rawCommandLine.stream().anyMatch(StringUtils::isBlank)) {
-            throw new IllegalStateException("Illegal command line " + rawCommandLine);
+        @Nullable Path temporaryNativeLink = preparation.temporaryNativeLink();
+        if (temporaryNativeLink != null) {
+            Files.deleteIfExists(temporaryNativeLink);
+            Files.createSymbolicLink(temporaryNativeLink, preparation.nativeFolder());
         }
+        preparePrivateLaunchResources(preparation);
 
-        if (!options.isUseCustomNatives()) {
-            decompressNatives(command.javaNativeFolder);
-        }
-
-        if (isUsingLog4j())
-            extractLog4jConfigurationFile();
-
-        Path runDirectory = repository.getRunDirectory(manifest.id());
-
-        if (StringUtils.isNotBlank(options.getPreLaunchCommand())) {
-            ProcessBuilder builder = new ProcessBuilder(StringUtils.tokenize(options.getPreLaunchCommand(), getEnvVars(nativeFolder))).directory(runDirectory.toFile());
-            builder.environment().putAll(getEnvVars(nativeFolder));
-            SystemUtils.callExternalProcess(builder);
+        if (plan.preLaunch() != null) {
+            runAuxiliaryProcess(plan.preLaunch(), secretResolver);
         }
 
         Process process;
         try {
-            ProcessBuilder builder = new ProcessBuilder(rawCommandLine).directory(runDirectory.toFile());
-            if (listener == null) {
+            ProcessBuilder builder = new ProcessBuilder(rawCommandLine)
+                    .directory(plan.workingDirectory().toFile());
+            applyEnvironment(builder, plan.inheritEnvironment(), plan.environmentSet(),
+                    plan.environmentUnset(), secretResolver);
+            if (plan.inheritIo()) {
                 builder.inheritIO();
             }
-            Path appdata = options.getGameDir().toAbsolutePath().getParent();
-            if (appdata != null) builder.environment().put("APPDATA", appdata.toString());
-
-            builder.environment().putAll(getEnvVars(nativeFolder));
             process = builder.start();
         } catch (IOException e) {
             throw new ProcessCreationException(e);
         }
 
-        ManagedProcess p = new ManagedProcess(process, rawCommandLine);
-        if (listener != null)
-            startMonitors(p, nativeFolder, listener, command.encoding, daemon);
-        return p;
+        ManagedProcess managedProcess = new ManagedProcess(process, rawCommandLine);
+        if (processListener != null) {
+            startMonitors(managedProcess, processListener, preparation.outputEncoding(),
+                    plan.daemonMonitors(), plan.postExit(), secretResolver, exitCleanup);
+        }
+        return managedProcess;
+    }
+
+    /// Extracts launcher-private resources after Hook transformations have completed.
+    ///
+    /// @param preparation transformed launch preparation
+    /// @throws IOException if native or logging resources cannot be prepared
+    private void preparePrivateLaunchResources(LaunchPreparation preparation) throws IOException {
+        if (!options.isUseCustomNatives()) {
+            decompressNatives(preparation.javaNativeFolder());
+        }
+        if (isUsingLog4j()) {
+            extractLog4jConfigurationFile();
+        }
+    }
+
+    /// Applies one plan's exact environment inheritance and edit policy to a process builder.
+    ///
+    /// @param builder target process builder
+    /// @param inheritEnvironment whether to retain the launcher environment
+    /// @param environmentSet environment values to set
+    /// @param environmentUnset environment names to remove
+    /// @param secretResolver final secret resolver
+    private static void applyEnvironment(
+            ProcessBuilder builder,
+            boolean inheritEnvironment,
+            Map<String, LaunchPlanText> environmentSet,
+            Set<String> environmentUnset,
+            Function<String, @Nullable String> secretResolver
+    ) {
+        Map<String, String> environment = builder.environment();
+        if (!inheritEnvironment) {
+            environment.clear();
+        }
+        for (String name : environmentUnset) {
+            environment.remove(name);
+        }
+        for (Map.Entry<String, LaunchPlanText> entry : environmentSet.entrySet()) {
+            environment.put(entry.getKey(), entry.getValue().resolve(secretResolver));
+        }
+    }
+
+    /// Runs one resolved pre-launch or post-exit process synchronously.
+    ///
+    /// @param auxiliary immutable auxiliary process plan
+    /// @param secretResolver final secret resolver
+    /// @throws IOException if the process cannot be created
+    /// @throws InterruptedException if process waiting is interrupted
+    private static void runAuxiliaryProcess(
+            LaunchAuxiliaryProcessPlan auxiliary,
+            Function<String, @Nullable String> secretResolver
+    ) throws IOException, InterruptedException {
+        ProcessBuilder builder = new ProcessBuilder(auxiliary.resolveCommand(secretResolver))
+                .directory(auxiliary.workingDirectory().toFile());
+        applyEnvironment(builder, auxiliary.inheritEnvironment(), auxiliary.environmentSet(),
+                auxiliary.environmentUnset(), secretResolver);
+        SystemUtils.callExternalProcess(builder);
     }
 
     private Map<String, String> getEnvVars(Path nativeFolder) {
@@ -713,166 +988,49 @@ public class DefaultLauncher extends Launcher {
 
     @Override
     public void makeLaunchScript(Path scriptFile) throws IOException {
-        boolean isWindows = OperatingSystem.WINDOWS == OperatingSystem.CURRENT_OS;
-
-        Path nativeFolder = getNativeFolder();
-
-        String scriptExtension = FileUtils.getExtension(scriptFile);
-        boolean usePowerShell = "ps1".equals(scriptExtension);
-
-        if (!usePowerShell) {
-            if (isWindows && !scriptExtension.equalsIgnoreCase("bat"))
-                throw new IllegalArgumentException("The extension of " + scriptFile + " is not 'bat' or 'ps1' in Windows");
-            else if (!isWindows && !(scriptExtension.equalsIgnoreCase("sh") || scriptExtension.equalsIgnoreCase("command") || scriptExtension.equalsIgnoreCase("bash")))
-                throw new IllegalArgumentException("The extension of " + scriptFile + " is not 'sh', 'bash', 'ps1' or 'command' in macOS/Linux");
-        }
-
-        final Command commandLine = generateCommandLine(nativeFolder);
-        final String command = usePowerShell ? null : commandLine.commandLine.toString();
-        Map<String, String> envVars = getEnvVars(nativeFolder);
-
-        if (isWindows && !usePowerShell) {
-            // https://stackoverflow.com/a/28452546
-            // https://learn.microsoft.com/troubleshoot/windows-client/shell-experience/command-line-string-limitation
-            if (command.length() > 32767) {
-                throw new CommandTooLongException();
-            }
-        }
-
-        if (isUsingLog4j())
-            extractLog4jConfigurationFile();
-
-        if (!options.isUseCustomNatives())
-            decompressNatives(commandLine.javaNativeFolder);
-
-        Files.createDirectories(scriptFile.getParent());
-
-        try (OutputStream outputStream = Files.newOutputStream(scriptFile)) {
-            Charset charset = StandardCharsets.UTF_8;
-
-            if (isWindows) {
-                if (usePowerShell) {
-                    // Write UTF-8 BOM
-                    try {
-                        outputStream.write(0xEF);
-                        outputStream.write(0xBB);
-                        outputStream.write(0xBF);
-                    } catch (IOException e) {
-                        outputStream.close();
-                        throw e;
-                    }
-                } else {
-                    charset = OperatingSystem.NATIVE_CHARSET;
-                }
-            }
-
-            try (BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(outputStream, charset))) {
-                if (usePowerShell) {
-                    if (isWindows) {
-                        Path appdata = options.getGameDir().toAbsolutePath().getParent();
-                        if (appdata != null) {
-                            writer.write("$Env:APPDATA=");
-                            writer.write(CommandBuilder.pwshString(appdata.toString()));
-                            writer.newLine();
-                        }
-                    }
-                    for (Map.Entry<String, String> entry : envVars.entrySet()) {
-                        writer.write("$Env:" + entry.getKey() + "=");
-                        writer.write(CommandBuilder.pwshString(entry.getValue()));
-                        writer.newLine();
-                    }
-                    writer.write("Set-Location -LiteralPath ");
-                    writer.write(CommandBuilder.pwshString(FileUtils.getAbsolutePath(repository.getRunDirectory(manifest.id()))));
-                    writer.newLine();
-
-
-                    if (StringUtils.isNotBlank(options.getPreLaunchCommand())) {
-                        writer.write('&');
-                        for (String rawCommand : StringUtils.tokenize(options.getPreLaunchCommand(), envVars)) {
-                            writer.write(' ');
-                            writer.write(CommandBuilder.pwshString(rawCommand));
-                        }
-                        writer.newLine();
-                    }
-
-                    writer.write('&');
-                    for (String rawCommand : commandLine.commandLine.asList()) {
-                        writer.write(' ');
-                        writer.write(CommandBuilder.pwshString(rawCommand));
-                    }
-                    writer.newLine();
-
-                    if (StringUtils.isNotBlank(options.getPostExitCommand())) {
-                        writer.write('&');
-                        for (String rawCommand : StringUtils.tokenize(options.getPostExitCommand(), envVars)) {
-                            writer.write(' ');
-                            writer.write(CommandBuilder.pwshString(rawCommand));
-                        }
-                        writer.newLine();
-                    }
-                } else {
-                    if (isWindows) {
-                        writer.write("@echo off");
-                        writer.newLine();
-
-                        Path appdata = options.getGameDir().toAbsolutePath().getParent();
-                        if (appdata != null) {
-                            writer.write("set APPDATA=" + appdata);
-                            writer.newLine();
-                        }
-
-                        for (Map.Entry<String, String> entry : envVars.entrySet()) {
-                            writer.write("set " + entry.getKey() + "=" + CommandBuilder.toBatchStringLiteral(entry.getValue()));
-                            writer.newLine();
-                        }
-                        writer.newLine();
-                        writer.write(new CommandBuilder().addAll("cd", "/D", FileUtils.getAbsolutePath(repository.getRunDirectory(manifest.id()))).toString());
-                    } else {
-                        writer.write("#!/usr/bin/env bash");
-                        writer.newLine();
-                        for (Map.Entry<String, String> entry : envVars.entrySet()) {
-                            writer.write("export " + entry.getKey() + "=" + CommandBuilder.toShellStringLiteral(entry.getValue()));
-                            writer.newLine();
-                        }
-                        if (commandLine.tempNativeFolder != null) {
-                            writer.write(new CommandBuilder().addAll("ln", "-s", FileUtils.getAbsolutePath(nativeFolder), commandLine.tempNativeFolder.toString()).toString());
-                            writer.newLine();
-                        }
-                        writer.write(new CommandBuilder().addAll("cd", FileUtils.getAbsolutePath(repository.getRunDirectory(manifest.id()))).toString());
-                    }
-                    writer.newLine();
-                    if (StringUtils.isNotBlank(options.getPreLaunchCommand())) {
-                        writer.write(new CommandBuilder().addAll(StringUtils.tokenize(options.getPreLaunchCommand(), envVars)).toString());
-                        writer.newLine();
-                    }
-                    writer.write(command);
-                    writer.newLine();
-
-                    if (StringUtils.isNotBlank(options.getPostExitCommand())) {
-                        writer.write(new CommandBuilder().addAll(StringUtils.tokenize(options.getPostExitCommand(), envVars)).toString());
-                        writer.newLine();
-                    }
-
-                    if (isWindows) {
-                        writer.write("pause");
-                        writer.newLine();
-                    }
-                    if (commandLine.tempNativeFolder != null) {
-                        writer.write(new CommandBuilder().addAll("rm", commandLine.tempNativeFolder.toString()).toString());
-                        writer.newLine();
-                    }
-                }
-            }
-        }
-        FileUtils.setExecutable(scriptFile);
-        if (!Files.isExecutable(scriptFile))
-            throw new PermissionException();
-
-        if (usePowerShell && !CommandBuilder.hasExecutionPolicy())
-            throw new ExecutionPolicyLimitException();
+        renderLaunchScript(prepareLaunch(LaunchExecutionMode.SCRIPT), scriptFile);
     }
 
-    private void startMonitors(ManagedProcess managedProcess, Path nativeFolder, ProcessListener processListener, Charset encoding, boolean isDaemon) {
+    /// Renders one prepared script plan after preparing launcher-private resources.
+    ///
+    /// @param preparation immutable validated launch preparation
+    /// @param scriptFile target launch script
+    /// @throws IOException if resource preparation or script writing fails
+    protected void renderLaunchScript(LaunchPreparation preparation, Path scriptFile) throws IOException {
+        Objects.requireNonNull(preparation, "preparation");
+        Objects.requireNonNull(scriptFile, "scriptFile");
+        LaunchProcessPlan plan = preparation.plan();
+        if (plan.executionMode() != LaunchExecutionMode.SCRIPT) {
+            throw new IllegalArgumentException("Script rendering requires a script launch plan");
+        }
+        plan.validate(preparation.secrets().keySet());
+        preparePrivateLaunchResources(preparation);
+        LaunchScriptRenderer.render(scriptFile, plan, preparation.secrets()::get,
+                preparation.temporaryNativeLink(), preparation.nativeFolder());
+        if ("ps1".equalsIgnoreCase(FileUtils.getExtension(scriptFile))
+                && !CommandBuilder.hasExecutionPolicy()) {
+            throw new ExecutionPolicyLimitException();
+        }
+    }
+
+    /// Starts output pumps and one exit waiter for an observed game process.
+    ///
+    /// @param managedProcess managed game process
+    /// @param processListener process event listener
+    /// @param encoding process output encoding
+    /// @param isDaemon whether monitor threads are daemon threads
+    /// @param postExit optional post-exit process
+    /// @param secretResolver final secret resolver
+    /// @param exitCleanup cleanup invoked after listener and post-exit handling
+    private void startMonitors(
+            ManagedProcess managedProcess,
+            ProcessListener processListener,
+            Charset encoding,
+            boolean isDaemon,
+            @Nullable LaunchAuxiliaryProcessPlan postExit,
+            Function<String, @Nullable String> secretResolver,
+            Runnable exitCleanup
+    ) {
         processListener.setProcess(managedProcess);
         Thread stdout = Lang.thread(new StreamPump(managedProcess.getProcess().getInputStream(), it -> {
             processListener.onLog(it, false);
@@ -885,24 +1043,21 @@ public class DefaultLauncher extends Launcher {
         }, encoding), "stderr-pump", isDaemon);
         managedProcess.addRelatedThread(stderr);
         managedProcess.addRelatedThread(Lang.thread(new ExitWaiter(managedProcess, Arrays.asList(stdout, stderr), (exitCode, exitType) -> {
-            processListener.onExit(exitCode, exitType);
-
-            if (StringUtils.isNotBlank(options.getPostExitCommand())) {
+            try {
                 try {
-                    ProcessBuilder builder = new ProcessBuilder(StringUtils.tokenize(options.getPostExitCommand(), getEnvVars(nativeFolder))).directory(options.getGameDir().toFile());
-                    builder.environment().putAll(getEnvVars(nativeFolder));
-                    SystemUtils.callExternalProcess(builder);
-                } catch (Throwable e) {
-                    LOG.warning("An Exception happened while running exit command.", e);
+                    processListener.onExit(exitCode, exitType);
+                } finally {
+                    if (postExit != null) {
+                        try {
+                            runAuxiliaryProcess(postExit, secretResolver);
+                        } catch (Throwable e) {
+                            LOG.warning("An Exception happened while running exit command.", e);
+                        }
+                    }
                 }
+            } finally {
+                exitCleanup.run();
             }
         }), "exit-waiter", isDaemon));
-    }
-
-    private record Command(
-            CommandBuilder commandLine,
-            @Nullable Path tempNativeFolder,
-            Path javaNativeFolder,
-            Charset encoding) {
     }
 }
