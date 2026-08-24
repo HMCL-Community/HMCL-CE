@@ -27,6 +27,7 @@ import org.jackhuang.hmcl.plugin.PluginManifest;
 import org.jackhuang.hmcl.plugin.PluginVersion;
 import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityEvaluator;
 import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityResult;
+import org.jackhuang.hmcl.plugin.runtime.PluginPlatformTarget;
 import org.jackhuang.hmcl.plugin.trust.PluginCertificationReceipt;
 import org.jackhuang.hmcl.plugin.trust.PluginDocumentVerification;
 import org.jackhuang.hmcl.plugin.trust.PluginRepositoryAttestation;
@@ -497,7 +498,13 @@ public final class PluginStoreManager {
             }
             PluginStoreManifest manifest = PluginStoreManifest.fromJson(verification.signed(), pluginId);
             for (PluginStoreManifest.PluginVersionEntry version : manifest.getVersions()) {
-                validateRemoteUrl(version.getPackageUrl(), "plugin package");
+                if (version.getArtifacts().isEmpty()) {
+                    validateRemoteUrl(version.getPackageUrl(), "plugin package");
+                } else {
+                    for (PluginStoreArtifact artifact : version.getArtifacts()) {
+                        validateRemoteUrl(artifact.packageUrl(), "plugin package");
+                    }
+                }
             }
             assignVersionTrust(manifest, verification.trust());
             sourceContext.manifestCache.put(manifestUrl, manifest);
@@ -583,12 +590,20 @@ public final class PluginStoreManager {
         }
     }
 
-    /// Evaluates one exact version against its NPL proof, weekly repository proof, and fresh online status.
+    /// Evaluates one exact platform artifact against its NPL proof, weekly repository proof, and online status.
+    ///
+    /// @param manifest repository manifest owning the selected version
+    /// @param repositoryIdentity externally established repository identity, or `null` when unavailable
+    /// @param repositoryResolution verified historical repository proof, or `null` when unavailable
+    /// @param version selected repository version
+    /// @param artifact exact current-platform package metadata
+    /// @return current trust decision for the selected artifact
     private PluginTrustResult evaluateCertifiedVersion(
             PluginStoreManifest manifest,
             @Nullable String repositoryIdentity,
             @Nullable RepositoryAttestationResolution repositoryResolution,
-            PluginStoreManifest.PluginVersionEntry version
+            PluginStoreManifest.PluginVersionEntry version,
+            PluginStoreArtifact artifact
     ) {
         @Nullable JsonObject artifactAttestation = version.getArtifactAttestation();
         if (artifactAttestation == null) {
@@ -604,10 +619,6 @@ public final class PluginStoreManager {
         if (status == null) {
             return PluginTrustResult.rejected("official trust status is unavailable or expired");
         }
-        @Nullable Long size = version.getSize();
-        if (size == null) {
-            return PluginTrustResult.rejected("artifact size is unavailable");
-        }
         PluginTrustResult result = trustVerifier.verifyArtifactAttestation(
                 artifactAttestation,
                 repositoryResolution.attestation(),
@@ -615,9 +626,9 @@ public final class PluginStoreManager {
                 repositoryIdentity,
                 manifest.getId(),
                 version.getVersion(),
-                version.getPackageUrl(),
-                version.getSha256(),
-                size
+                artifact.packageUrl(),
+                artifact.sha256(),
+                artifact.size()
         );
         if (result.level() != PluginTrustLevel.CERTIFIED) {
             return result;
@@ -629,8 +640,8 @@ public final class PluginStoreManager {
                     repositoryEnvelope,
                     manifest.getId(),
                     version.getVersion(),
-                    version.getSha256(),
-                    size
+                    artifact.sha256(),
+                    artifact.size()
             );
             PluginCertificationReceipt receipt = PluginCertificationReceipt.fromVerified(
                     certification,
@@ -823,7 +834,13 @@ public final class PluginStoreManager {
             PluginStoreManifest.PluginVersionEntry version,
             Path targetDirectory
     ) throws IOException {
-        return downloadPluginToFile(pluginId, version, targetDirectory.resolve(pluginId + ".npl"));
+        PluginStoreArtifact artifact = version.requireArtifact(PluginPlatformTarget.current());
+        return downloadPluginToFile(
+                pluginId,
+                version,
+                artifact,
+                targetDirectory.resolve(pluginId + ".npl")
+        );
     }
 
     /// Downloads and fully validates a package in a staging directory without touching installed files.
@@ -841,10 +858,12 @@ public final class PluginStoreManager {
             PluginStoreManifest.PluginVersionEntry version,
             Path stagingDirectory
     ) throws IOException {
-        String checksumPrefix = version.getSha256().substring(0, 12).toLowerCase(Locale.ROOT);
+        PluginStoreArtifact artifact = version.requireArtifact(PluginPlatformTarget.current());
+        String checksumPrefix = artifact.sha256().substring(0, 12).toLowerCase(Locale.ROOT);
         return downloadPluginToFile(
                 pluginId,
                 version,
+                artifact,
                 stagingDirectory.resolve(pluginId + "-" + checksumPrefix + ".npl")
         );
     }
@@ -853,20 +872,22 @@ public final class PluginStoreManager {
     ///
     /// @param pluginId validated plugin ID
     /// @param version selected remote version metadata
+    /// @param artifact exact current-platform package metadata
     /// @param targetFile final package path
     /// @return verified target path
     /// @throws IOException if compatibility, transport, size, checksum, metadata, or replacement fails
     private Path downloadPluginToFile(
             String pluginId,
             PluginStoreManifest.PluginVersionEntry version,
+            PluginStoreArtifact artifact,
             Path targetFile
     ) throws IOException {
-        PluginTrustResult currentTrust = refreshDownloadTrust(pluginId, version);
+        PluginTrustResult currentTrust = refreshDownloadTrust(pluginId, version, artifact);
         if (!currentTrust.canInstall()) {
             throw new IOException("Plugin trust verification rejected " + pluginId + ": " + currentTrust.detail());
         }
         validateCompatibility(version);
-        validateRemoteUrl(version.getPackageUrl(), "plugin package");
+        validateRemoteUrl(artifact.packageUrl(), "plugin package");
 
         Path normalizedTarget = targetFile.toAbsolutePath().normalize();
         @Nullable Path targetDirectory = normalizedTarget.getParent();
@@ -877,8 +898,8 @@ public final class PluginStoreManager {
         Path temporaryFile = targetDirectory.resolve(
                 "." + pluginId + "-" + UUID.randomUUID() + ".download"
         );
-        @Nullable Long declaredSize = version.getSize();
-        if (declaredSize != null && declaredSize > MAX_PACKAGE_BYTES) {
+        long declaredSize = artifact.size();
+        if (declaredSize > MAX_PACKAGE_BYTES) {
             throw new IOException("Plugin package exceeds the maximum allowed size");
         }
 
@@ -886,11 +907,11 @@ public final class PluginStoreManager {
         long totalBytes = 0;
         byte[] buffer = new byte[8192];
         LOG.info("Downloading plugin " + pluginId + " v" + version.getVersion()
-                + " from " + PluginSourceLabels.diagnosticUrl(version.getPackageUrl()));
+                + " from " + PluginSourceLabels.diagnosticUrl(artifact.packageUrl()));
 
         @Nullable HttpURLConnection connection = null;
         try {
-            connection = openValidatedConnection(version.getPackageUrl(), "plugin package");
+            connection = openValidatedConnection(artifact.packageUrl(), "plugin package");
             int responseCode = connection.getResponseCode();
             if (responseCode / 100 != 2) {
                 throw new IOException("Plugin package request failed with HTTP " + responseCode);
@@ -904,7 +925,7 @@ public final class PluginStoreManager {
                         continue;
                     }
                     totalBytes = Math.addExact(totalBytes, read);
-                    if (totalBytes > MAX_PACKAGE_BYTES || declaredSize != null && totalBytes > declaredSize) {
+                    if (totalBytes > MAX_PACKAGE_BYTES || totalBytes > declaredSize) {
                         throw new IOException("Plugin package exceeds its declared or maximum size");
                     }
                     digest.update(buffer, 0, read);
@@ -923,12 +944,12 @@ public final class PluginStoreManager {
         }
 
         try {
-            if (declaredSize != null && totalBytes != declaredSize) {
+            if (totalBytes != declaredSize) {
                 throw new IOException("Plugin package size mismatch. Expected " + declaredSize + ", got " + totalBytes);
             }
             String actualHash = toHex(digest.digest());
-            if (!actualHash.equalsIgnoreCase(version.getSha256())) {
-                throw new IOException("Plugin checksum mismatch. Expected " + version.getSha256()
+            if (!actualHash.equals(artifact.sha256())) {
+                throw new IOException("Plugin checksum mismatch. Expected " + artifact.sha256()
                         + ", got " + actualHash);
             }
             validateDownloadedPackage(temporaryFile, pluginId, version);
@@ -953,10 +974,12 @@ public final class PluginStoreManager {
     ///
     /// @param pluginId selected plugin ID
     /// @param version selected version
+    /// @param artifact exact current-platform package metadata
     /// @return current exact-version trust
     private PluginTrustResult refreshDownloadTrust(
             String pluginId,
-            PluginStoreManifest.PluginVersionEntry version
+            PluginStoreManifest.PluginVersionEntry version,
+            PluginStoreArtifact artifact
     ) {
         @Nullable SourceContext sourceContext = context;
         if (sourceContext == null || sourceContext.registryTrust.level() == PluginTrustLevel.OFFICIAL
@@ -982,7 +1005,8 @@ public final class PluginStoreManager {
                 manifest,
                 repositoryIdentity,
                 repositoryResolution,
-                version
+                version,
+                artifact
         );
         version.setTrust(current);
         return current;
@@ -1384,6 +1408,9 @@ public final class PluginStoreManager {
             }
             if (!packageManifest.getPlatforms().equals(expectedVersion.getPlatforms())) {
                 throw new IOException("Downloaded package platforms do not match selected version metadata");
+            }
+            if (packageManifest.getPluginKind() != expectedVersion.getPluginKind()) {
+                throw new IOException("Downloaded package pluginKind does not match selected version metadata");
             }
             if (expectedVersion.getPluginApiVersion() >= 3
                     && !new HashSet<>(packageManifest.getPermissions())

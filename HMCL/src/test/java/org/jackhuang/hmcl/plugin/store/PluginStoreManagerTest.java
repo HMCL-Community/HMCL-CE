@@ -497,6 +497,83 @@ public final class PluginStoreManagerTest {
         }
     }
 
+    /// Downloads only the artifact matching the current host and verifies its artifact-owned hash and size.
+    @Test
+    public void downloadSelectedPlatformArtifact(@TempDir Path temporaryDirectory) throws Exception {
+        PluginPlatformTarget currentPlatform = PluginPlatformTarget.current();
+        String currentArchitecture = Objects.requireNonNull(currentPlatform.getArchitecture());
+        String otherPlatform = currentPlatform.getOperatingSystem().equals("windows")
+                && currentArchitecture.equals("x64") ? "windows-arm64" : "windows-x64";
+        byte @Unmodifiable [] selectedPackage = createPluginPackageFive(
+                "dev.hmclce.test.platform-artifact",
+                "1.0.0",
+                "java",
+                2,
+                "[\"" + currentPlatform.getId() + "\"]"
+        );
+        AtomicInteger selectedRequests = new AtomicInteger();
+        AtomicInteger otherRequests = new AtomicInteger();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/selected", exchange -> {
+            selectedRequests.incrementAndGet();
+            respond(exchange, selectedPackage);
+        });
+        server.createContext("/other", exchange -> {
+            otherRequests.incrementAndGet();
+            respond(exchange, new byte[]{1});
+        });
+        server.start();
+
+        try {
+            String baseUrl = "http://127.0.0.1:" + server.getAddress().getPort();
+            PluginStoreManifest manifest = parseManifest("dev.hmclce.test.platform-artifact", """
+                    {
+                      "schemaVersion": 2,
+                      "id": "dev.hmclce.test.platform-artifact",
+                      "versions": [{
+                        "version": "1.0.0",
+                        "pluginApiVersion": 5,
+                        "permissions": [],
+                        "requiredPermissions": [],
+                        "launcherVersion": "*",
+                        "runtime": "java",
+                        "abi": 2,
+                        "platforms": ["%s"],
+                        "pluginKind": "normal",
+                        "artifacts": [
+                          {"platform": "%s", "packageUrl": "%s/other",
+                           "sha256": "%s", "size": 1},
+                          {"platform": "%s", "packageUrl": "%s/selected",
+                           "sha256": "%s", "size": %d}
+                        ],
+                        "dependencies": []
+                      }]
+                    }
+                    """.formatted(
+                    currentPlatform.getId(),
+                    otherPlatform,
+                    baseUrl,
+                    "0".repeat(64),
+                    currentPlatform.getId(),
+                    baseUrl,
+                    sha256(selectedPackage),
+                    selectedPackage.length
+            ));
+
+            Path installed = new PluginStoreManager().downloadPlugin(
+                    manifest.getId(),
+                    manifest.getVersions().get(0),
+                    temporaryDirectory.resolve("plugins")
+            );
+
+            assertArrayEquals(selectedPackage, Files.readAllBytes(installed));
+            assertEquals(1, selectedRequests.get());
+            assertEquals(0, otherRequests.get());
+        } finally {
+            server.stop(0);
+        }
+    }
+
     /// Keeps historical API-v1 through API-v3 metadata visible while excluding every old package from installation.
     @Test
     public void rejectsEveryPluginApiBeforeVersionFour(@TempDir Path temporaryDirectory) throws Exception {

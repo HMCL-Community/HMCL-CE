@@ -29,7 +29,7 @@ import java.util.Set;
 ///
 /// A target is written as `os` or `os-arch`, for example `windows-x64`, `linux-arm64`, or `macos` for an
 /// architecture-independent package. HMCL currently uses targets to reject incompatible manifests and store
-/// entries. Store artifact matrices and automatic per-platform artifact selection are not yet implemented.
+/// entries and select exact Store artifacts without architecture fallback.
 @NotNullByDefault
 public final class PluginPlatformTarget {
     /// Canonical operating-system identifiers accepted in manifests and store indexes.

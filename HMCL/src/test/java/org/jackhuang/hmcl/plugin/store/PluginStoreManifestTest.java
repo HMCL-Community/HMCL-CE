@@ -19,9 +19,11 @@ package org.jackhuang.hmcl.plugin.store;
 
 import com.google.gson.JsonParseException;
 import com.google.gson.JsonParser;
+import org.jackhuang.hmcl.plugin.PluginKind;
 import org.jackhuang.hmcl.plugin.PluginPermission;
 import org.jackhuang.hmcl.plugin.runtime.PluginAbi;
 import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityRequirements;
+import org.jackhuang.hmcl.plugin.runtime.PluginPlatformTarget;
 import org.jackhuang.hmcl.plugin.runtime.PluginRuntimeTypes;
 import org.jackhuang.hmcl.plugin.trust.PluginTrustLevel;
 import org.jackhuang.hmcl.plugin.trust.PluginTrustResult;
@@ -326,6 +328,114 @@ public final class PluginStoreManifestTest {
         }
     }
 
+    /// Selects one artifact only when its operating system and architecture exactly equal the requested target.
+    @Test
+    public void selectOneExactPlatformArtifact() throws IOException {
+        PluginStoreManifest.PluginVersionEntry version = parseManifest(
+                "dev.hmclce.test.artifact-selection",
+                schemaFiveArtifactManifest(
+                        "dev.hmclce.test.artifact-selection",
+                        "\"pluginKind\": \"normal\",",
+                        """
+                                {"platform": "windows-x64", "packageUrl": "https://example.test/win-x64.npl",
+                                 "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "size": 41},
+                                {"platform": "windows-arm64", "packageUrl": "https://example.test/win-arm64.npl",
+                                 "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "size": 59},
+                                {"platform": "linux-x64", "packageUrl": "https://example.test/linux-x64.npl",
+                                 "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "size": 73}
+                                """
+                )
+        ).getVersions().get(0);
+
+        PluginStoreArtifact selected = version.requireArtifact(PluginPlatformTarget.parse("linux-x64"));
+
+        assertEquals("linux-x64", selected.platform().getId());
+        assertEquals("https://example.test/linux-x64.npl", selected.packageUrl());
+        assertEquals("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", selected.sha256());
+        assertEquals(73, selected.size());
+        assertEquals(3, version.getArtifacts().size());
+
+        IOException noMatch = assertThrows(
+                IOException.class,
+                () -> version.requireArtifact(PluginPlatformTarget.parse("linux-arm64"))
+        );
+        assertTrue(noMatch.getMessage().contains("linux-arm64"), noMatch.getMessage());
+        assertTrue(noMatch.getMessage().contains("linux-x64"), noMatch.getMessage());
+    }
+
+    /// Rejects duplicate artifact targets and architecture-independent targets instead of applying native fallback.
+    @Test
+    public void rejectAmbiguousPlatformArtifactMatrices() {
+        assertManifestRejected(schemaFiveArtifactManifest(
+                "dev.hmclce.test.invalid-declarations",
+                "\"pluginKind\": \"normal\",",
+                """
+                        {"platform": "windows-x64", "packageUrl": "https://example.test/one.npl",
+                         "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "size": 1},
+                        {"platform": "windows-x64", "packageUrl": "https://example.test/two.npl",
+                         "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "size": 2}
+                        """
+        ));
+        assertManifestRejected(schemaFiveArtifactManifest(
+                "dev.hmclce.test.invalid-declarations",
+                "\"pluginKind\": \"normal\",",
+                """
+                        {"platform": "windows", "packageUrl": "https://example.test/native.npl",
+                         "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "size": 1}
+                        """
+        ));
+    }
+
+    /// Requires exactly one package representation and mandates an artifact matrix for runtime providers.
+    @Test
+    public void enforceSchemaFiveArtifactRepresentation() throws IOException {
+        assertManifestRejected(schemaFiveArtifactManifest(
+                "dev.hmclce.test.invalid-declarations",
+                "\"pluginKind\": \"normal\",",
+                ""
+        ));
+        assertManifestRejected(schemaFiveVersionDeclarations("""
+                "permissions": [],
+                "requiredPermissions": [],
+                "launcherVersion": "*",
+                "runtime": "java",
+                "abi": 2,
+                "platforms": [],
+                "pluginKind": "normal",
+                "artifacts": [{
+                  "platform": "windows-x64",
+                  "packageUrl": "https://example.test/plugin.npl",
+                  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "size": 1
+                }],
+                "dependencies": []
+                """));
+        assertManifestRejected(schemaFiveVersionDeclarations("""
+                "permissions": ["native-code"],
+                "requiredPermissions": ["native-code"],
+                "launcherVersion": "*",
+                "runtime": "java",
+                "abi": 2,
+                "platforms": [],
+                "pluginKind": "runtime-provider",
+                "dependencies": []
+                """));
+
+        PluginStoreManifest.PluginVersionEntry provider = parseManifest(
+                "dev.hmclce.test.provider-artifacts",
+                schemaFiveArtifactManifest(
+                        "dev.hmclce.test.provider-artifacts",
+                        "\"pluginKind\": \"runtime-provider\",",
+                        """
+                                {"platform": "windows-x64", "packageUrl": "https://example.test/provider.npl",
+                                 "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "size": 1}
+                                """
+                )
+        ).getVersions().get(0);
+        assertEquals(PluginKind.RUNTIME_PROVIDER, provider.getPluginKind());
+        assertEquals(1, provider.getArtifacts().size());
+    }
+
     /// Keeps schema-v1 manifests compatible without treating their optional dependency list as authoritative.
     @Test
     public void parseSchemaVersionOneManifest() throws IOException {
@@ -588,6 +698,38 @@ public final class PluginStoreManifestTest {
                   ]
                 }
                 """.formatted(pluginApiVersion, declarationsJson);
+    }
+
+    /// Creates a schema-v5 Store manifest whose package identity belongs only to platform artifacts.
+    ///
+    /// @param pluginId manifest plugin ID
+    /// @param pluginKindDeclaration serialized plugin kind declaration
+    /// @param artifactsJson serialized artifact objects without the surrounding array
+    /// @return complete Store manifest JSON
+    private static String schemaFiveArtifactManifest(
+            String pluginId,
+            String pluginKindDeclaration,
+            String artifactsJson
+    ) {
+        return """
+                {
+                  "schemaVersion": 2,
+                  "id": "%s",
+                  "versions": [{
+                    "version": "1.0.0",
+                    "pluginApiVersion": 5,
+                    "permissions": [],
+                    "requiredPermissions": [],
+                    "launcherVersion": "*",
+                    "runtime": "java",
+                    "abi": 2,
+                    "platforms": [],
+                    %s
+                    "artifacts": [%s],
+                    "dependencies": []
+                  }]
+                }
+                """.formatted(pluginId, pluginKindDeclaration, artifactsJson);
     }
 
     /// Parses and validates one repository manifest fixture.

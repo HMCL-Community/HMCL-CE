@@ -22,6 +22,7 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParseException;
 import com.google.gson.annotations.SerializedName;
 import org.jackhuang.hmcl.plugin.PluginDependency;
+import org.jackhuang.hmcl.plugin.PluginKind;
 import org.jackhuang.hmcl.plugin.PluginManifest;
 import org.jackhuang.hmcl.plugin.PluginPermission;
 import org.jackhuang.hmcl.plugin.PluginVersion;
@@ -44,6 +45,7 @@ import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.Set;
 import java.util.regex.Pattern;
@@ -230,6 +232,17 @@ public final class PluginStoreManifest {
             entry.runtimeDeclared = versionObject.has("runtime");
             entry.abiDeclared = versionObject.has("abi");
             entry.platformsDeclared = versionObject.has("platforms");
+            entry.pluginKindDeclared = versionObject.has("pluginKind");
+            @Nullable JsonElement pluginKindElement = versionObject.get("pluginKind");
+            entry.pluginKindToken = pluginKindElement != null
+                    && pluginKindElement.isJsonPrimitive()
+                    && pluginKindElement.getAsJsonPrimitive().isString()
+                    ? pluginKindElement.getAsString()
+                    : null;
+            entry.packageUrlDeclared = versionObject.has("packageUrl");
+            entry.sha256Declared = versionObject.has("sha256");
+            entry.sizeDeclared = versionObject.has("size");
+            entry.artifactsDeclared = versionObject.has("artifacts");
         }
     }
 
@@ -278,9 +291,15 @@ public final class PluginStoreManifest {
         @SerializedName("packageUrl")
         private @Nullable String packageUrl;
 
+        /// Whether the source JSON explicitly contained the legacy single-package URL.
+        private transient boolean packageUrlDeclared;
+
         /// Required SHA-256 checksum.
         @SerializedName("sha256")
         private @Nullable String sha256;
+
+        /// Whether the source JSON explicitly contained the legacy single-package checksum.
+        private transient boolean sha256Declared;
 
         /// Minimum compatible launcher version.
         @SerializedName("minLauncherVersion")
@@ -306,6 +325,16 @@ public final class PluginStoreManifest {
         @SerializedName("size")
         private @Nullable Long size;
 
+        /// Whether the source JSON explicitly contained the legacy single-package size.
+        private transient boolean sizeDeclared;
+
+        /// Exact platform-specific package artifacts for schema-v5 versions.
+        @SerializedName("artifacts")
+        private @Nullable List<@Nullable PluginStoreArtifact> artifacts;
+
+        /// Whether the source JSON explicitly contained the schema-v5 artifact matrix.
+        private transient boolean artifactsDeclared;
+
         /// Required HMCL plugin manifest/API schema version.
         @SerializedName("pluginApiVersion")
         private int pluginApiVersion = 1;
@@ -330,6 +359,16 @@ public final class PluginStoreManifest {
 
         /// Whether the source JSON explicitly contained the schema-v5 `platforms` property.
         private transient boolean platformsDeclared;
+
+        /// Schema-v5 role of the package represented by this Store entry.
+        @SerializedName("pluginKind")
+        private @Nullable PluginKind pluginKind;
+
+        /// Whether the source JSON explicitly contained the schema-v5 plugin role.
+        private transient boolean pluginKindDeclared;
+
+        /// Exact serialized plugin role token retained for canonical-spelling validation.
+        private transient @Nullable String pluginKindToken;
 
         /// Whether installation or update is expected to require a launcher restart.
         @SerializedName("requiresRestart")
@@ -454,11 +493,55 @@ public final class PluginStoreManifest {
             return size;
         }
 
+        /// Returns immutable exact platform artifacts in declaration order.
+        ///
+        /// @return platform artifact matrix, or an empty list for a legacy single package
+        public @Unmodifiable List<PluginStoreArtifact> getArtifacts() {
+            @Nullable List<@Nullable PluginStoreArtifact> values = artifacts;
+            if (values == null || values.isEmpty()) {
+                return List.of();
+            }
+            return values.stream().map(Objects::requireNonNull).toList();
+        }
+
+        /// Selects the package metadata for an exact operating-system and architecture target.
+        ///
+        /// Legacy single-package entries produce an immutable compatibility view for the requested target.
+        /// Platform matrices never use operating-system-only or architecture translation fallback.
+        ///
+        /// @param target exact host target
+        /// @return matching platform artifact or the legacy package compatibility view
+        /// @throws IOException if a platform matrix has no exact target match
+        public PluginStoreArtifact requireArtifact(PluginPlatformTarget target) throws IOException {
+            @Unmodifiable List<PluginStoreArtifact> matrix = getArtifacts();
+            if (matrix.isEmpty()) {
+                return new PluginStoreArtifact(target, getPackageUrl(), getSha256().toLowerCase(Locale.ROOT),
+                        Objects.requireNonNull(getSize(), "Plugin version has no size"));
+            }
+            for (PluginStoreArtifact artifact : matrix) {
+                if (artifact.platform().equals(target)) {
+                    return artifact;
+                }
+            }
+            throw new IOException("No exact plugin artifact for " + target.getId()
+                    + "; available targets: " + matrix.stream()
+                    .map(artifact -> artifact.platform().getId())
+                    .sorted()
+                    .toList());
+        }
+
         /// Returns the required plugin API schema version.
         ///
         /// @return plugin API version
         public int getPluginApiVersion() {
             return pluginApiVersion;
+        }
+
+        /// Returns the package role, defaulting omitted schema-v5 metadata to an ordinary plugin.
+        ///
+        /// @return package role
+        public PluginKind getPluginKind() {
+            return Objects.requireNonNullElse(pluginKind, PluginKind.NORMAL);
         }
 
         /// Returns the canonical required runtime, defaulting legacy packages to built-in Java.
@@ -624,15 +707,6 @@ public final class PluginStoreManifest {
             } catch (IllegalArgumentException exception) {
                 throw new IOException("Plugin version entry has an invalid version", exception);
             }
-            if (packageUrl == null || packageUrl.isBlank()) {
-                throw new IOException("Plugin version " + version + " has no packageUrl");
-            }
-            if (sha256 == null || !SHA256_PATTERN.matcher(sha256).matches()) {
-                throw new IOException("Plugin version " + version + " has an invalid SHA-256 checksum");
-            }
-            if (size == null || size <= 0) {
-                throw new IOException("Plugin version " + version + " has an invalid size");
-            }
             if (pluginApiVersion < 1) {
                 throw new IOException("Plugin version " + version + " has an invalid plugin API "
                         + pluginApiVersion);
@@ -641,6 +715,7 @@ public final class PluginStoreManifest {
                 throw new IOException("Plugin version " + version + " requires unsupported plugin API "
                         + pluginApiVersion);
             }
+            validateArtifactMetadata();
             validateRuntimeCompatibilityMetadata();
             if (releaseDate != null && !releaseDate.isBlank()) {
                 try {
@@ -725,6 +800,58 @@ public final class PluginStoreManifest {
                                 + dependency.getId());
                     }
                 }
+            }
+        }
+
+        /// Validates the mutually exclusive single-package and schema-v5 artifact-matrix representations.
+        ///
+        /// @throws IOException if package metadata is absent, mixed, duplicated, or schema-incompatible
+        private void validateArtifactMetadata() throws IOException {
+            if (pluginApiVersion < 5 && (artifactsDeclared || artifacts != null)) {
+                throw new IOException("Plugin API " + pluginApiVersion + " cannot declare artifacts");
+            }
+            if (pluginApiVersion < 5 && (pluginKindDeclared || pluginKind != null)) {
+                throw new IOException("Plugin API " + pluginApiVersion + " cannot declare pluginKind");
+            }
+            if (pluginApiVersion >= 5 && pluginKindDeclared
+                    && (pluginKind == null || !pluginKind.getId().equals(pluginKindToken))) {
+                throw new IOException("Plugin API 5 version " + version + " has invalid pluginKind");
+            }
+            if (pluginApiVersion >= 5 && artifactsDeclared
+                    && (packageUrlDeclared || sha256Declared || sizeDeclared)) {
+                throw new IOException("Plugin API 5 version " + version
+                        + " cannot combine packageUrl, sha256, or size with artifacts");
+            }
+            if (pluginApiVersion >= 5 && artifactsDeclared) {
+                if (artifacts == null || artifacts.isEmpty()) {
+                    throw new IOException("Plugin API 5 version " + version + " has an empty artifact matrix");
+                }
+                Set<PluginPlatformTarget> targets = new HashSet<>();
+                for (@Nullable PluginStoreArtifact artifact : artifacts) {
+                    if (artifact == null) {
+                        throw new IOException("Plugin API 5 version " + version + " has a null artifact");
+                    }
+                    if (artifact.platform().getArchitecture() == null) {
+                        throw new IOException("Plugin artifact target must include an architecture: "
+                                + artifact.platform().getId());
+                    }
+                    if (!targets.add(artifact.platform())) {
+                        throw new IOException("Duplicate plugin artifact target: " + artifact.platform().getId());
+                    }
+                }
+            } else {
+                if (packageUrl == null || packageUrl.isBlank()) {
+                    throw new IOException("Plugin version " + version + " has no packageUrl");
+                }
+                if (sha256 == null || !SHA256_PATTERN.matcher(sha256).matches()) {
+                    throw new IOException("Plugin version " + version + " has an invalid SHA-256 checksum");
+                }
+                if (size == null || size <= 0) {
+                    throw new IOException("Plugin version " + version + " has an invalid size");
+                }
+            }
+            if (pluginApiVersion >= 5 && getPluginKind() == PluginKind.RUNTIME_PROVIDER && !artifactsDeclared) {
+                throw new IOException("Runtime provider " + version + " must declare a platform artifact matrix");
             }
         }
 
