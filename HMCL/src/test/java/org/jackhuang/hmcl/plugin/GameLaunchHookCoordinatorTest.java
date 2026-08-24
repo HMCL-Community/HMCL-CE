@@ -41,6 +41,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
@@ -425,6 +426,40 @@ public final class GameLaunchHookCoordinatorTest {
         assertFalse(laterInvoked.get());
         assertEquals("top-secret", original.secrets().get("access-token"));
         assertFalse(original.plan().environmentSet().containsKey("LEAKED_SECRET"));
+    }
+
+    /// Rejects an account-visible secret used as a nested environment object key.
+    @Test
+    public void secretCannotEscapeThroughEnvironmentObjectKey() {
+        LaunchPreparation original = preparation(LaunchExecutionMode.DIRECT)
+                .withSecrets(Map.of("access-token", "TOPSECRET123"));
+        AtomicBoolean laterInvoked = new AtomicBoolean();
+        GameLaunchHookCoordinator coordinator = coordinator(List.of(
+                accountSubscriber("dev.test.key-leak", event -> {
+                    String visibleSecret = event.secrets().resolve("access-token");
+                    LaunchProcessPlan current = decode(event, original.secrets().keySet());
+                    Map<String, LaunchPlanText> environment = new LinkedHashMap<>(current.environmentSet());
+                    environment.put(visibleSecret, LaunchPlanText.literal("leaked-through-key"));
+                    return replace(event, current.withEnvironment(
+                            current.inheritEnvironment(), environment, current.environmentUnset()));
+                }),
+                subscriber("dev.test.after-key-leak", Set.of("dev.test.key-leak"), event -> {
+                    laterInvoked.set(true);
+                    assertTrue(event.data().requireObject("plan")
+                            .requireObject("environmentSet").values().containsKey("TOPSECRET123"));
+                    return PluginHookResult.unchanged();
+                })
+        ), false);
+
+        PluginHookDispatchException failure = assertThrows(PluginHookDispatchException.class,
+                () -> coordinator.beforeLaunch(original, metadata("direct")));
+
+        assertEquals(PluginHookDispatchException.Category.INVALID_RESULT, failure.category());
+        assertEquals("dev.test.key-leak", failure.pluginId());
+        assertFalse(failure.getMessage().contains("TOPSECRET123"));
+        assertFalse(Objects.toString(failure.getCause(), "").contains("TOPSECRET123"));
+        assertFalse(laterInvoked.get());
+        assertFalse(original.plan().environmentSet().containsKey("TOPSECRET123"));
     }
 
     /// Coordinates script plans without allocating direct-execution after state.

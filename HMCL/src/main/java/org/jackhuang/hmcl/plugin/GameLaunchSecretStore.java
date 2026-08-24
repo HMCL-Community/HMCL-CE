@@ -199,6 +199,7 @@ final class GameLaunchSecretStore {
             String path
     ) {
         for (Map.Entry<String, PluginDataValue> entry : object.values().entrySet()) {
+            scanValue(pluginId, PluginDataValue.string(entry.getKey()), visibleSecrets, path + ".<key>");
             scanValue(pluginId, entry.getValue(), visibleSecrets, path + "." + entry.getKey());
         }
     }
