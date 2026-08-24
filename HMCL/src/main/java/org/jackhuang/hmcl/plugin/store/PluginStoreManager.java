@@ -1024,6 +1024,9 @@ public final class PluginStoreManager {
         if (!compatibility.isCompatible()) {
             throw new IOException(compatibility.detail());
         }
+        if (!version.getArtifacts().isEmpty()) {
+            version.requireArtifact(PluginPlatformTarget.current());
+        }
 
         String requiredJava = version.getRequiredJavaVersion();
         if (!requiredJava.isBlank()) {

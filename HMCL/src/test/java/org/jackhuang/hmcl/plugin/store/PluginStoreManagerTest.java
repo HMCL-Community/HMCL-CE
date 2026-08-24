@@ -684,6 +684,60 @@ public final class PluginStoreManagerTest {
                 """), "limited", "ABI 2", "[1]");
     }
 
+    /// Excludes artifact matrices without an exact current target even when package platforms allow the host.
+    @Test
+    public void rejectCompatibleVersionWithoutCurrentPlatformArtifact() throws IOException {
+        PluginPlatformTarget currentPlatform = PluginPlatformTarget.current();
+        String currentArchitecture = Objects.requireNonNull(currentPlatform.getArchitecture());
+        String otherPlatform = currentPlatform.getOperatingSystem().equals("windows")
+                && currentArchitecture.equals("x64") ? "windows-arm64" : "windows-x64";
+        PluginStoreManager manager = new PluginStoreManager();
+
+        for (String platforms : new String[]{"[]", "[\"" + currentPlatform.getId() + "\"]"}) {
+            PluginStoreManifest manifest = parseManifest("dev.hmclce.test.missing-host-artifact", """
+                    {
+                      "schemaVersion": 2,
+                      "id": "dev.hmclce.test.missing-host-artifact",
+                      "versions": [{
+                        "version": "1.0.0",
+                        "pluginApiVersion": 5,
+                        "permissions": [],
+                        "requiredPermissions": [],
+                        "launcherVersion": "*",
+                        "runtime": "java",
+                        "abi": 2,
+                        "platforms": %s,
+                        "pluginKind": "normal",
+                        "artifacts": [{
+                          "platform": "%s",
+                          "packageUrl": "https://example.test/other.npl",
+                          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                          "size": 1
+                        }],
+                        "dependencies": []
+                      }]
+                    }
+                    """.formatted(platforms, otherPlatform));
+            PluginStoreManifest.PluginVersionEntry version = manifest.getVersions().get(0);
+
+            IOException exception = assertThrows(IOException.class, () -> manager.validateCompatibility(version));
+            assertTrue(exception.getMessage().contains(currentPlatform.getId()), exception.getMessage());
+            assertTrue(exception.getMessage().contains(otherPlatform), exception.getMessage());
+            assertFalse(manager.isCompatible(version));
+            assertTrue(manager.getCompatibleVersions(manifest).isEmpty());
+        }
+
+        assertTrue(manager.isCompatible(compatibilityVersion(5, """
+                "permissions": [],
+                "requiredPermissions": [],
+                "launcherVersion": "*",
+                "runtime": "java",
+                "abi": 2,
+                "platforms": [],
+                "dependencies": []
+                """)));
+    }
+
     /// Observes providers registered after a production store manager has been constructed.
     @Test
     public void useProcessWideRuntimeProvidersForStoreCompatibility() throws IOException {
