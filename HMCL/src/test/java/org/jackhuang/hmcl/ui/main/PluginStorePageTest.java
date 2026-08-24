@@ -820,9 +820,10 @@ public final class PluginStorePageTest {
         PluginStoreManifest.PluginVersionEntry version = Objects.requireNonNull(
                 Objects.requireNonNull(item.getManifest()).getVersion("1.0.0")
         );
-        PluginInstallPlan plan = new PluginStoreDependencyResolver(Map.of(
-                item.getEntry().getId(), item
-        )).resolveInstallPlan(item.getEntry().getId(), version, Map.of(), Map.of(), Map.of());
+        PluginInstallPlan plan = new PluginStoreDependencyResolver(
+                Map.of(item.getEntry().getId(), item),
+                List.of(source)
+        ).resolveInstallPlan(item.getEntry().getId(), version, Map.of(), Map.of(), Map.of());
 
         PluginInstallPlan.Entry entry = plan.getRootEntry();
         String finalConfirmationRow = PluginStorePage.formatInstallPlan(plan).get(0);
@@ -1118,10 +1119,13 @@ public final class PluginStorePageTest {
         PluginStoreManifest.PluginVersionEntry rootVersion = Objects.requireNonNull(
                 Objects.requireNonNull(root.getManifest()).getVersion("1.0.0")
         );
-        return new PluginStoreDependencyResolver(Map.of(
-                root.getEntry().getId(), root,
-                dependency.getEntry().getId(), dependency
-        )).resolveInstallPlan(root.getEntry().getId(), rootVersion, Map.of(), Map.of(), Map.of());
+        return new PluginStoreDependencyResolver(
+                Map.of(
+                        root.getEntry().getId(), root,
+                        dependency.getEntry().getId(), dependency
+                ),
+                List.of(sourceA, sourceB)
+        ).resolveInstallPlan(root.getEntry().getId(), rootVersion, Map.of(), Map.of(), Map.of());
     }
 
     /// Creates a successful source outcome with an empty registry.

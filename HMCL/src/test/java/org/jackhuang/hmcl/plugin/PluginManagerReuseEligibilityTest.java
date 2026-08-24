@@ -24,6 +24,7 @@ import org.jackhuang.hmcl.plugin.runtime.PluginPlatformTarget;
 import org.jackhuang.hmcl.plugin.runtime.PluginRuntimeTypes;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProvider;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderRegistry;
+import org.jackhuang.hmcl.plugin.trust.PluginRuntimeTrustGuard;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Unmodifiable;
 import org.junit.jupiter.api.Test;
@@ -50,6 +51,52 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /// Verifies exact-artifact permission checks used by plugin-store dependency reuse planning.
 @NotNullByDefault
 public final class PluginManagerReuseEligibilityTest {
+    /// Exposes only fully compatible, authorized, trusted disabled artifacts as activatable Store Providers.
+    ///
+    /// @param temporaryDirectory isolated launcher homes
+    /// @throws IOException if package, permission, or planning state cannot be prepared
+    @Test
+    public void activatableSnapshotRejectsEveryNonDisabledReuseFailure(@TempDir Path temporaryDirectory)
+            throws IOException {
+        Path localHome = temporaryDirectory.resolve("ordinary");
+        PluginManager manager = new PluginManager(localHome);
+        String compatibleId = "dev.test.activatable.compatible";
+        String underGrantedId = "dev.test.activatable.under-granted";
+        String launcherIncompatibleId = "dev.test.activatable.launcher-incompatible";
+        writeSchemaFourPackage(
+                manager.getPluginsDirectory().resolve(compatibleId + ".npl"),
+                compatibleId, "[]", "[]", "*", "compatible"
+        );
+        writeSchemaFourPackage(
+                manager.getPluginsDirectory().resolve(underGrantedId + ".npl"),
+                underGrantedId, "[\"filesystem\"]", "[\"filesystem\"]", "*", "under-granted"
+        );
+        writeSchemaFourPackage(
+                manager.getPluginsDirectory().resolve(launcherIncompatibleId + ".npl"),
+                launcherIncompatibleId, "[]", "[]", ">=9999.0.0", "incompatible"
+        );
+
+        PluginInstallationPlanningSnapshot snapshot = manager.getInstallationPlanningSnapshot();
+
+        assertTrue(snapshot.getActivatableArtifacts().containsKey(compatibleId));
+        assertFalse(snapshot.getActivatableArtifacts().containsKey(underGrantedId));
+        assertFalse(snapshot.getActivatableArtifacts().containsKey(launcherIncompatibleId));
+
+        Path untrustedHome = temporaryDirectory.resolve("untrusted");
+        PluginManager untrustedManager = new PluginManager(
+                untrustedHome,
+                PluginRuntimeTrustGuard.unavailable("test trust state unavailable")
+        );
+        String untrustedId = "dev.test.activatable.untrusted";
+        writeSchemaFourPackage(
+                untrustedManager.getPluginsDirectory().resolve(untrustedId + ".npl"),
+                untrustedId, "[]", "[]", "*", "untrusted"
+        );
+
+        assertFalse(untrustedManager.getInstallationPlanningSnapshot()
+                .getActivatableArtifacts().containsKey(untrustedId));
+    }
+
     /// Requires complete grants for the current package hash and invalidates eligibility when package bytes change.
     @Test
     public void reuseEligibilityIsBoundToRequiredGrantsAndExactPackage(@TempDir Path temporaryDirectory)

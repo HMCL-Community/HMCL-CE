@@ -267,7 +267,12 @@ final class PluginPermissionManagementPage extends BorderPane implements Decorat
         String pluginId = manifest.getId();
         boolean desiredEnabled = pluginManager.isPluginEnabled(pluginId);
         if (desiredEnabled) {
-            pluginManager.disablePlugin(pluginId);
+            try {
+                pluginManager.disablePlugin(pluginId);
+            } catch (IOException exception) {
+                showStatusHint(MessageDialogPane.MessageType.ERROR, failureMessage(exception));
+                return;
+            }
         } else {
             pluginManager.enablePlugin(pluginId);
         }

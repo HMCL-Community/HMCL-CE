@@ -35,24 +35,34 @@ public final class PluginInstallationPlanningSnapshot {
     /// Exact installed artifacts currently eligible for dependency reuse.
     private final @Unmodifiable Map<String, PluginArtifactIdentity> reusableArtifacts;
 
+    /// Exact fully eligible artifacts whose only reuse failure is their disabled state.
+    private final @Unmodifiable Map<String, PluginArtifactIdentity> activatableArtifacts;
+
     /// Creates one validated immutable planning snapshot.
     ///
     /// @param manifests installed manifests indexed by plugin ID
     /// @param installedArtifacts exact prior artifact for every installed manifest
     /// @param reusableArtifacts reusable subset of `installedArtifacts`
+    /// @param activatableArtifacts disabled but otherwise reusable subset of `installedArtifacts`
     PluginInstallationPlanningSnapshot(
             @Unmodifiable Map<String, PluginManifest> manifests,
             @Unmodifiable Map<String, PluginArtifactIdentity> installedArtifacts,
-            @Unmodifiable Map<String, PluginArtifactIdentity> reusableArtifacts
+            @Unmodifiable Map<String, PluginArtifactIdentity> reusableArtifacts,
+            @Unmodifiable Map<String, PluginArtifactIdentity> activatableArtifacts
     ) {
         this.manifests = Map.copyOf(manifests);
         this.installedArtifacts = Map.copyOf(installedArtifacts);
         this.reusableArtifacts = Map.copyOf(reusableArtifacts);
+        this.activatableArtifacts = Map.copyOf(activatableArtifacts);
         if (!this.manifests.keySet().equals(this.installedArtifacts.keySet())) {
             throw new IllegalArgumentException("Every planning manifest must have exactly one artifact identity");
         }
-        if (!this.installedArtifacts.keySet().containsAll(this.reusableArtifacts.keySet())) {
-            throw new IllegalArgumentException("Reusable artifacts must belong to the installed snapshot");
+        if (!this.installedArtifacts.keySet().containsAll(this.reusableArtifacts.keySet())
+                || !this.installedArtifacts.keySet().containsAll(this.activatableArtifacts.keySet())) {
+            throw new IllegalArgumentException("Eligible artifacts must belong to the installed snapshot");
+        }
+        if (this.reusableArtifacts.keySet().stream().anyMatch(this.activatableArtifacts::containsKey)) {
+            throw new IllegalArgumentException("An installed artifact cannot be reusable and activatable");
         }
         for (Map.Entry<String, PluginManifest> entry : this.manifests.entrySet()) {
             PluginArtifactIdentity identity = this.installedArtifacts.get(entry.getKey());
@@ -65,6 +75,11 @@ public final class PluginInstallationPlanningSnapshot {
             @Nullable PluginArtifactIdentity reusable = this.reusableArtifacts.get(entry.getKey());
             if (reusable != null && !identity.equals(reusable)) {
                 throw new IllegalArgumentException("Reusable artifact differs from the installed snapshot: "
+                        + entry.getKey());
+            }
+            @Nullable PluginArtifactIdentity activatable = this.activatableArtifacts.get(entry.getKey());
+            if (activatable != null && !identity.equals(activatable)) {
+                throw new IllegalArgumentException("Activatable artifact differs from the installed snapshot: "
                         + entry.getKey());
             }
         }
@@ -89,5 +104,12 @@ public final class PluginInstallationPlanningSnapshot {
     /// @return immutable reusable artifact identities
     public @Unmodifiable Map<String, PluginArtifactIdentity> getReusableArtifacts() {
         return reusableArtifacts;
+    }
+
+    /// Returns the exact disabled subset eligible for explicit activation.
+    ///
+    /// @return immutable activatable artifact identities
+    public @Unmodifiable Map<String, PluginArtifactIdentity> getActivatableArtifacts() {
+        return activatableArtifacts;
     }
 }

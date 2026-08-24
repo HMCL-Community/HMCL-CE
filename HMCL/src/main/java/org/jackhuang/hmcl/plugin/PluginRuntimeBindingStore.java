@@ -35,6 +35,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /// Atomically persists dependent-scoped runtime Provider bindings selected by confirmed Store plans.
 @NotNullByDefault
@@ -75,6 +76,34 @@ final class PluginRuntimeBindingStore {
             Map<String, RuntimeProviderBinding> merged = new LinkedHashMap<>(readLocked());
             merged.putAll(additions);
             writeLocked(Map.copyOf(merged));
+        });
+    }
+
+    /// Atomically replaces the complete binding document with an exact prospective snapshot.
+    ///
+    /// @param bindings complete bindings indexed by dependent plugin ID
+    /// @throws IOException if validation or replacement fails
+    void replaceStrict(@Unmodifiable Map<String, RuntimeProviderBinding> bindings) throws IOException {
+        mutationLock.run(() -> {
+            for (Map.Entry<String, RuntimeProviderBinding> entry : bindings.entrySet()) {
+                if (!entry.getKey().equals(entry.getValue().dependentPluginId())) {
+                    throw new IOException("Runtime binding key does not match dependent plugin ID: "
+                            + entry.getKey());
+                }
+            }
+            writeLocked(Map.copyOf(bindings));
+        });
+    }
+
+    /// Removes selected dependent-owned bindings while preserving every unrelated edge.
+    ///
+    /// @param dependentPluginIds dependent plugin IDs whose bindings must be removed
+    /// @throws IOException if existing state is invalid or replacement fails
+    void removeDependentsStrict(@Unmodifiable Set<String> dependentPluginIds) throws IOException {
+        mutationLock.run(() -> {
+            Map<String, RuntimeProviderBinding> remaining = new LinkedHashMap<>(readLocked());
+            dependentPluginIds.forEach(remaining::remove);
+            writeLocked(Map.copyOf(remaining));
         });
     }
 

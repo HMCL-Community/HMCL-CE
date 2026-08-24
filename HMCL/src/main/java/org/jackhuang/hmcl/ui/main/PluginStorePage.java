@@ -1313,12 +1313,16 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                 if (snapshot == null || !canUseSnapshotForInstallation(snapshot, sourceRepository.getSourceConfiguration())) {
                     throw new IOException(i18n("plugin.store.catalog.unavailable"));
                 }
-                PluginInstallPlan plan = new PluginStoreDependencyResolver(snapshot.getWinningItems()).resolveInstallPlan(
+                PluginInstallPlan plan = new PluginStoreDependencyResolver(
+                        snapshot.getWinningItems(),
+                        snapshot.getSourceConfiguration().getSources()
+                ).resolveInstallPlan(
                         item.getEntry().getId(),
                         version,
                         planningSnapshot.getManifests(),
                         planningSnapshot.getInstalledArtifacts(),
-                        planningSnapshot.getReusableArtifacts()
+                        planningSnapshot.getReusableArtifacts(),
+                        planningSnapshot.getActivatableArtifacts()
                 );
                 return new ResolvedInstallPlan(plan, snapshot);
             } catch (IOException exception) {

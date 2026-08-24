@@ -50,6 +50,117 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @EnabledIf("org.jackhuang.hmcl.JavaFXLauncher#isStarted")
 @NotNullByDefault
 public final class PluginRuntimeProviderTransactionTest {
+    /// Removes a dependent's runtime binding in the same transaction as immediate package uninstall.
+    ///
+    /// @param temporaryDirectory isolated launcher-local home
+    /// @throws Exception if fixture publication or uninstall fails unexpectedly
+    @Test
+    public void immediateDependentUninstallRemovesRuntimeBinding(@TempDir Path temporaryDirectory) throws Exception {
+        Path localHome = temporaryDirectory.resolve("home");
+        PluginManager manager = new PluginManager(localHome);
+        String providerId = "dev.test.uninstall-provider";
+        String dependentId = "dev.test.uninstall-dependent";
+        writeApiFourPackage(manager.getPluginsDirectory().resolve(providerId + ".npl"), providerId, "1.0.0");
+        writeApiFourPackage(manager.getPluginsDirectory().resolve(dependentId + ".npl"), dependentId, "1.0.0");
+        writeBindings(localHome, providerId, dependentId);
+
+        manager.uninstallPlugin(dependentId);
+
+        assertFalse(new PluginRuntimeBindingStore(localHome, new PluginMutationLock(localHome))
+                .readStrict().containsKey(dependentId));
+    }
+
+    /// Removes a dependent's runtime binding when uninstall is staged for the next restart.
+    ///
+    /// @param temporaryDirectory isolated launcher-local home
+    /// @throws Exception if fixture publication or pending uninstall persistence fails unexpectedly
+    @Test
+    public void pendingDependentUninstallRemovesRuntimeBinding(@TempDir Path temporaryDirectory) throws Exception {
+        Path localHome = temporaryDirectory.resolve("home");
+        PluginManager manager = new PluginManager(localHome);
+        String providerId = "dev.test.pending-provider";
+        String dependentId = "dev.test.pending-dependent";
+        writeApiFourPackage(manager.getPluginsDirectory().resolve(providerId + ".npl"), providerId, "1.0.0");
+        writeApiFourPackage(manager.getPluginsDirectory().resolve(dependentId + ".npl"), dependentId, "1.0.0");
+        writeBindings(localHome, providerId, dependentId);
+
+        manager.markForUninstall(dependentId);
+
+        assertFalse(new PluginRuntimeBindingStore(localHome, new PluginMutationLock(localHome))
+                .readStrict().containsKey(dependentId));
+    }
+
+    /// Removes a stale external-runtime binding when the dependent is replaced by a Java package.
+    ///
+    /// @param temporaryDirectory isolated launcher-local home and replacement source
+    /// @throws Exception if fixture publication or replacement fails unexpectedly
+    @Test
+    public void replacingDependentWithJavaRemovesOldBindingBeforeGraphValidation(
+            @TempDir Path temporaryDirectory
+    ) throws Exception {
+        Path localHome = temporaryDirectory.resolve("home");
+        PluginManager manager = new PluginManager(localHome);
+        String providerId = "dev.test.java-update-provider";
+        String dependentId = "dev.test.java-update-dependent";
+        writeRuntimeProviderPackage(manager.getPluginsDirectory().resolve(providerId + ".npl"), providerId);
+        writeRuntimeConsumerPackage(manager.getPluginsDirectory().resolve(dependentId + ".npl"), dependentId);
+        writeBindings(localHome, providerId, dependentId);
+        Path replacement = temporaryDirectory.resolve("java-update.npl");
+        writeApiFourPackage(replacement, dependentId, "2.0.0");
+
+        manager.prepareLocalPluginInstallation(replacement, Set.of());
+
+        assertFalse(new PluginRuntimeBindingStore(localHome, new PluginMutationLock(localHome))
+                .readStrict().containsKey(dependentId));
+        assertEquals("2.0.0", readManifest(manager.getPluginsDirectory().resolve(dependentId + ".npl")).getVersion());
+    }
+
+    /// Replaces an old ABI/provider binding before validating the prospective replacement graph.
+    ///
+    /// @param temporaryDirectory isolated launcher-local home and replacement source
+    /// @throws Exception if fixture publication or replacement fails unexpectedly
+    @Test
+    public void runtimeUpdateReplacesOldBindingBeforeProspectiveValidation(
+            @TempDir Path temporaryDirectory
+    ) throws Exception {
+        Path localHome = temporaryDirectory.resolve("home");
+        PluginManager manager = new PluginManager(localHome);
+        String oldProviderId = "dev.test.old-abi-provider";
+        String newProviderId = "dev.test.new-abi-provider";
+        String dependentId = "dev.test.abi-dependent";
+        Path oldProvider = manager.getPluginsDirectory().resolve(oldProviderId + ".npl");
+        Path newProvider = manager.getPluginsDirectory().resolve(newProviderId + ".npl");
+        Path installedDependent = manager.getPluginsDirectory().resolve(dependentId + ".npl");
+        writeRuntimeProviderPackage(oldProvider, oldProviderId, 1);
+        writeRuntimeProviderPackage(newProvider, newProviderId, 2);
+        writeRuntimeConsumerPackage(installedDependent, dependentId, 1);
+        writeBindings(localHome, oldProviderId, dependentId);
+        Path replacement = temporaryDirectory.resolve("abi-dependent-v2.npl");
+        writeRuntimeConsumerPackage(replacement, dependentId, 2);
+        LocalPluginInspection inspection = manager.inspectStorePluginPackage(replacement);
+        PluginRuntimeInstallAuthorization authorization = new PluginRuntimeInstallAuthorization(
+                Map.of(dependentId, new RuntimeProviderBinding(dependentId, newProviderId, "rust")),
+                Set.of(), Set.of(), Set.of(), Set.of(), Set.of(),
+                Map.of(dependentId, PluginPackageRuntimeContract.fromManifest(inspection.getManifest()))
+        );
+
+        manager.stagePluginInstallations(
+                List.of(inspection),
+                Map.of(dependentId, Set.of()),
+                Map.of(newProviderId, identity(newProvider)),
+                Map.of(dependentId, Optional.of(identity(installedDependent))),
+                Map.of(),
+                authorization
+        );
+
+        RuntimeProviderBinding binding = Objects.requireNonNull(
+                new PluginRuntimeBindingStore(localHome, new PluginMutationLock(localHome))
+                        .readStrict().get(dependentId)
+        );
+        assertEquals(newProviderId, binding.providerId());
+        assertEquals("rust", binding.runtime());
+    }
+
     /// Rejects a Java package when the confirmed Store contract selected a Rust consumer.
     ///
     /// @param temporaryDirectory isolated launcher-local home and package source
@@ -315,6 +426,54 @@ public final class PluginRuntimeProviderTransactionTest {
         assertFalse(manager.isPluginEnabled(dependentId));
     }
 
+    /// Restores the previous dependent binding when a replacement transaction fails after rebinding it.
+    ///
+    /// @param temporaryDirectory isolated launcher home and replacement source
+    /// @throws Exception if package creation, publication failure, or rollback verification fails unexpectedly
+    @Test
+    public void restoresPreviousRuntimeBindingWhenReplacementStatePublicationFails(
+            @TempDir Path temporaryDirectory
+    ) throws Exception {
+        Path localHome = temporaryDirectory.resolve("home");
+        PluginManager manager = new PluginManager(localHome);
+        String oldProviderId = "dev.test.rollback-old-provider";
+        String newProviderId = "dev.test.rollback-new-provider";
+        String dependentId = "dev.test.rollback-rebound-dependent";
+        Path oldProvider = manager.getPluginsDirectory().resolve(oldProviderId + ".npl");
+        Path newProvider = manager.getPluginsDirectory().resolve(newProviderId + ".npl");
+        Path installedDependent = manager.getPluginsDirectory().resolve(dependentId + ".npl");
+        writeRuntimeProviderPackage(oldProvider, oldProviderId, 1);
+        writeRuntimeProviderPackage(newProvider, newProviderId, 2);
+        writeRuntimeConsumerPackage(installedDependent, dependentId, "1.0.0", 1);
+        writeBindings(localHome, oldProviderId, dependentId);
+        Path replacement = temporaryDirectory.resolve("rebound-dependent-v2.npl");
+        writeRuntimeConsumerPackage(replacement, dependentId, "2.0.0", 2);
+        LocalPluginInspection inspection = manager.inspectStorePluginPackage(replacement);
+        PluginRuntimeInstallAuthorization authorization = new PluginRuntimeInstallAuthorization(
+                Map.of(dependentId, new RuntimeProviderBinding(dependentId, newProviderId, "rust")),
+                Set.of(newProviderId), Set.of(), Set.of(), Set.of(), Set.of(),
+                Map.of(dependentId, PluginPackageRuntimeContract.fromManifest(inspection.getManifest()))
+        );
+        Files.createDirectory(localHome.resolve("plugin-states.json.tmp"));
+
+        assertThrows(IOException.class, () -> manager.stagePluginInstallations(
+                List.of(inspection),
+                Map.of(dependentId, Set.of()),
+                Map.of(newProviderId, identity(newProvider)),
+                Map.of(dependentId, Optional.of(identity(installedDependent))),
+                Map.of(),
+                authorization
+        ));
+
+        RuntimeProviderBinding restoredBinding = Objects.requireNonNull(
+                new PluginRuntimeBindingStore(localHome, new PluginMutationLock(localHome))
+                        .readStrict().get(dependentId)
+        );
+        assertEquals(oldProviderId, restoredBinding.providerId());
+        assertEquals("1.0.0", readManifest(installedDependent).getVersion());
+        assertFalse(manager.isPluginEnabled(newProviderId));
+    }
+
     /// Blocks Runtime Host removal and reports every dependent recorded only by virtual runtime bindings.
     ///
     /// @param temporaryDirectory isolated launcher home
@@ -340,12 +499,13 @@ public final class PluginRuntimeProviderTransactionTest {
         assertTrue(Files.exists(manager.getPluginsDirectory().resolve(providerId + ".npl")));
     }
 
-    /// Disables every virtual runtime dependent before disabling its selected Runtime Host.
+    /// Rejects default Runtime Host disablement while reporting every enabled bound dependent.
     ///
     /// @param temporaryDirectory isolated launcher home
     /// @throws Exception if package creation or durable state mutation fails
     @Test
-    public void disablingProviderDisablesAllBoundRuntimeDependents(@TempDir Path temporaryDirectory) throws Exception {
+    public void disablingProviderRejectsEnabledBoundRuntimeDependents(@TempDir Path temporaryDirectory)
+            throws Exception {
         Path localHome = temporaryDirectory.resolve("home");
         PluginManager manager = new PluginManager(localHome);
         String providerId = "dev.hmclce.test.disable-runtime-host";
@@ -358,7 +518,34 @@ public final class PluginRuntimeProviderTransactionTest {
         }
         writeBindings(localHome, providerId, firstDependentId, secondDependentId);
 
-        manager.disablePlugin(providerId);
+        IOException exception = assertThrows(IOException.class, () -> manager.disablePlugin(providerId));
+
+        assertTrue(Objects.requireNonNull(exception.getMessage()).contains(firstDependentId));
+        assertTrue(exception.getMessage().contains(secondDependentId));
+        assertTrue(manager.isPluginEnabled(providerId));
+        assertTrue(manager.isPluginEnabled(firstDependentId));
+        assertTrue(manager.isPluginEnabled(secondDependentId));
+    }
+
+    /// Disables every virtual runtime dependent only through the explicit cascade operation.
+    ///
+    /// @param temporaryDirectory isolated launcher home
+    /// @throws Exception if package creation or durable state mutation fails
+    @Test
+    public void cascadeDisableDisablesAllBoundRuntimeDependents(@TempDir Path temporaryDirectory) throws Exception {
+        Path localHome = temporaryDirectory.resolve("home");
+        PluginManager manager = new PluginManager(localHome);
+        String providerId = "dev.test.cascade-disable-runtime-host";
+        String firstDependentId = "dev.test.cascade-disable-rust-one";
+        String secondDependentId = "dev.test.cascade-disable-rust-two";
+        for (String pluginId : List.of(providerId, firstDependentId, secondDependentId)) {
+            writeApiFourPackage(manager.getPluginsDirectory().resolve(pluginId + ".npl"), pluginId, "1.0.0");
+            manager.enablePlugin(pluginId);
+            assertTrue(manager.isPluginEnabled(pluginId));
+        }
+        writeBindings(localHome, providerId, firstDependentId, secondDependentId);
+
+        manager.disablePluginCascade(providerId);
 
         assertFalse(manager.isPluginEnabled(providerId));
         assertFalse(manager.isPluginEnabled(firstDependentId));
@@ -470,12 +657,23 @@ public final class PluginRuntimeProviderTransactionTest {
     /// @param pluginId Provider plugin ID
     /// @throws IOException if package creation fails
     private static void writeRuntimeProviderPackage(Path target, String pluginId) throws IOException {
+        writeRuntimeProviderPackage(target, pluginId, 2);
+    }
+
+    /// Writes a schema-v5 Java Runtime Host providing one embedded Rust ABI.
+    ///
+    /// @param target target package path
+    /// @param pluginId Provider plugin ID
+    /// @param providedAbi provided Rust plugin ABI
+    /// @throws IOException if package creation fails
+    private static void writeRuntimeProviderPackage(Path target, String pluginId, int providedAbi)
+            throws IOException {
         writePackage(target, pluginId, "1.0.0", """
                 "runtime": "java", "abi": 2, "pluginKind": "runtime-provider",
                 "executionMode": "embedded", "platforms": [],
-                "providesRuntimes": [{"runtime": "rust", "abis": [2], "bridgeAbi": 1,
+                "providesRuntimes": [{"runtime": "rust", "abis": [%s], "bridgeAbi": 1,
                   "executionModes": ["embedded"], "features": ["bridge"]}]
-                """);
+                """.formatted(providedAbi));
     }
 
     /// Writes a schema-v5 embedded Rust ABI 2 consumer package.
@@ -484,10 +682,32 @@ public final class PluginRuntimeProviderTransactionTest {
     /// @param pluginId dependent plugin ID
     /// @throws IOException if package creation fails
     private static void writeRuntimeConsumerPackage(Path target, String pluginId) throws IOException {
-        writePackage(target, pluginId, "1.0.0", """
-                "runtime": "rust", "abi": 2, "pluginKind": "normal",
+        writeRuntimeConsumerPackage(target, pluginId, 2);
+    }
+
+    /// Writes a schema-v5 embedded Rust consumer package for one ABI.
+    ///
+    /// @param target target package path
+    /// @param pluginId dependent plugin ID
+    /// @param abi required Rust plugin ABI
+    /// @throws IOException if package creation fails
+    private static void writeRuntimeConsumerPackage(Path target, String pluginId, int abi) throws IOException {
+        writeRuntimeConsumerPackage(target, pluginId, "1.0.0", abi);
+    }
+
+    /// Writes a schema-v5 embedded Rust consumer package for one version and ABI.
+    ///
+    /// @param target target package path
+    /// @param pluginId dependent plugin ID
+    /// @param version package version
+    /// @param abi required Rust plugin ABI
+    /// @throws IOException if package creation fails
+    private static void writeRuntimeConsumerPackage(Path target, String pluginId, String version, int abi)
+            throws IOException {
+        writePackage(target, pluginId, version, """
+                "runtime": "rust", "abi": %s, "pluginKind": "normal",
                 "executionMode": "embedded", "platforms": []
-                """);
+                """.formatted(abi));
     }
 
     /// Writes a schema-v5 embedded Python ABI 2 consumer package.

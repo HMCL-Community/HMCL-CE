@@ -33,6 +33,7 @@ import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
@@ -114,7 +115,7 @@ public final class PluginInstallPlanPresentationTest {
                 source, registry, manager, registry.getPlugins().get(0), rootManifest));
         catalog.put("dev.test.rust-host", new PluginStoreItem(
                 source, registry, manager, registry.getPlugins().get(1), hostManifest));
-        return new PluginStoreDependencyResolver(catalog).resolveInstallPlan(
+        return new PluginStoreDependencyResolver(catalog, List.of(source)).resolveInstallPlan(
                 "dev.test.rust-tool", rootManifest.getVersions().get(0), Map.of(), Map.of(), Map.of());
     }
 

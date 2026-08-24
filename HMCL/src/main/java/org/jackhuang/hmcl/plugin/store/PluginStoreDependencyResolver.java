@@ -51,7 +51,7 @@ public final class PluginStoreDependencyResolver {
     /// Shared deterministic runtime Provider compatibility and ranking policy.
     private final RuntimeProviderSelector runtimeProviderSelector = new RuntimeProviderSelector();
 
-    /// Source priority derived from the aggregate winner insertion order.
+    /// Source priority captured from the complete configured source order.
     private final @Unmodifiable Map<String, Integer> sourcePriorities;
 
     /// Creates a resolver bound to one immutable aggregate catalog snapshot.
@@ -60,11 +60,23 @@ public final class PluginStoreDependencyResolver {
     /// remote metadata eligible for dependency planning.
     ///
     /// @param winningItems selected catalog winners indexed by plugin ID
-    public PluginStoreDependencyResolver(@Unmodifiable Map<String, PluginStoreItem> winningItems) {
+    /// @param configuredSources complete configured sources in priority order
+    public PluginStoreDependencyResolver(
+            @Unmodifiable Map<String, PluginStoreItem> winningItems,
+            @Unmodifiable List<PluginSource> configuredSources
+    ) {
         this.winningItems = Map.copyOf(winningItems);
         Map<String, Integer> priorities = new LinkedHashMap<>();
+        for (PluginSource source : configuredSources) {
+            if (priorities.putIfAbsent(source.getId(), priorities.size()) != null) {
+                throw new IllegalArgumentException("Duplicate configured plugin source ID: " + source.getId());
+            }
+        }
         for (PluginStoreItem item : winningItems.values()) {
-            priorities.computeIfAbsent(item.getSource().getId(), ignored -> priorities.size());
+            if (!priorities.containsKey(item.getSource().getId())) {
+                throw new IllegalArgumentException("Catalog winner source is absent from the configured snapshot: "
+                        + item.getSource().getId());
+            }
         }
         sourcePriorities = Map.copyOf(priorities);
     }
@@ -89,6 +101,34 @@ public final class PluginStoreDependencyResolver {
             @Unmodifiable Map<String, PluginArtifactIdentity> installedArtifactIdentities,
             @Unmodifiable Map<String, PluginArtifactIdentity> reusableInstalledArtifacts
     ) throws IOException {
+        return resolveInstallPlan(
+                pluginId,
+                requestedVersion,
+                installedManifests,
+                installedArtifactIdentities,
+                reusableInstalledArtifacts,
+                Map.of()
+        );
+    }
+
+    /// Resolves a requested version with explicit enabled-reusable and disabled-activatable artifact states.
+    ///
+    /// @param pluginId requested root plugin ID
+    /// @param requestedVersion exact requested remote version
+    /// @param installedManifests installed plugin manifests indexed by ID
+    /// @param installedArtifactIdentities exact current artifact for every installed manifest
+    /// @param reusableInstalledArtifacts exact enabled artifacts approved for reuse
+    /// @param activatableInstalledArtifacts exact disabled artifacts approved for activation
+    /// @return immutable dependency-first install plan
+    /// @throws IOException if metadata is unavailable or the dependency graph cannot be satisfied
+    public PluginInstallPlan resolveInstallPlan(
+            String pluginId,
+            PluginStoreManifest.PluginVersionEntry requestedVersion,
+            @Unmodifiable Map<String, PluginManifest> installedManifests,
+            @Unmodifiable Map<String, PluginArtifactIdentity> installedArtifactIdentities,
+            @Unmodifiable Map<String, PluginArtifactIdentity> reusableInstalledArtifacts,
+            @Unmodifiable Map<String, PluginArtifactIdentity> activatableInstalledArtifacts
+    ) throws IOException {
         PluginStoreItem rootItem = requireWinningItem(pluginId);
         PluginStoreManifest rootManifest = requireManifest(rootItem, pluginId);
         PluginStoreManifest.PluginVersionEntry rootVersion = requirePublishedVersion(
@@ -103,7 +143,9 @@ public final class PluginStoreDependencyResolver {
                 Map.copyOf(installedArtifactIdentities);
         @Unmodifiable Map<String, PluginArtifactIdentity> reusableInstalled =
                 Map.copyOf(reusableInstalledArtifacts);
-        validateArtifactSnapshots(installed, installedArtifacts, reusableInstalled);
+        @Unmodifiable Map<String, PluginArtifactIdentity> activatableInstalled =
+                Map.copyOf(activatableInstalledArtifacts);
+        validateArtifactSnapshots(installed, installedArtifacts, reusableInstalled, activatableInstalled);
 
         Map<String, PluginInstallPlan.Entry> selected = new LinkedHashMap<>();
         selected.put(pluginId, createRemotePlanEntry(pluginId, rootItem, rootVersion, installed));
@@ -128,6 +170,7 @@ public final class PluginStoreDependencyResolver {
                 pluginId,
                 installed,
                 reusableInstalled.keySet(),
+                activatableInstalled.keySet(),
                 solution,
                 runtimeBindings,
                 failures
@@ -138,7 +181,7 @@ public final class PluginStoreDependencyResolver {
         for (PluginInstallPlan.Entry entry : solution.values()) {
             if (!entry.requiresDownload()) {
                 @Nullable PluginArtifactIdentity identity = entry.getAction() == PluginInstallPlan.Action.ENABLE
-                        ? installedArtifacts.get(entry.getPluginId())
+                        ? activatableInstalled.get(entry.getPluginId())
                         : reusableInstalled.get(entry.getPluginId());
                 if (identity == null) {
                     throw new IllegalStateException("Selected reusable entry has no exact artifact identity: "
@@ -178,6 +221,7 @@ public final class PluginStoreDependencyResolver {
             String rootPluginId,
             @Unmodifiable Map<String, PluginManifest> installedManifests,
             @Unmodifiable Set<String> reusableInstalledPluginIds,
+            @Unmodifiable Set<String> activatableInstalledPluginIds,
             Map<String, PluginInstallPlan.Entry> solution,
             Map<String, RuntimeProviderBinding> runtimeBindings,
             List<IOException> failures
@@ -197,6 +241,7 @@ public final class PluginStoreDependencyResolver {
                     requirement,
                     installedManifests,
                     reusableInstalledPluginIds,
+                    activatableInstalledPluginIds,
                     solution
             );
             @Nullable PluginInstallPlan.Entry existing = solution.get(provider.entry.getPluginId());
@@ -242,6 +287,7 @@ public final class PluginStoreDependencyResolver {
             RuntimeRequirement requirement,
             @Unmodifiable Map<String, PluginManifest> installedManifests,
             @Unmodifiable Set<String> reusableInstalledPluginIds,
+            @Unmodifiable Set<String> activatableInstalledPluginIds,
             Map<String, PluginInstallPlan.Entry> selected
     ) throws IOException {
         List<ProviderCandidate> candidates = new ArrayList<>();
@@ -250,6 +296,10 @@ public final class PluginStoreDependencyResolver {
                 continue;
             }
             boolean enabled = reusableInstalledPluginIds.contains(manifest.getId());
+            boolean activatable = activatableInstalledPluginIds.contains(manifest.getId());
+            if (!enabled && !activatable) {
+                continue;
+            }
             PluginInstallPlan.Entry entry = new PluginInstallPlan.Entry(
                     manifest.getId(), manifest.getName(), manifest.getVersion(), enabled
                     ? PluginInstallPlan.Action.REUSE
@@ -358,13 +408,18 @@ public final class PluginStoreDependencyResolver {
     private static void validateArtifactSnapshots(
             @Unmodifiable Map<String, PluginManifest> installed,
             @Unmodifiable Map<String, PluginArtifactIdentity> installedArtifacts,
-            @Unmodifiable Map<String, PluginArtifactIdentity> reusableInstalled
+            @Unmodifiable Map<String, PluginArtifactIdentity> reusableInstalled,
+            @Unmodifiable Map<String, PluginArtifactIdentity> activatableInstalled
     ) {
         if (!installed.keySet().equals(installedArtifacts.keySet())) {
             throw new IllegalArgumentException("Every installed manifest must have one exact prior artifact identity");
         }
-        if (!installedArtifacts.keySet().containsAll(reusableInstalled.keySet())) {
-            throw new IllegalArgumentException("Reusable artifacts must belong to the installed manifest snapshot");
+        if (!installedArtifacts.keySet().containsAll(reusableInstalled.keySet())
+                || !installedArtifacts.keySet().containsAll(activatableInstalled.keySet())) {
+            throw new IllegalArgumentException("Eligible artifacts must belong to the installed manifest snapshot");
+        }
+        if (reusableInstalled.keySet().stream().anyMatch(activatableInstalled::containsKey)) {
+            throw new IllegalArgumentException("An installed artifact cannot be reusable and activatable");
         }
         for (Map.Entry<String, PluginArtifactIdentity> entry : installedArtifacts.entrySet()) {
             @Nullable PluginManifest installedManifest = installed.get(entry.getKey());
@@ -379,6 +434,12 @@ public final class PluginStoreDependencyResolver {
         for (Map.Entry<String, PluginArtifactIdentity> entry : reusableInstalled.entrySet()) {
             if (!entry.getValue().equals(installedArtifacts.get(entry.getKey()))) {
                 throw new IllegalArgumentException("Reusable artifact differs from the installed snapshot: "
+                        + entry.getKey());
+            }
+        }
+        for (Map.Entry<String, PluginArtifactIdentity> entry : activatableInstalled.entrySet()) {
+            if (!entry.getValue().equals(installedArtifacts.get(entry.getKey()))) {
+                throw new IllegalArgumentException("Activatable artifact differs from the installed snapshot: "
                         + entry.getKey());
             }
         }

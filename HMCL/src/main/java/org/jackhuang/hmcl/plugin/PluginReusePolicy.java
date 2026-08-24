@@ -20,6 +20,7 @@ package org.jackhuang.hmcl.plugin;
 import org.jackhuang.hmcl.plugin.internal.PluginPackageVersions;
 import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityEvaluator;
 import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityRequirements;
+import org.jackhuang.hmcl.plugin.trust.PluginRuntimeTrustGuard;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
@@ -46,22 +47,28 @@ final class PluginReusePolicy {
     /// Launcher version supplied to the shared compatibility evaluator.
     private final String launcherVersion;
 
+    /// Proof-backed runtime trust policy shared with lifecycle loading.
+    private final PluginRuntimeTrustGuard runtimeTrustGuard;
+
     /// Creates one exact-artifact dependency reuse policy.
     ///
     /// @param packageRepository installed package repository
     /// @param permissionService artifact-bound permission service
     /// @param compatibilityEvaluator shared launcher-host compatibility policy
     /// @param launcherVersion current launcher version
+    /// @param runtimeTrustGuard proof-backed runtime trust policy
     PluginReusePolicy(
             PluginPackageRepository packageRepository,
             PluginPermissionService permissionService,
             PluginCompatibilityEvaluator compatibilityEvaluator,
-            String launcherVersion
+            String launcherVersion,
+            PluginRuntimeTrustGuard runtimeTrustGuard
     ) {
         this.packageRepository = packageRepository;
         this.permissionService = permissionService;
         this.compatibilityEvaluator = compatibilityEvaluator;
         this.launcherVersion = launcherVersion;
+        this.runtimeTrustGuard = runtimeTrustGuard;
     }
 
     /// Returns whether one installed manifest currently satisfies every reuse gate.
@@ -91,10 +98,42 @@ final class PluginReusePolicy {
             PluginManifest manifest,
             @Unmodifiable Set<String> enabledPluginIds
     ) throws IOException {
+        return resolveEligibleIdentity(pluginId, manifest, enabledPluginIds, true);
+    }
+
+    /// Resolves the exact identity of one fully eligible but currently disabled installed artifact.
+    ///
+    /// @param pluginId expected installed plugin ID
+    /// @param manifest installation-planning manifest
+    /// @param enabledPluginIds current desired-enabled plugin IDs
+    /// @return exact activatable identity or `null` when disabled state is not the only failed reuse gate
+    /// @throws IOException if installed package, permission, or trust state cannot be inspected
+    @Nullable PluginArtifactIdentity resolveActivatableIdentity(
+            String pluginId,
+            PluginManifest manifest,
+            @Unmodifiable Set<String> enabledPluginIds
+    ) throws IOException {
+        return resolveEligibleIdentity(pluginId, manifest, enabledPluginIds, false);
+    }
+
+    /// Applies every exact-artifact reuse gate with an explicit required enablement state.
+    ///
+    /// @param pluginId expected installed plugin ID
+    /// @param manifest installation-planning manifest
+    /// @param enabledPluginIds current desired-enabled plugin IDs
+    /// @param requireEnabled whether the artifact must currently be enabled rather than disabled
+    /// @return exact eligible identity or `null`
+    /// @throws IOException if installed package, permission, or trust state cannot be inspected
+    private @Nullable PluginArtifactIdentity resolveEligibleIdentity(
+            String pluginId,
+            PluginManifest manifest,
+            @Unmodifiable Set<String> enabledPluginIds,
+            boolean requireEnabled
+    ) throws IOException {
         if (!pluginId.equals(manifest.getId())) {
             return null;
         }
-        if (!enabledPluginIds.contains(pluginId)) {
+        if (enabledPluginIds.contains(pluginId) != requireEnabled) {
             return null;
         }
         if (!compatibilityEvaluator.evaluate(
@@ -116,6 +155,10 @@ final class PluginReusePolicy {
             return null;
         }
         String sha256 = PluginPackageVersions.calculateSha256(packageFile);
+        PluginArtifactIdentity identity = PluginArtifactIdentity.of(currentManifest, sha256);
+        if (runtimeTrustGuard.getBlockReason(identity, java.nio.file.Files.size(packageFile)) != null) {
+            return null;
+        }
         @Unmodifiable Set<PluginPermission> granted = permissionService.getGrantedPermissions(
                 currentManifest,
                 sha256
@@ -123,7 +166,7 @@ final class PluginReusePolicy {
         if (!granted.containsAll(currentManifest.getRequiredPermissions())) {
             return null;
         }
-        return PluginArtifactIdentity.of(currentManifest, sha256);
+        return identity;
     }
 
     /// Revalidates every unreplaced installed dependency in a replacement batch's complete dependency closure.

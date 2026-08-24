@@ -220,7 +220,8 @@ public final class PluginManager {
                 packageRepository,
                 permissionService,
                 compatibilityEvaluator,
-                Metadata.VERSION
+                Metadata.VERSION,
+                runtimeTrustGuard
         );
         stateStore.load(enabledStates, pendingUninstall);
         loaders.put(PluginManifest.PluginType.JAVA, new JavaPluginLoader());
@@ -421,6 +422,7 @@ public final class PluginManager {
                         () -> {
                             permissionService.removePlugin(pluginId);
                             certificationReceiptStore.removePlugin(pluginId);
+                            runtimeBindingStore.removeDependentsStrict(Set.of(pluginId));
                             stateStore.saveStrict(nextEnabledStates, nextPendingUninstall);
                         },
                         () -> {
@@ -1245,21 +1247,38 @@ public final class PluginManager {
         );
     }
 
-    /// Disables dependents first, then disables the requested plugin.
+    /// Disables one plugin unless enabled external-runtime plugins remain bound to it as their Runtime Provider.
     ///
     /// Active Mixin bytecode remains until restart and is reflected by `restartRequired`.
     ///
     /// @param pluginId plugin ID
-    public void disablePlugin(String pluginId) {
+    /// @throws IOException if enabled runtime dependents block the operation or lifecycle state cannot be persisted
+    public void disablePlugin(String pluginId) throws IOException {
         administrativeGuard.checkTrustedCaller();
-        try {
-            mutationLock.run(() -> {
-                stateStore.load(enabledStates, pendingUninstall);
-                disablePluginLocked(pluginId);
-            });
-        } catch (IOException exception) {
-            LOG.warning("Cannot persist plugin disablement for " + pluginId, exception);
-        }
+        mutationLock.run(() -> {
+            stateStore.load(enabledStates, pendingUninstall);
+            @Unmodifiable List<String> enabledRuntimeDependents =
+                    dependencyPlanner.findEnabledRuntimeDependents(pluginId, Set.copyOf(enabledStates));
+            if (!enabledRuntimeDependents.isEmpty()) {
+                throw new IOException("Cannot disable Runtime Provider " + pluginId
+                        + "; enabled runtime dependents: " + String.join(", ", enabledRuntimeDependents));
+            }
+            disablePluginLocked(pluginId);
+        });
+    }
+
+    /// Explicitly disables every direct or transitive dependent before disabling the requested plugin.
+    ///
+    /// Active Mixin bytecode remains until restart and is reflected by `restartRequired`.
+    ///
+    /// @param pluginId dependency or Runtime Provider plugin ID
+    /// @throws IOException if the installed dependency graph cannot be read or lifecycle state cannot be persisted
+    public void disablePluginCascade(String pluginId) throws IOException {
+        administrativeGuard.checkTrustedCaller();
+        mutationLock.run(() -> {
+            stateStore.load(enabledStates, pendingUninstall);
+            disablePluginLocked(pluginId);
+        });
     }
 
     /// Disables one plugin and its dependents while the shared mutation lock is held.
@@ -1739,6 +1758,7 @@ public final class PluginManager {
             @Unmodifiable Map<String, PluginArtifactIdentity> artifacts =
                     installationStateGuard.resolvePlanningArtifactIdentities(manifests);
             Map<String, PluginArtifactIdentity> reusable = new LinkedHashMap<>();
+            Map<String, PluginArtifactIdentity> activatable = new LinkedHashMap<>();
             for (Map.Entry<String, PluginManifest> entry : manifests.entrySet()) {
                 @Nullable PluginArtifactIdentity reusableIdentity = reusePolicy.resolveReusableIdentity(
                         entry.getKey(),
@@ -1752,9 +1772,28 @@ public final class PluginManager {
                                 + entry.getKey());
                     }
                     reusable.put(entry.getKey(), reusableIdentity);
+                    continue;
+                }
+                @Nullable PluginArtifactIdentity activatableIdentity = reusePolicy.resolveActivatableIdentity(
+                        entry.getKey(),
+                        entry.getValue(),
+                        enabledStates
+                );
+                if (activatableIdentity != null) {
+                    PluginArtifactIdentity plannedIdentity = Objects.requireNonNull(artifacts.get(entry.getKey()));
+                    if (!plannedIdentity.equals(activatableIdentity)) {
+                        throw new IOException("Plugin artifact changed while the installation plan was captured: "
+                                + entry.getKey());
+                    }
+                    activatable.put(entry.getKey(), activatableIdentity);
                 }
             }
-            return new PluginInstallationPlanningSnapshot(manifests, artifacts, Map.copyOf(reusable));
+            return new PluginInstallationPlanningSnapshot(
+                    manifests,
+                    artifacts,
+                    Map.copyOf(reusable),
+                    Map.copyOf(activatable)
+            );
         });
     }
 
@@ -2093,13 +2132,22 @@ public final class PluginManager {
                 dependencyPlanner.readInstallPlanningManifests(plugins, pendingUninstall);
         Map<String, PluginManifest> effectiveManifests = new LinkedHashMap<>(installedBefore);
         effectiveManifests.putAll(replacements);
+        @Unmodifiable Map<String, RuntimeProviderBinding> prospectiveRuntimeBindings =
+                createProspectiveRuntimeBindings(
+                        Set.copyOf(replacements.keySet()),
+                        runtimeAuthorization.getRuntimeBindings()
+                );
         validateRuntimeInstallAuthorization(
                 runtimeAuthorization,
                 Map.copyOf(effectiveManifests),
                 Set.copyOf(replacements.keySet()),
                 expectedReusableArtifacts
         );
-        dependencyPlanner.validateReplacementGraph(effectiveManifests, replacements.keySet());
+        dependencyPlanner.validateReplacementGraph(
+                effectiveManifests,
+                replacements.keySet(),
+                prospectiveRuntimeBindings
+        );
         Set<String> virtualProviderIds = runtimeAuthorization.getRuntimeBindings().values().stream()
                 .map(RuntimeProviderBinding::providerId)
                 .filter(providerId -> !replacements.containsKey(providerId))
@@ -2158,7 +2206,7 @@ public final class PluginManager {
                             Set.copyOf(replacements.keySet()),
                             certificationReceipts
                     );
-                    runtimeBindingStore.mergeStrict(runtimeAuthorization.getRuntimeBindings());
+                    runtimeBindingStore.replaceStrict(prospectiveRuntimeBindings);
                 },
                 () -> stateStore.saveStrict(nextEnabledStates, nextPendingUninstall),
                 permissionService::reload
@@ -2187,6 +2235,25 @@ public final class PluginManager {
             LOG.info("Staged plugin for next restart: " + pluginId + " " + replacement.getValue().getVersion());
         }
         return List.copyOf(replacements.values());
+    }
+
+    /// Applies dependent-owned binding removals and replacements to the current durable binding snapshot.
+    ///
+    /// @param replacementIds package IDs replaced by the transaction
+    /// @param replacementBindings confirmed new bindings for external-runtime dependents
+    /// @return immutable complete prospective binding document
+    /// @throws IOException if the current binding document is invalid
+    private @Unmodifiable Map<String, RuntimeProviderBinding> createProspectiveRuntimeBindings(
+            @Unmodifiable Set<String> replacementIds,
+            @Unmodifiable Map<String, RuntimeProviderBinding> replacementBindings
+    ) throws IOException {
+        if (!replacementIds.containsAll(replacementBindings.keySet())) {
+            throw new IOException("Runtime binding replacement belongs to a package outside the install batch");
+        }
+        Map<String, RuntimeProviderBinding> prospective = new LinkedHashMap<>(runtimeBindingStore.readStrict());
+        replacementIds.forEach(prospective::remove);
+        prospective.putAll(replacementBindings);
+        return Map.copyOf(prospective);
     }
 
     /// Verifies that Store authorization exactly covers every changed artifact declaring a dangerous permission.
@@ -2288,6 +2355,21 @@ public final class PluginManager {
                 .containsAll(authorization.getEnablementPluginIds())) {
             throw new IOException("Runtime Provider enablement is not part of the confirmed bindings");
         }
+        for (String providerId : authorization.getEnablementPluginIds()) {
+            if (replacementIds.contains(providerId)) {
+                throw new IOException("Runtime Provider enablement cannot replace a package: " + providerId);
+            }
+            PluginManifest provider = Objects.requireNonNull(effectiveManifests.get(providerId));
+            @Nullable PluginArtifactIdentity expected = expectedReusableArtifacts.get(providerId);
+            @Nullable PluginArtifactIdentity activatable = reusePolicy.resolveActivatableIdentity(
+                    providerId,
+                    provider,
+                    enabledStates
+            );
+            if (expected == null || !expected.equals(activatable)) {
+                throw new IOException("Installed Runtime Provider is no longer safely activatable: " + providerId);
+            }
+        }
     }
 
     /// Returns whether one Provider declaration satisfies the dependent's runtime, ABI, mode, and feature contract.
@@ -2366,6 +2448,7 @@ public final class PluginManager {
                 () -> {
                     permissionService.removePlugin(pluginId);
                     certificationReceiptStore.removePlugin(pluginId);
+                    runtimeBindingStore.removeDependentsStrict(Set.of(pluginId));
                     stateStore.saveStrict(nextEnabledStates, nextPendingUninstall);
                 },
                 () -> {
@@ -2425,6 +2508,7 @@ public final class PluginManager {
         packageMutationService.publishDocuments(
                 () -> {
                     permissionService.removePlugin(pluginId);
+                    runtimeBindingStore.removeDependentsStrict(Set.of(pluginId));
                     stateStore.saveStrict(nextEnabledStates, nextPendingUninstall);
                 },
                 () -> {

@@ -79,6 +79,20 @@ final class PluginDependencyPlanner {
             Map<String, PluginManifest> manifests,
             Set<String> replacementIds
     ) throws IOException {
+        validateReplacementGraph(manifests, replacementIds, runtimeBindingStore.readStrict());
+    }
+
+    /// Validates a replacement graph against the exact prospective virtual runtime edges.
+    ///
+    /// @param manifests complete prospective manifests indexed by ID
+    /// @param replacementIds plugin IDs replaced by the batch
+    /// @param runtimeBindings complete prospective runtime bindings
+    /// @throws IOException if a dependency or runtime edge is missing, incompatible, or cyclic
+    void validateReplacementGraph(
+            Map<String, PluginManifest> manifests,
+            Set<String> replacementIds,
+            @Unmodifiable Map<String, RuntimeProviderBinding> runtimeBindings
+    ) throws IOException {
         Set<String> visited = new HashSet<>();
         for (String pluginId : replacementIds) {
             validateDependencyClosure(pluginId, manifests, new HashSet<>(), visited);
@@ -102,7 +116,7 @@ final class PluginDependencyPlanner {
                 }
             }
         }
-        for (RuntimeProviderBinding binding : runtimeBindingStore.readStrict().values()) {
+        for (RuntimeProviderBinding binding : runtimeBindings.values()) {
             if (!replacementIds.contains(binding.dependentPluginId())
                     && !replacementIds.contains(binding.providerId())) {
                 continue;
@@ -169,6 +183,25 @@ final class PluginDependencyPlanner {
                         .filter(installed::containsKey)
                         .filter(dependentId -> !pendingUninstall.contains(dependentId))
         )
+                .distinct()
+                .sorted()
+                .toList();
+    }
+
+    /// Returns enabled external-runtime plugins bound directly to one Runtime Provider.
+    ///
+    /// @param providerId Runtime Provider plugin ID
+    /// @param enabledPluginIds plugin IDs whose desired lifecycle state is enabled
+    /// @return sorted enabled bound dependent IDs
+    /// @throws IOException if the runtime binding document cannot be read
+    @Unmodifiable List<String> findEnabledRuntimeDependents(
+            String providerId,
+            @Unmodifiable Set<String> enabledPluginIds
+    ) throws IOException {
+        return runtimeBindingStore.readStrict().values().stream()
+                .filter(binding -> binding.providerId().equals(providerId))
+                .map(RuntimeProviderBinding::dependentPluginId)
+                .filter(enabledPluginIds::contains)
                 .distinct()
                 .sorted()
                 .toList();

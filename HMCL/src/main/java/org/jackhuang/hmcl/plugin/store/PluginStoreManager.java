@@ -673,7 +673,14 @@ public final class PluginStoreManager {
         if (sourceContext == null) {
             return List.of();
         }
+        return getStoreItems(sourceContext);
+    }
 
+    /// Resolves registry entries against one already captured immutable source generation.
+    ///
+    /// @param sourceContext exact source generation used for every item and manifest cache lookup
+    /// @return resolved store items from that generation
+    private @Unmodifiable List<PluginStoreItem> getStoreItems(SourceContext sourceContext) {
         List<PluginStoreItem> items = new ArrayList<>();
         for (PluginStoreRegistry.PluginStoreEntry entry : sourceContext.registry.getPlugins()) {
             try {
@@ -808,11 +815,15 @@ public final class PluginStoreManager {
             @Unmodifiable Map<String, PluginArtifactIdentity> installedArtifactIdentities,
             @Unmodifiable Map<String, PluginArtifactIdentity> reusableInstalledArtifacts
     ) throws IOException {
+        @Nullable SourceContext sourceContext = context;
+        if (sourceContext == null) {
+            throw new IOException("Plugin Store source is not loaded");
+        }
         Map<String, PluginStoreItem> winningItems = new LinkedHashMap<>();
-        for (PluginStoreItem item : getStoreItems()) {
+        for (PluginStoreItem item : getStoreItems(sourceContext)) {
             winningItems.putIfAbsent(item.getEntry().getId(), item);
         }
-        return new PluginStoreDependencyResolver(winningItems).resolveInstallPlan(
+        return new PluginStoreDependencyResolver(winningItems, List.of(sourceContext.source)).resolveInstallPlan(
                 pluginId,
                 requestedVersion,
                 installedManifests,

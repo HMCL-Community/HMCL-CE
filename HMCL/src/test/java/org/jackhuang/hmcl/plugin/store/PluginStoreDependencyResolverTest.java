@@ -38,6 +38,8 @@ import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -57,13 +59,66 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /// Verifies complete-graph dependency selection for plugin-store installation plans.
 @NotNullByDefault
 public final class PluginStoreDependencyResolverTest {
+    /// Preserves configured source priority when a later source replaces a winner without moving its map key.
+    @Test
+    public void configuredSourcePrioritySurvivesWinnerReplacementPosition() throws Exception {
+        PluginStoreSnapshot snapshot = runtimeSourcePrioritySnapshot();
+        String rootId = "dev.test.priority-rust-tool";
+        assertEquals("configured-second", snapshot.getWinningItems().values().iterator().next()
+                .getSource().getId());
+
+        PluginInstallPlan plan = new PluginStoreDependencyResolver(
+                snapshot.getWinningItems(),
+                snapshot.getSourceConfiguration().getSources()
+        ).resolveInstallPlan(
+                rootId,
+                runtimeVersion(snapshot.getWinningItems(), rootId),
+                Map.of(), Map.of(), Map.of()
+        );
+
+        assertEquals("dev.test.configured-first-rust-host",
+                Objects.requireNonNull(plan.getRuntimeBindings().get(rootId)).providerId());
+    }
+
+    /// Keeps Runtime Provider selection stable when the same winner map is published in another insertion order.
+    @Test
+    public void winnerInsertionOrderDoesNotChangeConfiguredProviderPriority() throws Exception {
+        PluginStoreSnapshot snapshot = runtimeSourcePrioritySnapshot();
+        List<Map.Entry<String, PluginStoreItem>> reversedEntries =
+                new ArrayList<>(snapshot.getWinningItems().entrySet());
+        Collections.reverse(reversedEntries);
+        Map<String, PluginStoreItem> reorderedWinners = new LinkedHashMap<>();
+        reversedEntries.forEach(entry -> reorderedWinners.put(entry.getKey(), entry.getValue()));
+        String rootId = "dev.test.priority-rust-tool";
+        @Unmodifiable List<PluginSource> configuredSources = snapshot.getSourceConfiguration().getSources();
+        assertNotEquals(
+                List.copyOf(snapshot.getWinningItems().keySet()),
+                List.copyOf(reorderedWinners.keySet())
+        );
+
+        PluginInstallPlan original = new PluginStoreDependencyResolver(
+                snapshot.getWinningItems(), configuredSources
+        ).resolveInstallPlan(
+                rootId, runtimeVersion(snapshot.getWinningItems(), rootId), Map.of(), Map.of(), Map.of()
+        );
+        PluginInstallPlan reordered = new PluginStoreDependencyResolver(
+                Collections.unmodifiableMap(reorderedWinners), configuredSources
+        ).resolveInstallPlan(
+                rootId, runtimeVersion(reorderedWinners, rootId), Map.of(), Map.of(), Map.of()
+        );
+
+        assertEquals("dev.test.configured-first-rust-host",
+                Objects.requireNonNull(original.getRuntimeBindings().get(rootId)).providerId());
+        assertEquals(original.getRuntimeBindings(), reordered.getRuntimeBindings());
+    }
+
     /// Adds a compatible runtime Host before its Rust dependent and records the exact binding and artifact.
     @Test
     public void addsCompatibleRuntimeProviderBeforeRustPlugin() throws Exception {
         @Unmodifiable Map<String, PluginStoreItem> catalog = runtimeCatalog(true, "");
         PluginStoreManifest.PluginVersionEntry rootVersion = runtimeVersion(catalog, "dev.test.rust-tool");
 
-        PluginInstallPlan plan = new PluginStoreDependencyResolver(catalog).resolveInstallPlan(
+        PluginInstallPlan plan = new PluginStoreDependencyResolver(catalog, configuredSources(catalog)).resolveInstallPlan(
                 "dev.test.rust-tool", rootVersion, Map.of(), Map.of(), Map.of()
         );
 
@@ -91,7 +146,7 @@ public final class PluginStoreDependencyResolverTest {
         PluginManifest installedHost = installedRuntimeProviderManifest();
         PluginArtifactIdentity hostIdentity = PluginArtifactIdentity.of(installedHost, "a".repeat(64));
 
-        PluginInstallPlan plan = new PluginStoreDependencyResolver(catalog).resolveInstallPlan(
+        PluginInstallPlan plan = new PluginStoreDependencyResolver(catalog, configuredSources(catalog)).resolveInstallPlan(
                 "dev.test.rust-tool",
                 runtimeVersion(catalog, "dev.test.rust-tool"),
                 Map.of(installedHost.getId(), installedHost),
@@ -111,17 +166,42 @@ public final class PluginStoreDependencyResolverTest {
         PluginManifest installedHost = installedRuntimeProviderManifest();
         PluginArtifactIdentity hostIdentity = PluginArtifactIdentity.of(installedHost, "a".repeat(64));
 
-        PluginInstallPlan plan = new PluginStoreDependencyResolver(catalog).resolveInstallPlan(
+        PluginInstallPlan plan = new PluginStoreDependencyResolver(catalog, configuredSources(catalog)).resolveInstallPlan(
                 "dev.test.rust-tool",
                 runtimeVersion(catalog, "dev.test.rust-tool"),
                 Map.of(installedHost.getId(), installedHost),
                 Map.of(installedHost.getId(), hostIdentity),
-                Map.of()
+                Map.of(),
+                Map.of(installedHost.getId(), hostIdentity)
         );
 
         assertEquals(PluginInstallPlan.Action.ENABLE, plan.getEntries().get(0).getAction());
         assertEquals(List.of("dev.test.rust-host"), plan.getEnablementPluginIds());
         assertEquals(17, plan.getTotalDownloadSize());
+    }
+
+    /// Never treats an installed Provider that lacks explicit activatable state as merely disabled.
+    @Test
+    public void ineligibleInstalledRuntimeProviderIsUpdatedInsteadOfEnabled() throws Exception {
+        @Unmodifiable Map<String, PluginStoreItem> catalog = runtimeCatalog(true, "");
+        PluginManifest installedHost = installedRuntimeProviderManifest();
+        PluginArtifactIdentity hostIdentity = PluginArtifactIdentity.of(installedHost, "b".repeat(64));
+
+        PluginInstallPlan plan = new PluginStoreDependencyResolver(catalog, configuredSources(catalog)).resolveInstallPlan(
+                "dev.test.rust-tool",
+                runtimeVersion(catalog, "dev.test.rust-tool"),
+                Map.of(installedHost.getId(), installedHost),
+                Map.of(installedHost.getId(), hostIdentity),
+                Map.of(),
+                Map.of()
+        );
+
+        PluginInstallPlan.Entry host = plan.getEntries().stream()
+                .filter(entry -> entry.getPluginId().equals(installedHost.getId()))
+                .findFirst()
+                .orElseThrow();
+        assertEquals(PluginInstallPlan.Action.UPDATE, host.getAction());
+        assertTrue(plan.getEnablementPluginIds().isEmpty());
     }
 
     /// Selects one shared Host when two language packages in the same concrete graph require the same runtime.
@@ -133,7 +213,7 @@ public final class PluginStoreDependencyResolverTest {
                 true
         );
 
-        PluginInstallPlan plan = new PluginStoreDependencyResolver(catalog).resolveInstallPlan(
+        PluginInstallPlan plan = new PluginStoreDependencyResolver(catalog, configuredSources(catalog)).resolveInstallPlan(
                 "dev.test.rust-tool",
                 runtimeVersion(catalog, "dev.test.rust-tool"),
                 Map.of(),
@@ -159,7 +239,8 @@ public final class PluginStoreDependencyResolverTest {
                 false
         );
 
-        IOException exception = assertThrows(IOException.class, () -> new PluginStoreDependencyResolver(catalog)
+        IOException exception = assertThrows(IOException.class, () -> new PluginStoreDependencyResolver(
+                catalog, configuredSources(catalog))
                 .resolveInstallPlan(
                         "dev.test.rust-tool",
                         runtimeVersion(catalog, "dev.test.rust-tool"),
@@ -177,7 +258,7 @@ public final class PluginStoreDependencyResolverTest {
     public void customSourceRuntimeProviderRequiresConfirmation() throws Exception {
         @Unmodifiable Map<String, PluginStoreItem> catalog = runtimeCatalog(false, "");
 
-        PluginInstallPlan plan = new PluginStoreDependencyResolver(catalog).resolveInstallPlan(
+        PluginInstallPlan plan = new PluginStoreDependencyResolver(catalog, configuredSources(catalog)).resolveInstallPlan(
                 "dev.test.rust-tool", runtimeVersion(catalog, "dev.test.rust-tool"),
                 Map.of(), Map.of(), Map.of()
         );
@@ -193,7 +274,8 @@ public final class PluginStoreDependencyResolverTest {
                 "dev.test.missing-rust-host"
         );
 
-        IOException exception = assertThrows(IOException.class, () -> new PluginStoreDependencyResolver(catalog)
+        IOException exception = assertThrows(IOException.class, () -> new PluginStoreDependencyResolver(
+                catalog, configuredSources(catalog))
                 .resolveInstallPlan(
                         "dev.test.rust-tool", runtimeVersion(catalog, "dev.test.rust-tool"),
                         Map.of(), Map.of(), Map.of()
@@ -258,7 +340,9 @@ public final class PluginStoreDependencyResolverTest {
                 manifest,
                 PluginTrustResult.certified("ed25519:legacy-item", "legacy")
         );
-        PluginStoreDependencyResolver resolver = new PluginStoreDependencyResolver(Map.of(pluginId, item));
+        @Unmodifiable Map<String, PluginStoreItem> catalog = Map.of(pluginId, item);
+        PluginStoreDependencyResolver resolver = new PluginStoreDependencyResolver(
+                catalog, configuredSources(catalog));
 
         IOException rejectedFailure = assertThrows(IOException.class, () -> resolver.resolveInstallPlan(
                 pluginId, rejected, Map.of(), Map.of(), Map.of()
@@ -423,7 +507,8 @@ public final class PluginStoreDependencyResolverTest {
             PluginStoreManifest.PluginVersionEntry rootVersion = Objects.requireNonNull(
                     Objects.requireNonNull(root.getManifest()).getVersion("1.0.0")
             );
-            PluginStoreDependencyResolver resolver = new PluginStoreDependencyResolver(snapshot.getWinningItems());
+            PluginStoreDependencyResolver resolver = new PluginStoreDependencyResolver(
+                    snapshot.getWinningItems(), snapshot.getSourceConfiguration().getSources());
             IOException failure = assertThrows(IOException.class, () -> resolver.resolveInstallPlan(
                     rootId, rootVersion, Map.of(), Map.of(), Map.of()
             ));
@@ -489,7 +574,8 @@ public final class PluginStoreDependencyResolverTest {
                     Objects.requireNonNull(root.getManifest()).getVersion("1.0.0")
             );
 
-            PluginStoreDependencyResolver resolver = new PluginStoreDependencyResolver(snapshot.getWinningItems());
+            PluginStoreDependencyResolver resolver = new PluginStoreDependencyResolver(
+                    snapshot.getWinningItems(), snapshot.getSourceConfiguration().getSources());
             IOException failure = assertThrows(IOException.class, () -> resolver.resolveInstallPlan(
                     rootId, rootVersion, Map.of(), Map.of(), Map.of()
             ));
@@ -553,7 +639,8 @@ public final class PluginStoreDependencyResolverTest {
             PluginStoreManifest.PluginVersionEntry rootVersion = Objects.requireNonNull(
                     Objects.requireNonNull(root.getManifest()).getVersion("1.0.0")
             );
-            PluginStoreDependencyResolver resolver = new PluginStoreDependencyResolver(snapshot.getWinningItems());
+            PluginStoreDependencyResolver resolver = new PluginStoreDependencyResolver(
+                    snapshot.getWinningItems(), snapshot.getSourceConfiguration().getSources());
 
             PluginInstallPlan installPlan = resolver.resolveInstallPlan(rootId, rootVersion, Map.of(), Map.of(), Map.of());
             PluginInstallPlan.Entry installedDependency = installPlan.getEntries().get(0);
@@ -1090,6 +1177,75 @@ public final class PluginStoreDependencyResolverTest {
         return Map.copyOf(items);
     }
 
+    /// Builds a configured-order snapshot whose first winner is replaced by a lower-priority source.
+    ///
+    /// @return immutable snapshot with two compatible Runtime Providers
+    /// @throws IOException if generated Store metadata is invalid
+    private static PluginStoreSnapshot runtimeSourcePrioritySnapshot() throws IOException {
+        String target = PluginPlatformTarget.current().getId();
+        String replacedProviderId = "dev.test.replaced-rust-host";
+        String preferredProviderId = "dev.test.configured-first-rust-host";
+        String rootId = "dev.test.priority-rust-tool";
+        PluginStoreRegistry firstRegistry = Objects.requireNonNull(JsonUtils.GSON.fromJson("""
+                {"schemaVersion":1,"name":"Configured First","plugins":[
+                  {"id":"%s","name":"Replaced Host","manifestUrl":"https://first.example/replaced.json"},
+                  {"id":"%s","name":"Preferred Host","manifestUrl":"https://first.example/preferred.json"}
+                ]}
+                """.formatted(replacedProviderId, preferredProviderId), PluginStoreRegistry.class));
+        PluginStoreRegistry secondRegistry = Objects.requireNonNull(JsonUtils.GSON.fromJson("""
+                {"schemaVersion":1,"name":"Configured Second","plugins":[
+                  {"id":"%s","name":"Winning Replacement Host",
+                   "manifestUrl":"https://second.example/replaced.json"},
+                  {"id":"%s","name":"Rust Tool","manifestUrl":"https://second.example/tool.json"}
+                ]}
+                """.formatted(replacedProviderId, rootId), PluginStoreRegistry.class));
+        firstRegistry.validate();
+        secondRegistry.validate();
+        String providerDeclarations = """
+                "runtime": "java", "abi": 2, "pluginKind": "runtime-provider",
+                "providesRuntimes": [{"runtime": "rust", "abis": [2], "bridgeAbi": 1,
+                  "executionModes": ["embedded"], "features": ["bridge"]}],
+                "artifacts": [{"platform": "%s", "packageUrl": "https://example.com/host.npl",
+                  "sha256": "%s", "size": 41}]
+                """;
+        PluginStoreManifest replacedFromFirst = parseRuntimeStoreManifest(
+                replacedProviderId, providerDeclarations.formatted(target, "a".repeat(64)));
+        PluginStoreManifest replacementFromSecond = parseRuntimeStoreManifest(
+                replacedProviderId, providerDeclarations.formatted(target, "b".repeat(64)));
+        PluginStoreManifest preferred = parseRuntimeStoreManifest(
+                preferredProviderId, providerDeclarations.formatted(target, "c".repeat(64)));
+        PluginStoreManifest root = parseRuntimeStoreManifest(rootId, """
+                "runtime": "rust", "abi": 2, "pluginKind": "normal", "executionMode": "embedded",
+                "artifacts": [{"platform": "%s", "packageUrl": "https://example.com/tool.npl",
+                  "sha256": "%s", "size": 17}]
+                """.formatted(target, "d".repeat(64)));
+        replacedFromFirst.getVersions().get(0).setTrust(PluginTrustResult.community());
+        replacementFromSecond.getVersions().get(0).setTrust(PluginTrustResult.official("replacement-key"));
+        preferred.getVersions().get(0).setTrust(PluginTrustResult.official("preferred-key"));
+        root.getVersions().get(0).setTrust(PluginTrustResult.official("root-key"));
+        PluginSource firstSource = new PluginSource(
+                "configured-first", "https://first.example/registry.json", "First", true, false);
+        PluginSource secondSource = new PluginSource(
+                "configured-second", "https://second.example/registry.json", "Second", true, false);
+        PluginStoreManager firstManager = new PluginStoreManager();
+        PluginStoreManager secondManager = new PluginStoreManager();
+        PluginStoreItem replacedFirstItem = new PluginStoreItem(
+                firstSource, firstRegistry, firstManager, firstRegistry.getPlugins().get(0), replacedFromFirst);
+        PluginStoreItem preferredItem = new PluginStoreItem(
+                firstSource, firstRegistry, firstManager, firstRegistry.getPlugins().get(1), preferred);
+        PluginStoreItem replacementSecondItem = new PluginStoreItem(
+                secondSource, secondRegistry, secondManager, secondRegistry.getPlugins().get(0), replacementFromSecond);
+        PluginStoreItem rootItem = new PluginStoreItem(
+                secondSource, secondRegistry, secondManager, secondRegistry.getPlugins().get(1), root);
+        return new PluginStoreSnapshot(1, List.of(
+                PluginSourceLoadResult.success(
+                        firstSource, 1, List.of(replacedFirstItem, preferredItem), 0, firstRegistry, firstManager),
+                PluginSourceLoadResult.success(
+                        secondSource, 1, List.of(replacementSecondItem, rootItem), 0,
+                        secondRegistry, secondManager)
+        ));
+    }
+
     /// Builds a runtime graph with configurable root and Host dependencies and an optional second Rust consumer.
     ///
     /// @param rootDependenciesJson root dependency array JSON
@@ -1208,6 +1364,18 @@ public final class PluginStoreDependencyResolverTest {
             String pluginId
     ) {
         return Objects.requireNonNull(catalog.get(pluginId).getManifest()).getVersions().get(0);
+    }
+
+    /// Lists the explicit source order already encoded by simple hand-built catalog fixtures.
+    ///
+    /// @param catalog hand-built winning catalog
+    /// @return immutable first-appearance source list
+    private static @Unmodifiable List<PluginSource> configuredSources(
+            @Unmodifiable Map<String, PluginStoreItem> catalog
+    ) {
+        Map<String, PluginSource> sources = new LinkedHashMap<>();
+        catalog.values().forEach(item -> sources.putIfAbsent(item.getSource().getId(), item.getSource()));
+        return List.copyOf(sources.values());
     }
 
     /// Parses one installed Java Host that provides the Rust runtime.
