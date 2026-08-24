@@ -17,6 +17,7 @@
  */
 package org.jackhuang.hmcl.plugin;
 
+import javafx.application.Platform;
 import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
 import javafx.scene.image.Image;
@@ -64,6 +65,8 @@ import java.util.Optional;
 import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.stream.Collectors;
@@ -505,6 +508,24 @@ public final class PluginManager {
             Map<String, PluginVisitState> visitStates,
             Set<String> failed
     ) {
+        return loadCandidate(candidate, candidates, visitStates, failed, null);
+    }
+
+    /// Loads one candidate while optionally retaining the original lifecycle exception for transaction diagnostics.
+    ///
+    /// @param candidate candidate to load
+    /// @param candidates available candidates
+    /// @param visitStates dependency traversal states
+    /// @param failed plugin IDs that cannot be loaded
+    /// @param failuresByPluginId optional mutable original failures indexed by plugin ID
+    /// @return whether the candidate loaded and enabled successfully
+    private boolean loadCandidate(
+            PluginPackageCandidate candidate,
+            Map<String, PluginPackageCandidate> candidates,
+            Map<String, PluginVisitState> visitStates,
+            Set<String> failed,
+            @Nullable Map<String, Throwable> failuresByPluginId
+    ) {
         String pluginId = candidate.manifest.getId();
         if (failed.contains(pluginId)) {
             return false;
@@ -588,7 +609,8 @@ public final class PluginManager {
                 visitStates.put(pluginId, PluginVisitState.VISITED);
                 return false;
             }
-            if (providerCandidate != null && !loadCandidate(providerCandidate, candidates, visitStates, failed)) {
+            if (providerCandidate != null && !loadCandidate(
+                    providerCandidate, candidates, visitStates, failed, failuresByPluginId)) {
                 String message = "Plugin " + pluginId + " cannot load because runtime Provider "
                         + providerId + " failed";
                 setRuntimeStatus(candidate.identity, PluginRuntimeStatus.LOAD_FAILED, message);
@@ -636,7 +658,7 @@ public final class PluginManager {
                 return false;
             }
             if (dependency != null
-                    && !loadCandidate(dependency, candidates, visitStates, failed)) {
+                    && !loadCandidate(dependency, candidates, visitStates, failed, failuresByPluginId)) {
                 String message = "Plugin " + pluginId + " cannot load because dependency "
                         + dependencyId + " failed";
                 LOG.error(message);
@@ -669,6 +691,9 @@ public final class PluginManager {
                 failed.add(pluginId);
             }
         } catch (IOException | RuntimeException | Error exception) {
+            if (failuresByPluginId != null) {
+                failuresByPluginId.putIfAbsent(pluginId, exception);
+            }
             if (runtimeProviderHost) {
                 runtimeSupervisor.fail(pluginId);
             }
@@ -2080,7 +2105,8 @@ public final class PluginManager {
         administrativeGuard.checkTrustedCaller();
         @Unmodifiable Map<String, Optional<PluginArtifactIdentity>> expectedPriorArtifacts =
                 PluginInstallationStateGuard.expectedPriorArtifactsFromInspections(inspections);
-        return mutationLock.call(() -> stagePluginInstallationsLocked(
+        return stagePluginInstallationsOnLifecycleThread(inspections, () -> mutationLock.call(
+                () -> stagePluginInstallationsLocked(
                 inspections,
                 grantsByPluginId,
                 Map.of(),
@@ -2088,7 +2114,7 @@ public final class PluginManager {
                 expectedPriorArtifacts,
                 Map.of(),
                 PluginRuntimeInstallAuthorization.empty()
-        ));
+        )));
     }
 
     /// Validates and atomically publishes a confirmed store plan with exact reusable dependency identities.
@@ -2112,7 +2138,8 @@ public final class PluginManager {
                 Map.copyOf(expectedReusableArtifacts);
         @Unmodifiable Map<String, Optional<PluginArtifactIdentity>> expectedPriorArtifacts =
                 PluginInstallationStateGuard.expectedPriorArtifactsFromInspections(inspections);
-        return mutationLock.call(() -> stagePluginInstallationsLocked(
+        return stagePluginInstallationsOnLifecycleThread(inspections, () -> mutationLock.call(
+                () -> stagePluginInstallationsLocked(
                 inspections,
                 grantsByPluginId,
                 expectedSnapshot,
@@ -2120,7 +2147,7 @@ public final class PluginManager {
                 expectedPriorArtifacts,
                 Map.of(),
                 PluginRuntimeInstallAuthorization.empty()
-        ));
+        )));
     }
 
     /// Publishes a confirmed Store plan with runtime Provider bindings and explicit custom-source receipts.
@@ -2150,7 +2177,8 @@ public final class PluginManager {
         @Unmodifiable Map<String, PluginArtifactIdentity> reusableSnapshot = Map.copyOf(expectedReusableArtifacts);
         @Unmodifiable Map<String, Optional<PluginArtifactIdentity>> priorSnapshot = Map.copyOf(expectedPriorArtifacts);
         @Unmodifiable Map<String, PluginCertificationReceipt> receiptSnapshot = Map.copyOf(certificationReceipts);
-        return mutationLock.call(() -> stagePluginInstallationsLocked(
+        return stagePluginInstallationsOnLifecycleThread(inspections, () -> mutationLock.call(
+                () -> stagePluginInstallationsLocked(
                 inspections,
                 grantsByPluginId,
                 reusableSnapshot,
@@ -2158,7 +2186,7 @@ public final class PluginManager {
                 priorSnapshot,
                 receiptSnapshot,
                 runtimeAuthorization
-        ));
+        )));
     }
 
     /// Publishes a confirmed store plan with exact reusable dependencies and exact replacement prior state.
@@ -2184,7 +2212,8 @@ public final class PluginManager {
                 Map.copyOf(expectedReusableArtifacts);
         @Unmodifiable Map<String, Optional<PluginArtifactIdentity>> priorSnapshot =
                 Map.copyOf(expectedPriorArtifacts);
-        return mutationLock.call(() -> stagePluginInstallationsLocked(
+        return stagePluginInstallationsOnLifecycleThread(inspections, () -> mutationLock.call(
+                () -> stagePluginInstallationsLocked(
                 inspections,
                 grantsByPluginId,
                 reusableSnapshot,
@@ -2192,7 +2221,7 @@ public final class PluginManager {
                 priorSnapshot,
                 Map.of(),
                 PluginRuntimeInstallAuthorization.empty()
-        ));
+        )));
     }
 
     /// Publishes a confirmed store plan together with proof-backed certification receipts for certified downloads.
@@ -2221,7 +2250,8 @@ public final class PluginManager {
                 Map.copyOf(expectedPriorArtifacts);
         @Unmodifiable Map<String, PluginCertificationReceipt> receiptSnapshot =
                 Map.copyOf(certificationReceipts);
-        return mutationLock.call(() -> stagePluginInstallationsLocked(
+        return stagePluginInstallationsOnLifecycleThread(inspections, () -> mutationLock.call(
+                () -> stagePluginInstallationsLocked(
                 inspections,
                 grantsByPluginId,
                 reusableSnapshot,
@@ -2229,7 +2259,66 @@ public final class PluginManager {
                 priorSnapshot,
                 receiptSnapshot,
                 PluginRuntimeInstallAuthorization.empty()
-        ));
+        )));
+    }
+
+    /// Executes a stage mutation on JavaFX only when it must replace a live enabled runtime Host.
+    ///
+    /// The dispatch happens before the mutation lock is acquired. This prevents the caller from holding the lock while
+    /// JavaFX lifecycle code re-enters binding and permission stores guarded by the same lock.
+    ///
+    /// @param inspections immutable inspected replacement packages
+    /// @param action complete lock-owning stage mutation
+    /// @param <T> non-null mutation result type
+    /// @return mutation result
+    /// @throws IOException if dispatch, staging, or the lifecycle mutation fails
+    private <T> T stagePluginInstallationsOnLifecycleThread(
+            @Unmodifiable List<LocalPluginInspection> inspections,
+            PluginMutationLock.IOCallable<T> action
+    ) throws IOException {
+        if (!mayReplaceInstalledRuntimeProvider(inspections) || Platform.isFxApplicationThread()) {
+            return action.call();
+        }
+        FutureTask<T> task = new FutureTask<>(action::call);
+        try {
+            Platform.runLater(task);
+        } catch (IllegalStateException exception) {
+            throw new IOException("JavaFX is unavailable for live runtime Provider replacement", exception);
+        }
+        try {
+            return task.get();
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while waiting for live runtime Provider replacement", exception);
+        } catch (ExecutionException exception) {
+            Throwable cause = exception.getCause();
+            if (cause instanceof IOException ioException) {
+                throw ioException;
+            }
+            if (cause instanceof RuntimeException runtimeException) {
+                throw runtimeException;
+            }
+            if (cause instanceof Error error) {
+                throw error;
+            }
+            throw new IOException("Live runtime Provider replacement failed", cause);
+        }
+    }
+
+    /// Returns whether an installation batch may replace an installed runtime Host.
+    ///
+    /// Existing Host replacements are dispatched conservatively so discovery or enablement cannot race the initial
+    /// loaded-state observation and move lifecycle work onto a background thread. New Hosts and ordinary plugins keep
+    /// their caller thread because they cannot own a live graph yet.
+    ///
+    /// @param inspections immutable inspected replacement packages
+    /// @return whether JavaFX lifecycle execution is required
+    private static boolean mayReplaceInstalledRuntimeProvider(
+            @Unmodifiable List<LocalPluginInspection> inspections
+    ) {
+        return inspections.stream().anyMatch(inspection ->
+                inspection.manifest.getPluginKind() == PluginKind.RUNTIME_PROVIDER
+                        && inspection.oldManifest != null);
     }
 
     /// Publishes an installation batch while the shared package, state, and permission lock is held.
@@ -2368,6 +2457,13 @@ public final class PluginManager {
                     inspection.sha256
             ));
         }
+        LiveRuntimeProviderSwapSession liveSwapSession = captureLiveRuntimeProviderSwapSession(
+                installedBefore,
+                inspectionsById,
+                runtimeBindingStore.readStrict(),
+                Set.copyOf(enabledStates),
+                Set.copyOf(pendingUninstall)
+        );
         // Runtime providers are live process state, so close the planning-to-publication compatibility window.
         for (PluginManifest replacement : replacements.values()) {
             if (requiresLivePublicationCompatibility(replacement, runtimeAuthorization)) {
@@ -2391,12 +2487,16 @@ public final class PluginManager {
                     runtimeBindingStore.replaceStrict(prospectiveRuntimeBindings);
                 },
                 () -> stateStore.saveStrict(nextEnabledStates, nextPendingUninstall),
-                () -> validateEnabledRuntimeProviderReplacements(
-                        installedBefore,
+                () -> activateLiveRuntimeProviderReplacements(
+                        liveSwapSession,
                         inspectionsById,
-                        nextEnabledStates
+                        nextEnabledStates,
+                        nextPendingUninstall
                 ),
-                permissionService::reload
+                () -> {
+                    permissionService.reload();
+                    restoreLiveRuntimeProviderReplacements(liveSwapSession);
+                }
         );
 
         enabledStates.clear();
@@ -2412,9 +2512,25 @@ public final class PluginManager {
             );
             clearArtifactState(pluginId);
             runtimeState.remember(identity);
-            setRuntimeStatus(identity, PluginRuntimeStatus.WAITING_FOR_RESTART, null);
             Path installedPackage = pluginsDirectory.resolve(pluginId + ".npl").toAbsolutePath().normalize();
             @Nullable PluginContainer container = pluginMap.get(pluginId);
+            if (liveSwapSession.providerIds().contains(pluginId)
+                    && container != null
+                    && identity.equals(loadedIdentity(container))) {
+                container.setNplFile(installedPackage);
+                container.setRestartRequired(false);
+                setLoadedRuntimeStatus(
+                        container,
+                        container.isEnabled()
+                                ? PluginRuntimeStatus.ENABLED
+                                : PluginRuntimeStatus.INSTALLED_DISABLED,
+                        null
+                );
+                LOG.info("Activated live runtime Provider replacement: " + pluginId + " "
+                        + replacement.getValue().getVersion());
+                continue;
+            }
+            setRuntimeStatus(identity, PluginRuntimeStatus.WAITING_FOR_RESTART, null);
             if (container != null) {
                 container.setNplFile(installedPackage);
                 container.setRestartRequired(true);
@@ -2424,154 +2540,412 @@ public final class PluginManager {
         return List.copyOf(replacements.values());
     }
 
-    /// Health-validates enabled runtime Host updates before their installation transaction commits.
-    ///
-    /// New Hosts retain ordinary staged-install behavior. Existing disabled Hosts are not executed during update.
-    /// Each eligible replacement is probed with an isolated registry, Supervisor, package cache, and data directory,
-    /// so it cannot collide with the currently active Host registration or mutate the Host's persistent storage.
+    /// Captures every active Host replacement and its exact loaded dependent graph before publication.
     ///
     /// @param installedBefore immutable installed manifests before publication
     /// @param inspections immutable replacement inspections indexed by plugin ID
-    /// @param nextEnabledStates immutable desired enablement after publication
-    /// @throws IOException if an enabled replacement Host cannot bootstrap, register, initialize, or pass health
-    private void validateEnabledRuntimeProviderReplacements(
+    /// @param runtimeBindings immutable live dependent-to-Provider bindings before publication
+    /// @param originalEnabledStates immutable desired enablement before publication
+    /// @param originalPendingUninstall immutable pending removals before publication
+    /// @return mutable transaction-local swap session containing immutable lifecycle snapshots
+    /// @throws IOException if two replaced Host graphs overlap
+    private LiveRuntimeProviderSwapSession captureLiveRuntimeProviderSwapSession(
             @Unmodifiable Map<String, PluginManifest> installedBefore,
             @Unmodifiable Map<String, LocalPluginInspection> inspections,
-            @Unmodifiable Set<String> nextEnabledStates
+            @Unmodifiable Map<String, RuntimeProviderBinding> runtimeBindings,
+            @Unmodifiable Set<String> originalEnabledStates,
+            @Unmodifiable Set<String> originalPendingUninstall
     ) throws IOException {
+        Map<String, PluginContainer> loadedById = new LinkedHashMap<>();
+        stateLock.readLock().lock();
+        try {
+            for (PluginContainer container : plugins) {
+                loadedById.put(container.getManifest().getId(), container);
+            }
+        } finally {
+            stateLock.readLock().unlock();
+        }
+
+        List<LiveRuntimeProviderSwap> swaps = new ArrayList<>();
+        Set<String> claimedPluginIds = new HashSet<>();
         for (Map.Entry<String, LocalPluginInspection> entry : inspections.entrySet()) {
-            String pluginId = entry.getKey();
-            LocalPluginInspection inspection = entry.getValue();
-            if (inspection.manifest.getPluginKind() != PluginKind.RUNTIME_PROVIDER
-                    || !installedBefore.containsKey(pluginId)
-                    || !nextEnabledStates.contains(pluginId)) {
+            String providerId = entry.getKey();
+            @Nullable PluginContainer providerContainer = loadedById.get(providerId);
+            if (entry.getValue().manifest.getPluginKind() != PluginKind.RUNTIME_PROVIDER
+                    || !installedBefore.containsKey(providerId)
+                    || providerContainer == null
+                    || !providerContainer.isEnabled()) {
                 continue;
             }
-            validateRuntimeProviderReplacement(inspection);
-        }
-    }
-
-    /// Probes one exact published Host package through an isolated complete Provider activation lifecycle.
-    ///
-    /// @param inspection exact replacement inspection approved before publication
-    /// @throws IOException if package verification, Host activation, health, or cleanup fails
-    private void validateRuntimeProviderReplacement(LocalPluginInspection inspection) throws IOException {
-        PluginManifest manifest = inspection.manifest;
-        String pluginId = manifest.getId();
-        Path publishedPackage = pluginsDirectory.resolve(pluginId + ".npl").toAbsolutePath().normalize();
-        PluginPackageMutationService.verifyPackageHash(publishedPackage, inspection.sha256);
-        Path validationRoot = Files.createTempDirectory(pluginPackageDirectory, ".runtime-provider-validation-");
-        try {
-            probeRuntimeProviderReplacement(
-                    publishedPackage,
-                    validationRoot,
-                    manifest,
-                    inspection.sha256
+            List<LivePluginSnapshot> dependents = new ArrayList<>();
+            collectLoadedDependents(
+                    providerId,
+                    loadedById,
+                    runtimeBindings,
+                    new HashSet<>(),
+                    dependents
             );
-        } finally {
-            org.jackhuang.hmcl.util.io.FileUtils.deleteDirectory(validationRoot);
+            if (!claimedPluginIds.add(providerId)) {
+                throw new IOException("Overlapping live runtime Provider replacement graph: " + providerId);
+            }
+            for (LivePluginSnapshot dependent : dependents) {
+                if (!claimedPluginIds.add(dependent.identity().getPluginId())) {
+                    throw new IOException("Overlapping live runtime Provider replacement graph: "
+                            + dependent.identity().getPluginId());
+                }
+            }
+            swaps.add(new LiveRuntimeProviderSwap(
+                    snapshot(providerContainer),
+                    List.copyOf(dependents)
+            ));
         }
+        return new LiveRuntimeProviderSwapSession(
+                List.copyOf(swaps),
+                Set.copyOf(originalEnabledStates),
+                Set.copyOf(originalPendingUninstall)
+        );
     }
 
-    /// Loads and activates one Host against a private registry, then closes every validation resource.
+    /// Collects loaded dependents in leaf-first unload order from the pre-publication graph.
     ///
-    /// @param publishedPackage exact transaction-published Host artifact
-    /// @param validationRoot isolated validation cache and data root
-    /// @param manifest authoritative replacement manifest
-    /// @param artifactSha256 exact replacement digest
-    /// @throws IOException if Host loading, activation, health negotiation, or cleanup fails
-    private void probeRuntimeProviderReplacement(
-            Path publishedPackage,
-            Path validationRoot,
+    /// @param dependencyId dependency whose loaded dependents are collected
+    /// @param loadedById immutable loaded containers indexed by plugin ID
+    /// @param runtimeBindings immutable pre-publication runtime bindings
+    /// @param visited plugin IDs already traversed
+    /// @param ordered mutable leaf-first result
+    private void collectLoadedDependents(
+            String dependencyId,
+            @Unmodifiable Map<String, PluginContainer> loadedById,
+            @Unmodifiable Map<String, RuntimeProviderBinding> runtimeBindings,
+            Set<String> visited,
+            List<LivePluginSnapshot> ordered
+    ) {
+        if (!visited.add(dependencyId)) {
+            return;
+        }
+        loadedById.entrySet().stream()
+                .filter(entry -> directlyDependsOn(entry.getValue().getManifest(), dependencyId, runtimeBindings))
+                .filter(entry -> !visited.contains(entry.getKey()))
+                .sorted(Map.Entry.comparingByKey())
+                .forEach(entry -> {
+                    collectLoadedDependents(entry.getKey(), loadedById, runtimeBindings, visited, ordered);
+                    ordered.add(snapshot(entry.getValue()));
+                });
+    }
+
+    /// Returns whether one loaded manifest has a direct ordinary or virtual runtime edge to a dependency.
+    ///
+    /// @param manifest loaded dependent manifest
+    /// @param dependencyId candidate dependency ID
+    /// @param runtimeBindings immutable pre-publication runtime bindings
+    /// @return whether the direct edge exists
+    private static boolean directlyDependsOn(
             PluginManifest manifest,
-            String artifactSha256
-    ) throws IOException {
-        RuntimeProviderRegistry validationRegistry = new RuntimeProviderRegistry();
-        RuntimeSupervisor validationSupervisor = new RuntimeSupervisor(validationRegistry);
-        String pluginId = manifest.getId();
-        validationSupervisor.discover(pluginId);
-        validationSupervisor.resolve(pluginId);
-        VerifiedPluginPackage pluginPackage = PluginPackageVersions.prepareVerifiedLifecyclePackage(
-                publishedPackage,
-                validationRoot.resolve("packages"),
-                PluginArtifactIdentity.of(manifest, artifactSha256)
-        );
-        Plugin plugin = administrativeGuard.callPluginLoadingCallback(
-                () -> new JavaPluginLoader().load(manifest, pluginPackage, publishedPackage)
-        );
-        ClassLoader classLoader = plugin.getClass().getClassLoader();
-        validationSupervisor.bootstrapLoaded(pluginId);
-        PluginContext context = new PluginContext(
-                manifest,
-                pluginPackage.getDirectory(),
-                validationRoot.resolve("data"),
-                classLoader,
-                artifactSha256,
-                () -> permissionService.getGrantedPermissions(manifest, artifactSha256),
-                provider -> validationSupervisor.register(pluginId, provider)
-        );
-        try {
-            runPluginCallback(classLoader, () -> plugin.onLoad(context));
-            validationSupervisor.activateOwnedRegistration(pluginId);
-        } catch (IOException | RuntimeException | Error exception) {
-            @Nullable String detail = exception.getMessage();
-            IOException failure = new IOException(
-                    "Runtime Provider replacement health validation failed: " + pluginId
-                            + (detail == null || detail.isBlank() ? "" : " (" + detail + ")"),
-                    exception
-            );
-            cleanupRuntimeProviderValidation(plugin, context, classLoader, failure);
-            throw failure;
+            String dependencyId,
+            @Unmodifiable Map<String, RuntimeProviderBinding> runtimeBindings
+    ) {
+        if (manifest.getDependencies().contains(dependencyId)) {
+            return true;
         }
-        cleanupRuntimeProviderValidation(plugin, context, classLoader, null);
+        @Nullable RuntimeProviderBinding binding = runtimeBindings.get(manifest.getId());
+        return binding != null && binding.providerId().equals(dependencyId);
     }
 
-    /// Closes a probed Host lifecycle, registration, and dedicated loader without hiding the primary failure.
+    /// Creates one exact loaded lifecycle snapshot.
     ///
-    /// @param plugin validation Host lifecycle
-    /// @param context isolated validation context
-    /// @param classLoader Host lifecycle class loader
-    /// @param primaryFailure primary validation failure, or `null` after successful validation
-    /// @throws IOException if cleanup fails after otherwise successful validation
-    private void cleanupRuntimeProviderValidation(
-            Plugin plugin,
-            PluginContext context,
-            ClassLoader classLoader,
-            @Nullable IOException primaryFailure
+    /// @param container loaded plugin container
+    /// @return immutable exact identity and enablement snapshot
+    private static LivePluginSnapshot snapshot(PluginContainer container) {
+        return new LivePluginSnapshot(loadedIdentity(container), container.isEnabled());
+    }
+
+    /// Returns the exact artifact identity represented by one loaded container.
+    ///
+    /// @param container loaded plugin container
+    /// @return exact loaded artifact identity
+    private static PluginArtifactIdentity loadedIdentity(PluginContainer container) {
+        return PluginArtifactIdentity.of(
+                container.getManifest(),
+                container.getContext().getArtifactSha256()
+        );
+    }
+
+    /// Replaces every captured live Host graph while the package journal remains prepared.
+    ///
+    /// @param session transaction-local old graph snapshots and progress
+    /// @param inspections immutable replacement inspections indexed by plugin ID
+    /// @param nextEnabledStates immutable desired enablement after publication
+    /// @param nextPendingUninstall immutable pending removals after publication
+    /// @throws IOException if teardown, canonical loading, activation, health, or dependent restoration fails
+    private void activateLiveRuntimeProviderReplacements(
+            LiveRuntimeProviderSwapSession session,
+            @Unmodifiable Map<String, LocalPluginInspection> inspections,
+            @Unmodifiable Set<String> nextEnabledStates,
+            @Unmodifiable Set<String> nextPendingUninstall
     ) throws IOException {
-        @Nullable IOException cleanupFailure = null;
-        try {
-            runPluginCallback(classLoader, plugin::onUnload);
-        } catch (RuntimeException | Error exception) {
-            cleanupFailure = new IOException("Runtime Provider validation onUnload failed", exception);
+        if (session.swaps().isEmpty()) {
+            return;
         }
-        try {
-            context.closeRuntimeProviderRegistrations();
-        } catch (IOException exception) {
-            if (cleanupFailure == null) {
-                cleanupFailure = exception;
-            } else {
-                cleanupFailure.addSuppressed(exception);
+        for (LiveRuntimeProviderSwap swap : session.swaps()) {
+            session.markStarted(swap.provider().identity().getPluginId());
+            unloadLiveRuntimeGraph(swap);
+        }
+        replaceDesiredState(nextEnabledStates, nextPendingUninstall);
+        for (LiveRuntimeProviderSwap swap : session.swaps()) {
+            loadLiveRuntimeGraph(swap, inspections, nextEnabledStates, true);
+        }
+        replaceDesiredState(nextEnabledStates, nextPendingUninstall);
+    }
+
+    /// Restores each started old Host graph after the journal has restored packages and documents.
+    ///
+    /// @param session transaction-local old graph snapshots and progress
+    /// @throws IOException if new graph cleanup or exact old graph restoration fails
+    private void restoreLiveRuntimeProviderReplacements(LiveRuntimeProviderSwapSession session) throws IOException {
+        @Unmodifiable List<LiveRuntimeProviderSwap> started = session.startedSwaps();
+        if (started.isEmpty()) {
+            return;
+        }
+        @Nullable IOException failure = null;
+        for (LiveRuntimeProviderSwap swap : started) {
+            try {
+                unloadLiveRuntimeGraph(swap);
+            } catch (IOException | RuntimeException exception) {
+                failure = appendLifecycleFailure(
+                        failure,
+                        new IOException("Failed to clean replacement runtime Provider graph: "
+                                + swap.provider().identity().getPluginId(), exception)
+                );
             }
         }
-        if (classLoader != PluginManager.class.getClassLoader()
-                && classLoader instanceof java.net.URLClassLoader urlClassLoader) {
+        if (failure == null) {
             try {
-                urlClassLoader.close();
-            } catch (IOException exception) {
-                if (cleanupFailure == null) {
-                    cleanupFailure = exception;
-                } else {
-                    cleanupFailure.addSuppressed(exception);
+                replaceDesiredState(session.originalEnabledStates(), session.originalPendingUninstall());
+                for (LiveRuntimeProviderSwap swap : started) {
+                    loadLiveRuntimeGraph(swap, Map.of(), session.originalEnabledStates(), false);
+                }
+                replaceDesiredState(session.originalEnabledStates(), session.originalPendingUninstall());
+                return;
+            } catch (IOException | RuntimeException exception) {
+                failure = new IOException("Failed to restore the previous live runtime Provider graph", exception);
+            }
+        }
+
+        for (LiveRuntimeProviderSwap swap : started) {
+            try {
+                unloadLiveRuntimeGraph(swap);
+            } catch (IOException | RuntimeException cleanupFailure) {
+                failure = appendLifecycleFailure(
+                        Objects.requireNonNull(failure),
+                        new IOException("Failed to clean partially restored runtime Provider graph: "
+                                + swap.provider().identity().getPluginId(), cleanupFailure)
+                );
+            }
+        }
+        Set<String> disabled = new HashSet<>(session.originalEnabledStates());
+        for (LiveRuntimeProviderSwap swap : started) {
+            disabled.remove(swap.provider().identity().getPluginId());
+            swap.dependents().forEach(dependent -> disabled.remove(dependent.identity().getPluginId()));
+        }
+        try {
+            replaceDesiredState(Set.copyOf(disabled), session.originalPendingUninstall());
+        } catch (IOException stateFailure) {
+            Objects.requireNonNull(failure).addSuppressed(stateFailure);
+        }
+        throw Objects.requireNonNull(failure);
+    }
+
+    /// Unloads one captured graph in leaf-first order and verifies that its Host registration is gone.
+    ///
+    /// @param swap exact graph snapshot whose plugin IDs identify current containers
+    /// @throws IOException if a lifecycle refuses teardown or any graph member remains live
+    private void unloadLiveRuntimeGraph(LiveRuntimeProviderSwap swap) throws IOException {
+        @Nullable IOException failure = null;
+        for (LivePluginSnapshot dependent : swap.dependents()) {
+            try {
+                unloadPluginLocked(dependent.identity().getPluginId());
+            } catch (IOException | RuntimeException exception) {
+                failure = appendLifecycleFailure(
+                        failure,
+                        new IOException("Failed to unload runtime Provider dependent: "
+                                + dependent.identity().getPluginId(), exception)
+                );
+            }
+        }
+        String providerId = swap.provider().identity().getPluginId();
+        try {
+            unloadPluginLocked(providerId);
+        } catch (IOException | RuntimeException exception) {
+            failure = appendLifecycleFailure(
+                    failure,
+                    new IOException("Failed to unload runtime Provider Host: " + providerId, exception)
+            );
+        }
+        for (LivePluginSnapshot dependent : swap.dependents()) {
+            if (pluginMap.containsKey(dependent.identity().getPluginId())) {
+                failure = appendLifecycleFailure(failure, new IOException(
+                        "Runtime Provider dependent remains loaded: " + dependent.identity().getPluginId()));
+            }
+        }
+        if (pluginMap.containsKey(providerId) || runtimeProviders.findById(providerId).isPresent()) {
+            failure = appendLifecycleFailure(
+                    failure,
+                    new IOException("Runtime Provider Host remains live after unload: " + providerId)
+            );
+        }
+        if (failure != null) {
+            throw failure;
+        }
+    }
+
+    /// Loads one exact Host graph through the ordinary manager lifecycle and verifies final identity and enablement.
+    ///
+    /// @param swap old graph topology and fallback identities
+    /// @param inspections immutable replacements whose published canonical identities take precedence
+    /// @param desiredEnabledStates immutable desired final enablement
+    /// @param replacementsCanonical whether replacement identities must resolve at canonical package paths
+    /// @throws IOException if any exact package, dependency, binding, activation, or final state is invalid
+    private void loadLiveRuntimeGraph(
+            LiveRuntimeProviderSwap swap,
+            @Unmodifiable Map<String, LocalPluginInspection> inspections,
+            @Unmodifiable Set<String> desiredEnabledStates,
+            boolean replacementsCanonical
+    ) throws IOException {
+        Map<String, PluginPackageCandidate> candidates = new LinkedHashMap<>();
+        List<LivePluginSnapshot> loadOrder = new ArrayList<>();
+        loadOrder.add(swap.provider());
+        List<LivePluginSnapshot> dependencyFirst = new ArrayList<>(swap.dependents());
+        java.util.Collections.reverse(dependencyFirst);
+        loadOrder.addAll(dependencyFirst);
+        for (LivePluginSnapshot snapshot : loadOrder) {
+            String pluginId = snapshot.identity().getPluginId();
+            @Nullable LocalPluginInspection replacement = inspections.get(pluginId);
+            PluginArtifactIdentity targetIdentity = replacement == null
+                    ? snapshot.identity()
+                    : PluginArtifactIdentity.of(replacement.manifest, replacement.sha256);
+            candidates.put(
+                    pluginId,
+                    resolveExactCandidate(targetIdentity, replacementsCanonical && replacement != null)
+            );
+        }
+
+        Set<String> graphIds = new HashSet<>(candidates.keySet());
+        enabledStates.addAll(graphIds);
+        Map<String, PluginVisitState> visitStates = new HashMap<>();
+        Set<String> failed = new HashSet<>();
+        Map<String, Throwable> activationFailures = new LinkedHashMap<>();
+        for (LivePluginSnapshot snapshot : loadOrder) {
+            String pluginId = snapshot.identity().getPluginId();
+            PluginPackageCandidate candidate = Objects.requireNonNull(candidates.get(pluginId));
+            if (!loadCandidate(candidate, candidates, visitStates, failed, activationFailures)) {
+                @Nullable String detail = getPluginRuntimeDetail(pluginId);
+                @Nullable Throwable activationFailure = activationFailures.values().stream().findFirst().orElse(null);
+                String diagnostic = activationFailure == null
+                        ? detail == null ? "" : detail
+                        : lifecycleFailureDiagnostic(activationFailure);
+                throw new IOException("Live runtime Provider graph activation failed: " + pluginId
+                        + (diagnostic.isBlank() ? "" : " (" + diagnostic + ")"), activationFailure);
+            }
+        }
+        for (LivePluginSnapshot snapshot : swap.dependents()) {
+            String pluginId = snapshot.identity().getPluginId();
+            if (!desiredEnabledStates.contains(pluginId)) {
+                disablePluginLocked(pluginId);
+            }
+        }
+        if (!desiredEnabledStates.contains(swap.provider().identity().getPluginId())) {
+            disablePluginLocked(swap.provider().identity().getPluginId());
+        }
+        for (Map.Entry<String, PluginPackageCandidate> entry : candidates.entrySet()) {
+            @Nullable PluginContainer container = pluginMap.get(entry.getKey());
+            if (container == null
+                    || !entry.getValue().identity.equals(loadedIdentity(container))
+                    || container.isEnabled() != desiredEnabledStates.contains(entry.getKey())) {
+                throw new IOException("Live runtime Provider graph did not reach its exact target state: "
+                        + entry.getKey());
+            }
+        }
+    }
+
+    /// Resolves one exact installed artifact, optionally requiring its canonical replacement path.
+    ///
+    /// @param identity exact artifact identity to load
+    /// @param canonical whether the artifact must be the canonical transaction target
+    /// @return exact verified package candidate
+    /// @throws IOException if the exact artifact is absent, duplicated, or changed
+    private PluginPackageCandidate resolveExactCandidate(
+            PluginArtifactIdentity identity,
+            boolean canonical
+    ) throws IOException {
+        List<Path> matches = new ArrayList<>();
+        if (canonical) {
+            matches.add(pluginsDirectory.resolve(identity.getPluginId() + ".npl").toAbsolutePath().normalize());
+        } else {
+            for (Path packageFile : packageRepository.findInstalledPackages(identity.getPluginId())) {
+                PluginManifest manifest = packageRepository.readManifest(packageFile);
+                String sha256 = PluginPackageVersions.calculateSha256(packageFile);
+                if (identity.equals(PluginArtifactIdentity.of(manifest, sha256))) {
+                    matches.add(packageFile.toAbsolutePath().normalize());
                 }
             }
         }
-        if (cleanupFailure != null) {
-            if (primaryFailure == null) {
-                throw cleanupFailure;
-            }
-            primaryFailure.addSuppressed(cleanupFailure);
+        if (matches.size() != 1 || !Files.isRegularFile(matches.get(0), LinkOption.NOFOLLOW_LINKS)) {
+            throw new IOException("Expected exactly one installed runtime graph artifact: " + identity);
         }
+        Path packageFile = matches.get(0);
+        PluginManifest manifest = packageRepository.readManifest(packageFile);
+        String sha256 = PluginPackageVersions.calculateSha256(packageFile);
+        PluginArtifactIdentity actual = PluginArtifactIdentity.of(manifest, sha256);
+        if (!identity.equals(actual)) {
+            throw new IOException("Installed runtime graph artifact identity changed: " + identity.getPluginId());
+        }
+        return new PluginPackageCandidate(packageFile, manifest, actual);
+    }
+
+    /// Replaces the manager's desired state and persists it without changing lifecycle containers.
+    ///
+    /// @param desiredEnabledStates immutable enabled plugin IDs
+    /// @param desiredPendingUninstall immutable pending removal IDs
+    /// @throws IOException if strict state persistence fails
+    private void replaceDesiredState(
+            @Unmodifiable Set<String> desiredEnabledStates,
+            @Unmodifiable Set<String> desiredPendingUninstall
+    ) throws IOException {
+        enabledStates.clear();
+        enabledStates.addAll(desiredEnabledStates);
+        pendingUninstall.clear();
+        pendingUninstall.addAll(desiredPendingUninstall);
+        stateStore.saveStrict(enabledStates, pendingUninstall);
+    }
+
+    /// Appends one lifecycle failure to an optional aggregate.
+    ///
+    /// @param current current aggregate or `null`
+    /// @param next next failure
+    /// @return aggregate rooted at the first failure
+    private static IOException appendLifecycleFailure(@Nullable IOException current, IOException next) {
+        if (current == null) {
+            return next;
+        }
+        current.addSuppressed(next);
+        return current;
+    }
+
+    /// Formats non-empty messages from one lifecycle exception chain without discarding the root cause.
+    ///
+    /// @param failure original lifecycle failure
+    /// @return colon-separated diagnostic chain
+    private static String lifecycleFailureDiagnostic(Throwable failure) {
+        List<String> messages = new ArrayList<>();
+        @Nullable Throwable current = failure;
+        while (current != null) {
+            @Nullable String message = current.getMessage();
+            if (message != null && !message.isBlank() && !messages.contains(message)) {
+                messages.add(message);
+            }
+            current = current.getCause();
+        }
+        return String.join(": ", messages);
     }
 
     /// Returns whether publication depends on this manager's current live runtime registry.
@@ -2998,6 +3372,106 @@ public final class PluginManager {
     public Path getPluginsDirectory() {
         administrativeGuard.checkTrustedCaller();
         return pluginsDirectory;
+    }
+
+    /// Immutable exact snapshot of one loaded plugin lifecycle.
+    ///
+    /// @param identity exact loaded artifact identity
+    /// @param enabled whether the lifecycle was enabled when captured
+    @NotNullByDefault
+    private record LivePluginSnapshot(PluginArtifactIdentity identity, boolean enabled) {
+    }
+
+    /// Immutable old Host graph in leaf-first dependent unload order.
+    ///
+    /// @param provider exact old Host lifecycle snapshot
+    /// @param dependents immutable loaded dependent snapshots in leaf-first order
+    @NotNullByDefault
+    private record LiveRuntimeProviderSwap(
+            LivePluginSnapshot provider,
+            @Unmodifiable List<LivePluginSnapshot> dependents
+    ) {
+    }
+
+    /// Holds immutable old graphs and mutable progress for one prepared package transaction.
+    @NotNullByDefault
+    private static final class LiveRuntimeProviderSwapSession {
+        /// Immutable active Host replacements captured before publication.
+        private final @Unmodifiable List<LiveRuntimeProviderSwap> swaps;
+
+        /// Immutable IDs of active Host replacements used by post-commit status publication.
+        private final @Unmodifiable Set<String> providerIds;
+
+        /// Immutable desired enablement restored by journal rollback.
+        private final @Unmodifiable Set<String> originalEnabledStates;
+
+        /// Immutable pending removals restored by journal rollback.
+        private final @Unmodifiable Set<String> originalPendingUninstall;
+
+        /// Host IDs whose old graph teardown started before commit.
+        private final Set<String> startedProviderIds = new HashSet<>();
+
+        /// Creates one transaction-local live swap session.
+        ///
+        /// @param swaps immutable active Host replacement graphs
+        /// @param originalEnabledStates immutable desired enablement before publication
+        /// @param originalPendingUninstall immutable pending removals before publication
+        private LiveRuntimeProviderSwapSession(
+                @Unmodifiable List<LiveRuntimeProviderSwap> swaps,
+                @Unmodifiable Set<String> originalEnabledStates,
+                @Unmodifiable Set<String> originalPendingUninstall
+        ) {
+            this.swaps = List.copyOf(swaps);
+            providerIds = swaps.stream()
+                    .map(swap -> swap.provider().identity().getPluginId())
+                    .collect(Collectors.toUnmodifiableSet());
+            this.originalEnabledStates = Set.copyOf(originalEnabledStates);
+            this.originalPendingUninstall = Set.copyOf(originalPendingUninstall);
+        }
+
+        /// Returns every immutable captured Host graph.
+        ///
+        /// @return immutable Host graph list
+        private @Unmodifiable List<LiveRuntimeProviderSwap> swaps() {
+            return swaps;
+        }
+
+        /// Returns every active Host replacement ID.
+        ///
+        /// @return immutable Provider ID set
+        private @Unmodifiable Set<String> providerIds() {
+            return providerIds;
+        }
+
+        /// Marks one Host graph as requiring rollback restoration.
+        ///
+        /// @param providerId active Host ID
+        private void markStarted(String providerId) {
+            startedProviderIds.add(providerId);
+        }
+
+        /// Returns captured graphs whose old lifecycle teardown began.
+        ///
+        /// @return immutable started graph list in original order
+        private @Unmodifiable List<LiveRuntimeProviderSwap> startedSwaps() {
+            return swaps.stream()
+                    .filter(swap -> startedProviderIds.contains(swap.provider().identity().getPluginId()))
+                    .toList();
+        }
+
+        /// Returns desired enablement from before publication.
+        ///
+        /// @return immutable enabled plugin IDs
+        private @Unmodifiable Set<String> originalEnabledStates() {
+            return originalEnabledStates;
+        }
+
+        /// Returns pending removals from before publication.
+        ///
+        /// @return immutable pending removal IDs
+        private @Unmodifiable Set<String> originalPendingUninstall() {
+            return originalPendingUninstall;
+        }
     }
 
 }

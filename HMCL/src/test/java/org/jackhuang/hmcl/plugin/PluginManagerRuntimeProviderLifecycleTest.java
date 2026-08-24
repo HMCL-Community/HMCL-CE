@@ -49,6 +49,7 @@ import java.util.zip.ZipOutputStream;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -219,25 +220,37 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
             PluginManager manager = new PluginManager(localHome);
             Path oldHostPackage = manager.getPluginsDirectory().resolve("99-host.npl");
             writePayloadPackage(manager.getPluginsDirectory().resolve("00-payload.npl"));
-            writeHostPackage(oldHostPackage);
+            writeHostPackage(oldHostPackage, "1.0.0", true);
             writeBinding(localHome);
+            manager.setGrantedPermissions(
+                    PackagedRuntimeProviderPlugin.PROVIDER_ID,
+                    Set.of(PluginPermission.LAUNCHER_UI)
+            );
             manager.enablePlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID);
             manager.enablePlugin(PAYLOAD_ID);
+            System.setProperty(PackagedRuntimeProviderPlugin.REGISTER_UI_PROPERTY, "true");
             FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
 
             String oldHostSha256 = org.jackhuang.hmcl.plugin.internal.PluginPackageVersions
                     .calculateSha256(oldHostPackage);
+            PluginContainer oldContainer = Objects.requireNonNull(
+                    manager.getPlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID));
             RuntimeProvider oldProvider = registry.findById(PackagedRuntimeProviderPlugin.PROVIDER_ID)
                     .orElseThrow();
+            assertEquals(List.of("Runtime Host 1.0.0"), sidebarTitles());
+            assertEquals("1", System.getProperty(PackagedRuntimeProviderPlugin.ACTIVE_INSTANCES_PROPERTY));
             Map<String, RuntimeProviderBinding> oldBindings =
                     new PluginRuntimeBindingStore(localHome, new PluginMutationLock(localHome)).readStrict();
             Path replacement = temporaryDirectory.resolve("runtime-host-v2.npl");
-            writeHostPackage(replacement, "2.0.0");
-            System.setProperty(PackagedRuntimeProviderPlugin.FAIL_HEALTH_PROPERTY, "true");
+            writeHostPackage(replacement, "2.0.0", true);
+            System.setProperty(PackagedRuntimeProviderPlugin.FAIL_HEALTH_VERSION_PROPERTY, "2.0.0");
 
-            IOException failure = assertThrows(IOException.class, () -> manager.stagePluginInstallations(List.of(
-                    manager.inspectLocalPluginPackage(replacement)
-            )));
+            IOException failure = assertThrows(IOException.class, () -> manager.stagePluginInstallations(
+                    List.of(manager.inspectLocalPluginPackage(replacement)),
+                    Map.of(PackagedRuntimeProviderPlugin.PROVIDER_ID, Set.of(PluginPermission.LAUNCHER_UI))
+            ));
+            FXThreadTestSupport.runOnFxThread(() -> {
+            });
 
             assertTrue(Objects.requireNonNull(failure.getMessage()).contains("health check failed"));
             assertTrue(Files.isRegularFile(oldHostPackage));
@@ -253,11 +266,27 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
                     .load(enabled, pendingUninstall);
             assertEquals(Set.of(PackagedRuntimeProviderPlugin.PROVIDER_ID, PAYLOAD_ID), enabled);
             assertTrue(pendingUninstall.isEmpty());
-            assertTrue(Objects.requireNonNull(manager.getPlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID)).isEnabled());
+            PluginContainer restoredContainer = Objects.requireNonNull(
+                    manager.getPlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID));
+            assertNotSame(oldContainer, restoredContainer);
+            assertTrue(restoredContainer.isEnabled());
             assertTrue(Objects.requireNonNull(manager.getPlugin(PAYLOAD_ID)).isEnabled());
             assertEquals("1.0.0", Objects.requireNonNull(
                     manager.getPlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID)).getManifest().getVersion());
-            assertSame(oldProvider, registry.findById(PackagedRuntimeProviderPlugin.PROVIDER_ID).orElseThrow());
+            RuntimeProvider restoredProvider = registry.findById(PackagedRuntimeProviderPlugin.PROVIDER_ID)
+                    .orElseThrow();
+            assertNotSame(oldProvider, restoredProvider);
+            assertEquals("1.0.0", restoredProvider.descriptor().version());
+            assertEquals(PluginRuntimeStatus.ENABLED,
+                    manager.getPluginRuntimeStatus(PackagedRuntimeProviderPlugin.PROVIDER_ID));
+            assertEquals(1, registry.candidates("rust").size());
+            assertEquals(List.of("Runtime Host 1.0.0"), sidebarTitles());
+            assertEquals("1", System.getProperty(PackagedRuntimeProviderPlugin.ACTIVE_INSTANCES_PROPERTY));
+            assertEquals(
+                    localHome.resolve("plugin-storage").resolve(PackagedRuntimeProviderPlugin.PROVIDER_ID)
+                            .toAbsolutePath().normalize().toString(),
+                    System.getProperty(PackagedRuntimeProviderPlugin.DATA_PATH_PROPERTY)
+            );
             assertFalse(Files.exists(localHome.resolve("plugin-install-transaction.json")));
             assertFalse(Files.exists(manager.getPluginsDirectory().resolve(
                     PackagedRuntimeProviderPlugin.PROVIDER_ID + ".npl")));
@@ -266,9 +295,67 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
                         name -> name.endsWith(".backup") || name.endsWith(".installing")
                 ));
             }
-            assertTrue(events().subList(events().size() - 5, events().size()).equals(List.of(
-                    "host.onLoad", "provider.initialize", "provider.health", "provider.close", "host.onUnload"
-            )));
+            assertNoValidationDirectories(localHome);
+            assertTrue(events().stream().filter("provider.close"::equals).count() >= 2);
+            assertTrue(events().stream().filter("host.onUnload"::equals).count() >= 2);
+        } finally {
+            clearFixture(registry);
+        }
+    }
+
+    /// Replaces a live Host against its canonical artifact and persistent private data directory.
+    ///
+    /// @param temporaryDirectory isolated launcher home
+    /// @throws Exception if package creation, discovery, staging, or verification fails
+    @Test
+    public void validateProviderReplacementAgainstPersistentData(@TempDir Path temporaryDirectory) throws Exception {
+        Path localHome = temporaryDirectory.resolve("home");
+        RuntimeProviderRegistry registry = RuntimeProviderRegistry.processWide();
+        clearFixture(registry);
+        try {
+            PluginManager manager = new PluginManager(localHome);
+            writePayloadPackage(manager.getPluginsDirectory().resolve("00-payload.npl"));
+            writeHostPackage(manager.getPluginsDirectory().resolve("99-host.npl"));
+            writeBinding(localHome);
+            manager.enablePlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID);
+            manager.enablePlugin(PAYLOAD_ID);
+            FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
+
+            PluginContainer oldContainer = Objects.requireNonNull(
+                    manager.getPlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID));
+            RuntimeProvider oldProvider = registry.findById(PackagedRuntimeProviderPlugin.PROVIDER_ID)
+                    .orElseThrow();
+            Path persistentData = localHome.resolve("plugin-storage")
+                    .resolve(PackagedRuntimeProviderPlugin.PROVIDER_ID).toAbsolutePath().normalize();
+            Files.createDirectories(persistentData);
+            Files.writeString(persistentData.resolve("health.marker"), "ready", StandardCharsets.UTF_8);
+            System.setProperty(PackagedRuntimeProviderPlugin.REQUIRED_DATA_MARKER_PROPERTY, "health.marker");
+            Path replacement = temporaryDirectory.resolve("runtime-host-v2.npl");
+            writeHostPackage(replacement, "2.0.0");
+
+            manager.stagePluginInstallations(List.of(manager.inspectLocalPluginPackage(replacement)));
+
+            PluginContainer replacementContainer = Objects.requireNonNull(
+                    manager.getPlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID));
+            RuntimeProvider replacementProvider = registry.findById(PackagedRuntimeProviderPlugin.PROVIDER_ID)
+                    .orElseThrow();
+            assertNotSame(oldContainer, replacementContainer);
+            assertNotSame(oldProvider, replacementProvider);
+            assertEquals("2.0.0", replacementContainer.getManifest().getVersion());
+            assertEquals("2.0.0", replacementProvider.descriptor().version());
+            assertTrue(replacementContainer.isEnabled());
+            assertTrue(Objects.requireNonNull(manager.getPlugin(PAYLOAD_ID)).isEnabled());
+            assertEquals(PluginRuntimeStatus.ENABLED,
+                    manager.getPluginRuntimeStatus(PackagedRuntimeProviderPlugin.PROVIDER_ID));
+            assertEquals(persistentData.toString(),
+                    System.getProperty(PackagedRuntimeProviderPlugin.DATA_PATH_PROPERTY));
+            Path installedReplacement = manager.getPluginsDirectory()
+                    .resolve(PackagedRuntimeProviderPlugin.PROVIDER_ID + ".npl");
+            assertTrue(Files.isRegularFile(installedReplacement));
+            assertEquals("2.0.0",
+                    manager.inspectLocalPluginPackage(installedReplacement).getManifest().getVersion());
+            assertEquals("1", System.getProperty(PackagedRuntimeProviderPlugin.ACTIVE_INSTANCES_PROPERTY));
+            assertNoValidationDirectories(localHome);
         } finally {
             clearFixture(registry);
         }
@@ -340,6 +427,17 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
     /// @param version Host package and Provider descriptor version
     /// @throws IOException if package creation fails
     private static void writeHostPackage(Path target, String version) throws IOException {
+        writeHostPackage(target, version, false);
+    }
+
+    /// Writes a versioned Java bootstrap Host package with optional launcher UI capability.
+    ///
+    /// @param target Host package path
+    /// @param version Host package and Provider descriptor version
+    /// @param launcherUi whether the fixture may register a sidebar item
+    /// @throws IOException if package creation fails
+    private static void writeHostPackage(Path target, String version, boolean launcherUi) throws IOException {
+        String permissions = launcherUi ? "[\"launcher-ui\"]" : "[]";
         String manifest = """
                 {
                   "schemaVersion": 5,
@@ -348,7 +446,7 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
                   "version": "%s",
                   "type": "java",
                   "entrypoint": "%s",
-                  "permissions": [],
+                  "permissions": %s,
                   "requiredPermissions": [],
                   "launcherVersion": "*",
                   "runtime": "java",
@@ -363,7 +461,8 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
                   }]
                 }
                 """.formatted(PackagedRuntimeProviderPlugin.PROVIDER_ID, version,
-                PackagedRuntimeProviderPlugin.class.getName());
+                PackagedRuntimeProviderPlugin.class.getName(),
+                permissions);
         writePackage(target, manifest, PackagedRuntimeProviderPlugin.class, false);
     }
 
@@ -512,6 +611,29 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
         return events == null || events.isBlank() ? List.of() : List.of(events.split(","));
     }
 
+    /// Returns the current Host-owned sidebar titles after synchronizing with the JavaFX queue.
+    ///
+    /// @return immutable ordered sidebar title list
+    private static List<String> sidebarTitles() {
+        List<String> titles = new java.util.ArrayList<>();
+        FXThreadTestSupport.runOnFxThread(() -> PluginUIRegistry.getSidebarItems().stream()
+                .filter(item -> item.getPluginId().equals(PackagedRuntimeProviderPlugin.PROVIDER_ID))
+                .map(PluginUIRegistry.SidebarItem::getTitle)
+                .forEach(titles::add));
+        return List.copyOf(titles);
+    }
+
+    /// Verifies that no obsolete isolated runtime validation directory remains.
+    ///
+    /// @param localHome isolated launcher home
+    /// @throws IOException if package cache enumeration fails
+    private static void assertNoValidationDirectories(Path localHome) throws IOException {
+        try (var paths = Files.list(localHome.resolve("plugin-data"))) {
+            assertFalse(paths.anyMatch(path -> path.getFileName().toString()
+                    .startsWith(".runtime-provider-validation-")));
+        }
+    }
+
     /// Clears process-global fixture state and any stale Provider registration.
     ///
     /// @param registry process-wide runtime registry
@@ -520,6 +642,13 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
         registry.unregister(PackagedRuntimeProviderPlugin.PROVIDER_ID);
         System.clearProperty(PackagedRuntimeProviderPlugin.EVENTS_PROPERTY);
         System.clearProperty(PackagedRuntimeProviderPlugin.FAIL_HEALTH_PROPERTY);
+        System.clearProperty(PackagedRuntimeProviderPlugin.REQUIRED_DATA_MARKER_PROPERTY);
+        System.clearProperty(PackagedRuntimeProviderPlugin.DATA_PATH_PROPERTY);
+        System.clearProperty(PackagedRuntimeProviderPlugin.REGISTER_UI_PROPERTY);
+        System.clearProperty(PackagedRuntimeProviderPlugin.FAIL_HEALTH_VERSION_PROPERTY);
+        System.clearProperty(PackagedRuntimeProviderPlugin.ACTIVE_INSTANCES_PROPERTY);
         System.clearProperty(PackagedRuntimeProviderPlugin.FAIL_UNLOAD_ONCE_PROPERTY);
+        FXThreadTestSupport.runOnFxThread(
+                () -> PluginUIRegistry.unregisterAll(PackagedRuntimeProviderPlugin.PROVIDER_ID));
     }
 }

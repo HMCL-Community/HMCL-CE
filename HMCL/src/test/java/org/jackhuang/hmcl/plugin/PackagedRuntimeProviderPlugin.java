@@ -29,6 +29,8 @@ import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
@@ -45,11 +47,32 @@ public final class PackagedRuntimeProviderPlugin implements Plugin, RuntimeProvi
     /// Process property forcing the health check to fail when set to `true`.
     public static final String FAIL_HEALTH_PROPERTY = "hmcl.test.runtime-provider.fail-health";
 
+    /// Process property naming a persistent data marker required by the health check.
+    public static final String REQUIRED_DATA_MARKER_PROPERTY =
+            "hmcl.test.runtime-provider.required-data-marker";
+
+    /// Process property containing the data directory observed by the most recently loaded Host.
+    public static final String DATA_PATH_PROPERTY = "hmcl.test.runtime-provider.data-path";
+
+    /// Process property enabling one sidebar registration from `onLoad`.
+    public static final String REGISTER_UI_PROPERTY = "hmcl.test.runtime-provider.register-ui";
+
+    /// Process property naming the exact Host version whose health check must fail.
+    public static final String FAIL_HEALTH_VERSION_PROPERTY =
+            "hmcl.test.runtime-provider.fail-health-version";
+
+    /// Process property containing the number of Host instances whose `onLoad` has not been unloaded.
+    public static final String ACTIVE_INSTANCES_PROPERTY =
+            "hmcl.test.runtime-provider.active-instances";
+
     /// Process property forcing the next payload unload to fail once when set to `true`.
     public static final String FAIL_UNLOAD_ONCE_PROPERTY = "hmcl.test.runtime-provider.fail-unload-once";
 
     /// Manifest received during Host loading, or `null` before registration.
     private @Nullable PluginManifest manifest;
+
+    /// Persistent private data directory received during Host loading, or `null` before `onLoad`.
+    private @Nullable Path dataDirectory;
 
     /// Creates the package-owned Host lifecycle.
     public PackagedRuntimeProviderPlugin() {
@@ -61,7 +84,14 @@ public final class PackagedRuntimeProviderPlugin implements Plugin, RuntimeProvi
     @Override
     public void onLoad(PluginContext context) {
         manifest = context.getManifest();
+        dataDirectory = context.getDataDirectory().toAbsolutePath().normalize();
+        System.setProperty(DATA_PATH_PROPERTY, dataDirectory.toString());
+        changeActiveInstances(1);
         append("host.onLoad");
+        if (Boolean.getBoolean(REGISTER_UI_PROPERTY)) {
+            context.registerSidebarItem("Runtime Host " + manifest.getVersion(), () -> {
+            });
+        }
         context.registerRuntimeProvider(this);
     }
 
@@ -81,6 +111,7 @@ public final class PackagedRuntimeProviderPlugin implements Plugin, RuntimeProvi
     @Override
     public void onUnload() {
         append("host.onUnload");
+        changeActiveInstances(-1);
     }
 
     /// Returns the authoritative package manifest.
@@ -121,7 +152,16 @@ public final class PackagedRuntimeProviderPlugin implements Plugin, RuntimeProvi
     @Override
     public boolean healthCheck() {
         append("provider.health");
-        return !Boolean.getBoolean(FAIL_HEALTH_PROPERTY);
+        if (Boolean.getBoolean(FAIL_HEALTH_PROPERTY)) {
+            return false;
+        }
+        @Nullable String failedVersion = System.getProperty(FAIL_HEALTH_VERSION_PROPERTY);
+        if (getManifest().getVersion().equals(failedVersion)) {
+            return false;
+        }
+        @Nullable String requiredMarker = System.getProperty(REQUIRED_DATA_MARKER_PROPERTY);
+        return requiredMarker == null
+                || Files.isRegularFile(Objects.requireNonNull(dataDirectory).resolve(requiredMarker));
     }
 
     /// Records exact payload loading and returns an opaque handle.
@@ -169,5 +209,14 @@ public final class PackagedRuntimeProviderPlugin implements Plugin, RuntimeProvi
     private static synchronized void append(String event) {
         @Nullable String existing = System.getProperty(EVENTS_PROPERTY);
         System.setProperty(EVENTS_PROPERTY, existing == null || existing.isEmpty() ? event : existing + "," + event);
+    }
+
+    /// Changes the process-global count of currently loaded Host instances.
+    ///
+    /// @param delta positive for load and negative for unload
+    private static synchronized void changeActiveInstances(int delta) {
+        @Nullable String currentValue = System.getProperty(ACTIVE_INSTANCES_PROPERTY);
+        int current = currentValue == null ? 0 : Integer.parseInt(currentValue);
+        System.setProperty(ACTIVE_INSTANCES_PROPERTY, Integer.toString(current + delta));
     }
 }
