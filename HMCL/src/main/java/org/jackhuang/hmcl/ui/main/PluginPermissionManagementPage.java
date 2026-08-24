@@ -325,7 +325,7 @@ final class PluginPermissionManagementPage extends BorderPane implements Decorat
 
         PluginRuntimeStatus status = pluginManager.getPluginRuntimeStatus(manifest.getId());
         statusRow.setTrailingText(runtimeStatusLabel(status));
-        boolean executableArtifact = manifest.getSchemaVersion() == PluginManifest.CURRENT_SCHEMA_VERSION;
+        boolean executableArtifact = isExecutableSchema(manifest.getSchemaVersion());
         lifecycleActionAvailable = executableArtifact && status != PluginRuntimeStatus.PENDING_UNINSTALL;
         lifecycleButton.setManaged(executableArtifact);
         lifecycleButton.setVisible(executableArtifact);
@@ -336,7 +336,7 @@ final class PluginPermissionManagementPage extends BorderPane implements Decorat
 
     /// Updates control ownership and restart visibility from the current transaction and runtime state.
     private void refreshActionState() {
-        boolean executableArtifact = manifest.getSchemaVersion() == PluginManifest.CURRENT_SCHEMA_VERSION;
+        boolean executableArtifact = isExecutableSchema(manifest.getSchemaVersion());
         permissionPane.setPermissionControlsDisabled(savingPermissions || !executableArtifact);
         applyButton.setManaged(executableArtifact);
         applyButton.setVisible(executableArtifact);
@@ -420,6 +420,15 @@ final class PluginPermissionManagementPage extends BorderPane implements Decorat
             case LOAD_FAILED -> "load_failed";
             case PENDING_UNINSTALL -> "pending_uninstall";
         });
+    }
+
+    /// Returns whether the manifest schema can execute on this launcher build.
+    ///
+    /// @param schemaVersion plugin manifest schema generation
+    /// @return whether lifecycle and permission controls may operate on the artifact
+    static boolean isExecutableSchema(int schemaVersion) {
+        return schemaVersion >= PluginManifest.MIN_EXECUTABLE_SCHEMA_VERSION
+                && schemaVersion <= PluginManifest.CURRENT_SCHEMA_VERSION;
     }
 
     /// Adds an exact runtime diagnostic below stable user-facing guidance when one is available.

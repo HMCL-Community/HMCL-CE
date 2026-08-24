@@ -1065,20 +1065,10 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
     /// @param sourceManager manager bound to the selected store item
     /// @param version selected remote version
     /// @return compatibility text
-    private String compatibilityText(
+    static String compatibilityText(
             PluginStoreManager sourceManager,
             PluginStoreManifest.PluginVersionEntry version
     ) {
-        if (version.getPluginApiVersion() != PluginManifest.CURRENT_SCHEMA_VERSION) {
-            return i18n(
-                    "plugin.store.compatibility.incompatible",
-                    i18n(
-                            "plugin.store.compatibility.unsupported_api",
-                            PluginManifest.CURRENT_SCHEMA_VERSION,
-                            version.getPluginApiVersion()
-                    )
-            );
-        }
         try {
             sourceManager.validateCompatibility(version);
             List<String> requirements = new ArrayList<>();

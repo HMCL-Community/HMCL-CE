@@ -17,6 +17,7 @@
  */
 package org.jackhuang.hmcl.ui.main;
 
+import com.google.gson.JsonParser;
 import org.jackhuang.hmcl.plugin.PluginManifest;
 import org.jackhuang.hmcl.plugin.PluginPermission;
 import org.jackhuang.hmcl.plugin.PluginRuntimeStatus;
@@ -345,6 +346,33 @@ public final class PluginStorePageTest {
     public void compatibilityIconMatchesRuntimeState() {
         assertEquals(SVG.CHECK_CIRCLE, PluginStorePage.compatibilityIcon(true));
         assertEquals(SVG.ERROR, PluginStorePage.compatibilityIcon(false));
+    }
+
+    /// Displays both executable plugin API generations as compatible when the shared evaluator accepts them.
+    @Test
+    public void compatibilityTextAcceptsEveryExecutableSchema() throws IOException {
+        PluginStoreManager manager = new PluginStoreManager();
+
+        for (int schemaVersion : List.of(4, 5)) {
+            String text = PluginStorePage.compatibilityText(
+                    manager,
+                    compatibleVersion(schemaVersion)
+            );
+
+            assertTrue(text.startsWith(org.jackhuang.hmcl.util.i18n.I18n.i18n(
+                    "plugin.store.compatibility.current"
+            )));
+            assertTrue(text.contains(Integer.toString(schemaVersion)));
+        }
+    }
+
+    /// Treats every backend-supported manifest generation as executable in permission controls.
+    @Test
+    public void permissionControlsUseExecutableSchemaRange() {
+        assertFalse(PluginPermissionManagementPage.isExecutableSchema(3));
+        assertTrue(PluginPermissionManagementPage.isExecutableSchema(4));
+        assertTrue(PluginPermissionManagementPage.isExecutableSchema(5));
+        assertFalse(PluginPermissionManagementPage.isExecutableSchema(6));
     }
 
     /// Selects every required permission while carrying forward only optional grants retained by an update.
@@ -1162,6 +1190,45 @@ public final class PluginStorePageTest {
                 """.formatted(pluginId, pluginId, hashDigit.repeat(64), dependenciesJson), PluginStoreManifest.class));
         manifest.validate(pluginId);
         return new PluginStoreItem(source, item.getRegistry(), item.getSourceManager(), item.getEntry(), manifest);
+    }
+
+    /// Creates one Store version accepted by the shared compatibility evaluator for the requested API generation.
+    ///
+    /// @param schemaVersion executable plugin API generation
+    /// @return validated compatible version entry
+    /// @throws IOException if the generated Store manifest is invalid
+    private static PluginStoreManifest.PluginVersionEntry compatibleVersion(int schemaVersion) throws IOException {
+        String pluginId = "dev.hmclce.test.ui-compatibility-" + schemaVersion;
+        String schemaFiveFields = schemaVersion >= 5
+                ? """
+                  ,"runtime": "java",
+                  "abi": 2,
+                  "platforms": []
+                  """
+                : "";
+        PluginStoreManifest manifest = PluginStoreManifest.fromJson(JsonParser.parseString("""
+                {
+                  "schemaVersion": 2,
+                  "id": "%1$s",
+                  "versions": [{
+                    "version": "1.0.0",
+                    "packageUrl": "https://plugins.example.test/ui-compatibility-%2$d.npl",
+                    "sha256": "%3$s",
+                    "pluginApiVersion": %2$d,
+                    "permissions": [],
+                    "requiredPermissions": [],
+                    "launcherVersion": "*",
+                    "dependencies": [],
+                    "size": 1%4$s
+                  }]
+                }
+                """.formatted(
+                pluginId,
+                schemaVersion,
+                Integer.toHexString(schemaVersion).repeat(64),
+                schemaFiveFields
+        )), pluginId);
+        return Objects.requireNonNull(manifest.getVersion("1.0.0"));
     }
 
     /// Requires every runtime state used by plugin rows and permission details to have a localized label.
