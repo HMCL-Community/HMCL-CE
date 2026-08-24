@@ -25,6 +25,7 @@ import org.jackhuang.hmcl.plugin.internal.PluginPackageVersions;
 import org.jackhuang.hmcl.plugin.internal.VerifiedPluginPackage;
 import org.jackhuang.hmcl.plugin.loader.JavaPluginLoader;
 import org.jackhuang.hmcl.plugin.loader.PluginLoader;
+import org.jackhuang.hmcl.plugin.loader.RuntimePluginLoader;
 import org.jackhuang.hmcl.plugin.mixin.bootstrap.PluginAgentSnapshot;
 import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityEvaluator;
 import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityRequirements;
@@ -33,7 +34,9 @@ import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityStatus;
 import org.jackhuang.hmcl.plugin.runtime.PluginRuntimeTypes;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderBinding;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderDeclaration;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderRegistry;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeRequirement;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeSupervisor;
 import org.jackhuang.hmcl.plugin.trust.PluginCertificationReceipt;
 import org.jackhuang.hmcl.plugin.trust.PluginCertificationReceiptStore;
 import org.jackhuang.hmcl.plugin.trust.PluginRuntimeTrustGuard;
@@ -44,6 +47,7 @@ import org.jetbrains.annotations.Unmodifiable;
 import org.jetbrains.annotations.UnmodifiableView;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
@@ -104,6 +108,10 @@ public final class PluginManager {
     private final PluginInstallationStateGuard installationStateGuard;
     /// Shared launcher, platform, runtime, and ABI compatibility policy for every execution path.
     private final PluginCompatibilityEvaluator compatibilityEvaluator;
+    /// Exact runtime registry shared with compatibility evaluation and payload delegation.
+    private final RuntimeProviderRegistry runtimeProviders;
+    /// Launcher-owned external Provider lifecycle and payload supervisor.
+    private final RuntimeSupervisor runtimeSupervisor;
     /// Same-process guard protecting launcher-administrative entry points from ordinary plugin code.
     private final PluginAdministrativeGuard administrativeGuard;
     /// Startup snapshot that re-verifies certified receipts and applies authenticated revocations.
@@ -181,6 +189,8 @@ public final class PluginManager {
             PluginCompatibilityEvaluator compatibilityEvaluator
     ) {
         this.compatibilityEvaluator = compatibilityEvaluator;
+        runtimeProviders = compatibilityEvaluator.getRuntimeProviders();
+        runtimeSupervisor = new RuntimeSupervisor(runtimeProviders);
         administrativeGuard = new PluginAdministrativeGuard(trustConstructionStack);
         pluginsDirectory = localHome.resolve("plugins");
         pluginPackageDirectory = localHome.resolve("plugin-data");
@@ -296,20 +306,27 @@ public final class PluginManager {
 
         Map<String, PluginVisitState> visitStates = new HashMap<>();
         Set<String> failed = new HashSet<>();
+        @Unmodifiable Map<String, RuntimeProviderBinding> startupRuntimeBindings = runtimeBindingStore.readStrict();
         for (PluginPackageCandidate candidate : candidates.values()) {
-            PluginCompatibilityResult compatibility = evaluateCompatibility(candidate.manifest);
-            if (!compatibility.isCompatible()) {
-                if (compatibility.status() == PluginCompatibilityStatus.UNSUPPORTED_SCHEMA) {
-                    enabledStates.remove(candidate.manifest.getId());
+            boolean enabled = enabledStates.contains(candidate.manifest.getId());
+            boolean deferExternalRuntimeCompatibility = enabled
+                    && isExternalRuntimePayload(candidate.manifest)
+                    && startupRuntimeBindings.containsKey(candidate.manifest.getId());
+            if (!deferExternalRuntimeCompatibility) {
+                PluginCompatibilityResult compatibility = evaluateCompatibility(candidate.manifest);
+                if (!compatibility.isCompatible()) {
+                    if (compatibility.status() == PluginCompatibilityStatus.UNSUPPORTED_SCHEMA) {
+                        enabledStates.remove(candidate.manifest.getId());
+                    }
+                    setRuntimeStatus(
+                            candidate.identity,
+                            runtimeStatusFor(compatibility),
+                            compatibility.detail()
+                    );
+                    continue;
                 }
-                setRuntimeStatus(
-                        candidate.identity,
-                        runtimeStatusFor(compatibility),
-                        compatibility.detail()
-                );
-                continue;
             }
-            if (enabledStates.contains(candidate.manifest.getId())) {
+            if (enabled) {
                 loadCandidate(candidate, candidates, visitStates, failed);
             } else {
                 setRuntimeStatus(candidate.identity, PluginRuntimeStatus.INSTALLED_DISABLED, null);
@@ -317,6 +334,16 @@ public final class PluginManager {
         }
         saveStates();
         LOG.info("Discovered " + plugins.size() + " plugin(s)");
+    }
+
+    /// Returns whether compatibility must wait for a persisted external Provider binding to start.
+    ///
+    /// @param manifest candidate manifest
+    /// @return whether the package consumes a non-Java schema-v5 runtime
+    private static boolean isExternalRuntimePayload(PluginManifest manifest) {
+        return manifest.getSchemaVersion() >= 5
+                && manifest.getPluginKind() == PluginKind.NORMAL
+                && !PluginRuntimeTypes.JAVA.equals(manifest.getRuntime());
     }
 
     /// Reconciles process-local containers with the exact package set and persisted enablement read for this pass.
@@ -515,6 +542,62 @@ public final class PluginManager {
             return !failed.contains(pluginId);
         }
 
+        boolean runtimeProviderHost = candidate.manifest.getPluginKind() == PluginKind.RUNTIME_PROVIDER;
+        if (runtimeProviderHost) {
+            runtimeSupervisor.discover(pluginId);
+        }
+        visitStates.put(pluginId, PluginVisitState.VISITING);
+
+        @Nullable RuntimeProviderBinding persistedRuntimeBinding = null;
+        if (isExternalRuntimePayload(candidate.manifest)) {
+            try {
+                persistedRuntimeBinding = runtimeBindingStore.readStrict().get(pluginId);
+            } catch (IOException exception) {
+                setRuntimeStatus(candidate.identity, PluginRuntimeStatus.LOAD_FAILED, exception.getMessage());
+                failed.add(pluginId);
+                visitStates.put(pluginId, PluginVisitState.VISITED);
+                return false;
+            }
+        }
+        if (persistedRuntimeBinding != null) {
+            RuntimeProviderBinding runtimeBinding = persistedRuntimeBinding;
+            String providerId = runtimeBinding.providerId();
+            @Nullable PluginPackageCandidate providerCandidate = candidates.get(providerId);
+            @Nullable PluginContainer loadedProvider = pluginMap.get(providerId);
+            if (providerCandidate == null && loadedProvider == null) {
+                String message = "Plugin " + pluginId + " requires missing runtime Provider " + providerId;
+                setRuntimeStatus(candidate.identity, PluginRuntimeStatus.LOAD_FAILED, message);
+                failed.add(pluginId);
+                visitStates.put(pluginId, PluginVisitState.VISITED);
+                return false;
+            }
+            if (providerCandidate != null && !enabledStates.contains(providerId)) {
+                String message = "Plugin " + pluginId + " requires disabled runtime Provider " + providerId;
+                setRuntimeStatus(candidate.identity, PluginRuntimeStatus.LOAD_FAILED, message);
+                failed.add(pluginId);
+                visitStates.put(pluginId, PluginVisitState.VISITED);
+                return false;
+            }
+            if (providerCandidate != null && !loadCandidate(providerCandidate, candidates, visitStates, failed)) {
+                String message = "Plugin " + pluginId + " cannot load because runtime Provider "
+                        + providerId + " failed";
+                setRuntimeStatus(candidate.identity, PluginRuntimeStatus.LOAD_FAILED, message);
+                failed.add(pluginId);
+                visitStates.put(pluginId, PluginVisitState.VISITED);
+                return false;
+            }
+            try {
+                runtimeProviders.restoreBinding(runtimeBinding);
+            } catch (RuntimeException exception) {
+                @Nullable String detail = exception.getMessage();
+                setRuntimeStatus(candidate.identity, PluginRuntimeStatus.LOAD_FAILED,
+                        detail == null || detail.isBlank() ? exception.toString() : detail);
+                failed.add(pluginId);
+                visitStates.put(pluginId, PluginVisitState.VISITED);
+                return false;
+            }
+        }
+
         @Nullable PluginRuntimeStatus blockedStatus = getPreLoadBlock(candidate);
         if (blockedStatus != null) {
             failed.add(pluginId);
@@ -522,7 +605,6 @@ public final class PluginManager {
             return false;
         }
 
-        visitStates.put(pluginId, PluginVisitState.VISITING);
         for (PluginDependency declaredDependency : candidate.manifest.getPluginDependencies()) {
             String dependencyId = declaredDependency.getId();
             @Nullable PluginPackageCandidate dependency = candidates.get(dependencyId);
@@ -567,12 +649,19 @@ public final class PluginManager {
             }
         }
 
+        if (runtimeProviderHost) {
+            runtimeSupervisor.resolve(pluginId);
+        }
+
         try {
             loadPlugin(candidate);
             if (!enablePlugin(pluginId, new HashSet<>())) {
                 failed.add(pluginId);
             }
         } catch (IOException | RuntimeException | Error exception) {
+            if (runtimeProviderHost) {
+                runtimeSupervisor.fail(pluginId);
+            }
             failed.add(pluginId);
             @Nullable String failureMessage = exception.getMessage();
             setRuntimeStatus(
@@ -761,7 +850,16 @@ public final class PluginManager {
         Path dataDirectory = pluginStorageDirectory.resolve(pluginId);
         Files.createDirectories(dataDirectory);
 
-        @Nullable PluginLoader loader = loaders.get(manifest.getType());
+        @Nullable PluginLoader loader;
+        if (isExternalRuntimePayload(manifest) && runtimeProviders.bindingFor(pluginId).isPresent()) {
+            loader = new RuntimePluginLoader(
+                    runtimeSupervisor,
+                    ignored -> dataDirectory,
+                    ignored -> () -> permissionService.getGrantedPermissions(manifest, artifactSha256)
+            );
+        } else {
+            loader = loaders.get(manifest.getType());
+        }
         if (loader == null) {
             throw new IOException("No loader found for plugin type: " + manifest.getType());
         }
@@ -769,6 +867,9 @@ public final class PluginManager {
         Plugin plugin = administrativeGuard.callPluginLoadingCallback(
                 () -> loader.load(manifest, pluginPackage, nplFile)
         );
+        if (manifest.getPluginKind() == PluginKind.RUNTIME_PROVIDER) {
+            runtimeSupervisor.bootstrapLoaded(pluginId);
+        }
         ClassLoader classLoader = plugin.getClass().getClassLoader();
 
         PluginContext context = new PluginContext(
@@ -777,7 +878,8 @@ public final class PluginManager {
                 dataDirectory,
                 classLoader,
                 artifactSha256,
-                () -> permissionService.getGrantedPermissions(manifest, artifactSha256)
+                () -> permissionService.getGrantedPermissions(manifest, artifactSha256),
+                provider -> runtimeSupervisor.register(pluginId, provider)
         );
         return new PreparedPlugin(
                 plugin,
@@ -1004,6 +1106,13 @@ public final class PluginManager {
                     prepared.context.getClassLoader(),
                     () -> prepared.plugin.onLoad(prepared.context)
             );
+            if (prepared.manifest.getPluginKind() == PluginKind.RUNTIME_PROVIDER) {
+                try {
+                    runtimeSupervisor.activateOwnedRegistration(pluginId);
+                } catch (IOException exception) {
+                    throw new UncheckedIOException("Runtime Provider Host failed activation: " + pluginId, exception);
+                }
+            }
             LOG.info("Loaded plugin: " + prepared.manifest.getName() + " v" + prepared.manifest.getVersion());
             return container;
         } catch (RuntimeException | Error exception) {
@@ -1023,6 +1132,11 @@ public final class PluginManager {
                 runPluginCallback(prepared.context.getClassLoader(), prepared.plugin::onUnload);
             } catch (RuntimeException | Error unloadException) {
                 exception.addSuppressed(unloadException);
+            }
+            try {
+                container.closeRuntimeProviderRegistrations();
+            } catch (IOException closeException) {
+                exception.addSuppressed(closeException);
             }
             try {
                 container.closeClassLoader();
@@ -1388,10 +1502,13 @@ public final class PluginManager {
             stateLock.readLock().unlock();
         }
         
-        for (PluginContainer dependent : pluginsCopy) {
-            if (dependent.getManifest().getDependencies().contains(pluginId)) {
-                unloadPluginLocked(dependent.getManifest().getId());
-            }
+        @Unmodifiable List<String> dependentIds = dependencyPlanner.findBlockingDependents(
+                pluginId,
+                pluginsCopy,
+                pendingUninstall
+        );
+        for (String dependentId : dependentIds) {
+            unloadPluginLocked(dependentId);
         }
 
         stateLock.readLock().lock();
@@ -1417,6 +1534,11 @@ public final class PluginManager {
         } catch (RuntimeException | Error exception) {
             LOG.warning("Plugin onUnload failed: " + pluginId, exception);
         } finally {
+            try {
+                container.closeRuntimeProviderRegistrations();
+            } catch (IOException exception) {
+                LOG.warning("Failed to close runtime Provider registrations: " + pluginId, exception);
+            }
             stateLock.writeLock().lock();
             try {
                 plugins.remove(container);
@@ -2092,7 +2214,7 @@ public final class PluginManager {
             PluginPackageRepository.validateLocalPackage(source);
             PluginPackageMutationService.verifyPackageHash(source, inspection.sha256);
             PluginManifest manifest = inspection.manifest;
-            if (PluginRuntimeTypes.JAVA.equals(manifest.getRuntime())) {
+            if (requiresLivePublicationCompatibility(manifest, runtimeAuthorization)) {
                 requireCompatible(manifest);
             }
             if (inspectionsById.putIfAbsent(manifest.getId(), inspection) != null) {
@@ -2188,7 +2310,7 @@ public final class PluginManager {
         }
         // Runtime providers are live process state, so close the planning-to-publication compatibility window.
         for (PluginManifest replacement : replacements.values()) {
-            if (PluginRuntimeTypes.JAVA.equals(replacement.getRuntime())) {
+            if (requiresLivePublicationCompatibility(replacement, runtimeAuthorization)) {
                 requireCompatible(replacement);
             }
         }
@@ -2235,6 +2357,23 @@ public final class PluginManager {
             LOG.info("Staged plugin for next restart: " + pluginId + " " + replacement.getValue().getVersion());
         }
         return List.copyOf(replacements.values());
+    }
+
+    /// Returns whether publication depends on this manager's current live runtime registry.
+    ///
+    /// A confirmed Store batch carries a prospective binding for each external payload and validates that future
+    /// graph separately. Local and compatibility overloads carry no such authorization and must recheck the current
+    /// Provider immediately before package publication.
+    ///
+    /// @param manifest replacement manifest
+    /// @param runtimeAuthorization confirmed prospective runtime edges
+    /// @return whether current live compatibility must be enforced
+    private static boolean requiresLivePublicationCompatibility(
+            PluginManifest manifest,
+            PluginRuntimeInstallAuthorization runtimeAuthorization
+    ) {
+        return PluginRuntimeTypes.JAVA.equals(manifest.getRuntime())
+                || !runtimeAuthorization.getRuntimeBindings().containsKey(manifest.getId());
     }
 
     /// Applies dependent-owned binding removals and replacements to the current durable binding snapshot.

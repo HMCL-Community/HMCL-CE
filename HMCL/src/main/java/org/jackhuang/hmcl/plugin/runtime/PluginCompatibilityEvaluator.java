@@ -65,6 +65,16 @@ public final class PluginCompatibilityEvaluator {
         return hostPlatform;
     }
 
+    /// Returns the exact runtime registry used by this evaluator.
+    ///
+    /// Lifecycle managers use the same instance so compatibility checks, restored bindings, and payload delegation
+    /// cannot observe different Provider sets.
+    ///
+    /// @return configured runtime Provider registry
+    public RuntimeProviderRegistry getRuntimeProviders() {
+        return runtimeProviders;
+    }
+
     /// Evaluates package requirements in deterministic diagnostic-priority order.
     ///
     /// @param requirements package compatibility requirements

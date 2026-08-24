@@ -190,6 +190,30 @@ public final class RuntimeProviderRegistry {
         return Optional.ofNullable(bindingsByDependent.get(canonicalProviderId(dependentPluginId)));
     }
 
+    /// Restores one previously confirmed dependent binding after its exact Provider registers during startup.
+    ///
+    /// This path never reselects a Provider. Store planning already selected and persisted the exact Host, so startup
+    /// must either restore that edge or fail closed.
+    ///
+    /// @param binding persisted dependent-to-Provider edge
+    /// @throws IllegalStateException if the Provider is absent, lacks the bound runtime, or another binding exists
+    public synchronized void restoreBinding(RuntimeProviderBinding binding) {
+        @Nullable RuntimeProviderBinding existing = bindingsByDependent.get(binding.dependentPluginId());
+        if (existing != null) {
+            if (existing.equals(binding)) {
+                return;
+            }
+            throw new IllegalStateException("Plugin already has another runtime Provider binding: "
+                    + binding.dependentPluginId());
+        }
+        @Nullable RuntimeProviderDescriptor descriptor = descriptorsById.get(binding.providerId());
+        if (descriptor == null || descriptor.capability(binding.runtime()).isEmpty()) {
+            throw new IllegalStateException("Persisted runtime Provider binding is unavailable: "
+                    + binding.dependentPluginId() + " -> " + binding.providerId());
+        }
+        bindingsByDependent.put(binding.dependentPluginId(), binding);
+    }
+
     /// Returns one registered provider by provider plugin ID.
     ///
     /// @param providerId provider plugin ID

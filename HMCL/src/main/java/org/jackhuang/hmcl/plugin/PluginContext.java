@@ -20,15 +20,22 @@ package org.jackhuang.hmcl.plugin;
 import javafx.scene.Node;
 import javafx.stage.Stage;
 import org.jackhuang.hmcl.Metadata;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeProvider;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderDescriptor;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderRegistration;
 import org.jackhuang.hmcl.ui.Controllers;
 import org.jetbrains.annotations.NotNullByDefault;
+import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
 
+import java.io.IOException;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Set;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 /// Exposes package metadata, storage locations, class loading, and UI registration to one plugin.
@@ -52,6 +59,12 @@ public final class PluginContext {
     /// Dynamic source of user grants for the exact package artifact.
     private final Supplier<@Unmodifiable Set<PluginPermission>> grantedPermissionProvider;
 
+    /// Host-bound callback which publishes one manifest-validated runtime Provider registration.
+    private final Function<RuntimeProvider, RuntimeProviderRegistration> runtimeProviderRegistrar;
+
+    /// Runtime Provider registrations owned by this exact Host context in registration order.
+    private final List<RuntimeProviderRegistration> runtimeProviderRegistrations = new ArrayList<>();
+
     /// Creates a plugin context.
     ///
     /// @param manifest package manifest
@@ -64,7 +77,9 @@ public final class PluginContext {
             Path dataDirectory,
             ClassLoader classLoader
     ) {
-        this(manifest, packageDirectory, dataDirectory, classLoader, "", Set::of);
+        this(manifest, packageDirectory, dataDirectory, classLoader, "", Set::of, provider -> {
+            throw new IllegalStateException("Runtime Provider registration requires a manager-owned plugin context");
+        });
     }
 
     /// Creates a manager-owned context with dynamic artifact-bound permission decisions.
@@ -83,12 +98,93 @@ public final class PluginContext {
             String artifactSha256,
             Supplier<@Unmodifiable Set<PluginPermission>> grantedPermissionProvider
     ) {
+        this(manifest, packageDirectory, dataDirectory, classLoader, artifactSha256,
+                grantedPermissionProvider, provider -> {
+                    throw new IllegalStateException(
+                            "Runtime Provider registration requires a Supervisor-enabled plugin manager");
+                });
+    }
+
+    /// Creates a manager-owned context with dynamic permissions and Host-bound Provider registration.
+    ///
+    /// @param manifest package manifest
+    /// @param packageDirectory extracted package directory
+    /// @param dataDirectory persistent plugin data directory
+    /// @param classLoader plugin class loader
+    /// @param artifactSha256 exact `.npl` package digest
+    /// @param grantedPermissionProvider dynamic user-grant provider
+    /// @param runtimeProviderRegistrar Host-bound Provider registration callback
+    PluginContext(
+            PluginManifest manifest,
+            Path packageDirectory,
+            Path dataDirectory,
+            ClassLoader classLoader,
+            String artifactSha256,
+            Supplier<@Unmodifiable Set<PluginPermission>> grantedPermissionProvider,
+            Function<RuntimeProvider, RuntimeProviderRegistration> runtimeProviderRegistrar
+    ) {
         this.manifest = manifest;
         this.packageDirectory = packageDirectory;
         this.dataDirectory = dataDirectory;
         this.classLoader = classLoader;
         this.artifactSha256 = artifactSha256;
         this.grantedPermissionProvider = grantedPermissionProvider;
+        this.runtimeProviderRegistrar = runtimeProviderRegistrar;
+    }
+
+    /// Registers one external runtime Provider whose descriptor exactly matches this Host manifest.
+    ///
+    /// The returned handle belongs to this context and is closed automatically when its Host container unloads.
+    ///
+    /// @param provider Provider implementation created by this Host
+    /// @return Host-owned registration handle
+    public synchronized RuntimeProviderRegistration registerRuntimeProvider(RuntimeProvider provider) {
+        if (manifest.getPluginKind() != PluginKind.RUNTIME_PROVIDER) {
+            throw new IllegalStateException("Only a runtime-provider Host may register a runtime Provider: "
+                    + manifest.getId());
+        }
+        RuntimeProviderDescriptor descriptor = provider.descriptor();
+        if (!manifest.getId().equals(descriptor.providerId())) {
+            throw new IllegalArgumentException("Runtime Provider descriptor ID does not match its Host manifest: "
+                    + descriptor.providerId());
+        }
+        if (!manifest.getVersion().equals(descriptor.version())) {
+            throw new IllegalArgumentException("Runtime Provider descriptor version does not match its Host manifest: "
+                    + descriptor.version());
+        }
+        if (!manifest.getProvidesRuntimes().equals(List.copyOf(descriptor.capabilities().values()))) {
+            throw new IllegalArgumentException("Runtime Provider descriptor capabilities do not match its Host manifest: "
+                    + manifest.getId());
+        }
+        if (!descriptor.installed() || !descriptor.enabled() || descriptor.reserved()) {
+            throw new IllegalArgumentException("External runtime Provider descriptor must be installed and enabled: "
+                    + manifest.getId());
+        }
+        RuntimeProviderRegistration registration = runtimeProviderRegistrar.apply(provider);
+        runtimeProviderRegistrations.add(registration);
+        return registration;
+    }
+
+    /// Closes every Host-owned runtime Provider registration in reverse registration order.
+    ///
+    /// @throws IOException if Provider or dependent payload cleanup fails
+    synchronized void closeRuntimeProviderRegistrations() throws IOException {
+        @Nullable IOException failure = null;
+        for (int index = runtimeProviderRegistrations.size() - 1; index >= 0; index--) {
+            try {
+                runtimeProviderRegistrations.get(index).close();
+            } catch (IOException exception) {
+                if (failure == null) {
+                    failure = exception;
+                } else {
+                    failure.addSuppressed(exception);
+                }
+            }
+        }
+        runtimeProviderRegistrations.clear();
+        if (failure != null) {
+            throw failure;
+        }
     }
 
     /// Returns the authoritative package manifest.
