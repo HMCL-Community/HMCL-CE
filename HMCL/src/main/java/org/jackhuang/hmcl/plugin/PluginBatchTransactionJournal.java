@@ -64,8 +64,11 @@ final class PluginBatchTransactionJournal {
     /// Recovery journal schema before certification receipts joined package publication.
     private static final int PRE_RECEIPT_SCHEMA_VERSION = 3;
 
-    /// Current recovery journal schema with transaction-specific quarantine paths and certification receipts.
-    private static final int SCHEMA_VERSION = 4;
+    /// Recovery schema before runtime Provider bindings joined package publication.
+    private static final int PRE_RUNTIME_BINDING_SCHEMA_VERSION = 4;
+
+    /// Current recovery journal schema with transaction-specific quarantine paths and runtime Provider bindings.
+    private static final int SCHEMA_VERSION = 5;
 
     /// Role component used for quarantined published targets.
     private static final String TARGET_QUARANTINE_ROLE = "target";
@@ -112,6 +115,9 @@ final class PluginBatchTransactionJournal {
     /// Proof-backed certification receipts participating in package publication.
     private final Path certificationReceiptFile;
 
+    /// Dependent-scoped runtime Provider bindings participating in package publication.
+    private final Path runtimeBindingFile;
+
     /// Ownership-safe recovery file transitions.
     private final PluginRecoveryFileOperations recoveryFiles;
 
@@ -140,6 +146,7 @@ final class PluginBatchTransactionJournal {
         cleanupFile = localHome.resolve("plugin-cleanup-pending.json").toAbsolutePath().normalize();
         certificationReceiptFile = localHome.resolve(PluginCertificationReceiptStore.FILE_NAME)
                 .toAbsolutePath().normalize();
+        runtimeBindingFile = localHome.resolve(PluginRuntimeBindingStore.FILE_NAME).toAbsolutePath().normalize();
         recoveryFiles = new PluginRecoveryFileOperations(recoveryQuarantineHook);
     }
 
@@ -168,7 +175,8 @@ final class PluginBatchTransactionJournal {
                 capture(permissionFile),
                 capture(stateFile),
                 capture(cleanupFile),
-                capture(certificationReceiptFile)
+                capture(certificationReceiptFile),
+                capture(runtimeBindingFile)
         );
         write(transaction);
         return transaction;
@@ -1011,6 +1019,7 @@ final class PluginBatchTransactionJournal {
                 transaction.getCertificationReceiptSnapshot(),
                 certificationReceiptFile
         );
+        snapshotsRestored &= restoreSnapshot(transaction.getRuntimeBindingSnapshot(), runtimeBindingFile);
         if (!snapshotsRestored) {
             return false;
         }
@@ -1608,6 +1617,9 @@ final class PluginBatchTransactionJournal {
         /// Old proof-backed certification receipt document restored when a transaction is interrupted.
         private @Nullable FileSnapshot certificationReceiptSnapshot;
 
+        /// Old runtime Provider binding document restored when a transaction is interrupted.
+        private @Nullable FileSnapshot runtimeBindingSnapshot;
+
         /// Creates an empty transaction for Gson.
         private Transaction() {
         }
@@ -1625,7 +1637,8 @@ final class PluginBatchTransactionJournal {
                 FileSnapshot permissionSnapshot,
                 FileSnapshot stateSnapshot,
                 FileSnapshot cleanupSnapshot,
-                FileSnapshot certificationReceiptSnapshot
+                FileSnapshot certificationReceiptSnapshot,
+                FileSnapshot runtimeBindingSnapshot
         ) throws IOException {
             Transaction transaction = new Transaction();
             transaction.schemaVersion = SCHEMA_VERSION;
@@ -1654,6 +1667,7 @@ final class PluginBatchTransactionJournal {
             transaction.stateSnapshot = stateSnapshot;
             transaction.cleanupSnapshot = cleanupSnapshot;
             transaction.certificationReceiptSnapshot = certificationReceiptSnapshot;
+            transaction.runtimeBindingSnapshot = runtimeBindingSnapshot;
             return transaction;
         }
 
@@ -1669,15 +1683,20 @@ final class PluginBatchTransactionJournal {
             boolean validSchema = schemaVersion == LEGACY_SCHEMA_VERSION
                     && recoveryNonce == null
                     && !Boolean.TRUE.equals(cleanupAuthorized)
-                    || (schemaVersion == PRE_RECEIPT_SCHEMA_VERSION || schemaVersion == SCHEMA_VERSION)
+                    || (schemaVersion == PRE_RECEIPT_SCHEMA_VERSION
+                    || schemaVersion == PRE_RUNTIME_BINDING_SCHEMA_VERSION
+                    || schemaVersion == SCHEMA_VERSION)
                     && isRecoveryNonce(recoveryNonce)
                     && cleanupAuthorized != null;
             boolean validCleanupSnapshot = schemaVersion == LEGACY_SCHEMA_VERSION
                     ? cleanupSnapshot == null || cleanupSnapshot.isValid()
                     : cleanupSnapshot != null && cleanupSnapshot.isValid();
-            boolean validCertificationReceiptSnapshot = schemaVersion == SCHEMA_VERSION
+            boolean validCertificationReceiptSnapshot = schemaVersion >= PRE_RUNTIME_BINDING_SCHEMA_VERSION
                     ? certificationReceiptSnapshot != null && certificationReceiptSnapshot.isValid()
                     : certificationReceiptSnapshot == null || certificationReceiptSnapshot.isValid();
+            boolean validRuntimeBindingSnapshot = schemaVersion == SCHEMA_VERSION
+                    ? runtimeBindingSnapshot != null && runtimeBindingSnapshot.isValid()
+                    : runtimeBindingSnapshot == null || runtimeBindingSnapshot.isValid();
             return validSchema
                     && (PHASE_PREPARED.equals(phase) || PHASE_COMMITTED.equals(phase))
                     && backups != null
@@ -1695,14 +1714,17 @@ final class PluginBatchTransactionJournal {
                     && stateSnapshot != null
                     && stateSnapshot.isValid()
                     && validCleanupSnapshot
-                    && validCertificationReceiptSnapshot;
+                    && validCertificationReceiptSnapshot
+                    && validRuntimeBindingSnapshot;
         }
 
         /// Returns whether this valid journal must be durably upgraded before recovery mutates package paths.
         ///
         /// @return whether the journal predates certification receipt snapshots
         private boolean requiresRecoveryUpgrade() {
-            return schemaVersion == LEGACY_SCHEMA_VERSION || schemaVersion == PRE_RECEIPT_SCHEMA_VERSION;
+            return schemaVersion == LEGACY_SCHEMA_VERSION
+                    || schemaVersion == PRE_RECEIPT_SCHEMA_VERSION
+                    || schemaVersion == PRE_RUNTIME_BINDING_SCHEMA_VERSION;
         }
 
         /// Upgrades a schema 2 or 3 transaction while preserving any existing quarantine and cleanup boundary.
@@ -1710,7 +1732,10 @@ final class PluginBatchTransactionJournal {
             if (cleanupSnapshot == null) {
                 cleanupSnapshot = FileSnapshot.absent();
             }
-            certificationReceiptSnapshot = FileSnapshot.absent();
+            if (certificationReceiptSnapshot == null) {
+                certificationReceiptSnapshot = FileSnapshot.absent();
+            }
+            runtimeBindingSnapshot = FileSnapshot.absent();
             if (schemaVersion == LEGACY_SCHEMA_VERSION) {
                 recoveryNonce = newRecoveryNonce();
                 cleanupAuthorized = false;
@@ -1802,6 +1827,15 @@ final class PluginBatchTransactionJournal {
         /// @return certification receipt snapshot
         private FileSnapshot getCertificationReceiptSnapshot() {
             return Objects.requireNonNull(certificationReceiptSnapshot);
+        }
+
+        /// Returns the captured runtime Provider binding document.
+        ///
+        /// Missing older-schema values are normalized to an absent snapshot during durable upgrade.
+        ///
+        /// @return runtime binding snapshot
+        private FileSnapshot getRuntimeBindingSnapshot() {
+            return Objects.requireNonNull(runtimeBindingSnapshot);
         }
 
     }

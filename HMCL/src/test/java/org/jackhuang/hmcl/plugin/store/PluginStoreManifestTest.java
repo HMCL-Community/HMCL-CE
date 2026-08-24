@@ -475,7 +475,11 @@ public final class PluginStoreManifestTest {
                 "dev.hmclce.test.provider-artifacts",
                 schemaFiveArtifactManifest(
                         "dev.hmclce.test.provider-artifacts",
-                        "\"pluginKind\": \"runtime-provider\",",
+                        """
+                                "pluginKind": "runtime-provider",
+                                "providesRuntimes": [{"runtime": "rust", "abis": [2], "bridgeAbi": 1,
+                                  "executionModes": ["embedded"], "features": ["bridge"]}],
+                                """,
                         """
                                 {"platform": "windows-x64", "packageUrl": "https://example.test/provider.npl",
                                  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "size": 1}

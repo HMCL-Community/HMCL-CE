@@ -21,6 +21,7 @@ import com.google.gson.JsonParser;
 import org.jackhuang.hmcl.plugin.PluginManifest;
 import org.jackhuang.hmcl.plugin.PluginPermission;
 import org.jackhuang.hmcl.plugin.PluginRuntimeStatus;
+import org.jackhuang.hmcl.plugin.runtime.PluginPlatformTarget;
 import org.jackhuang.hmcl.plugin.store.PluginInstallPlan;
 import org.jackhuang.hmcl.plugin.store.PluginSource;
 import org.jackhuang.hmcl.plugin.store.PluginSourceConfiguration;
@@ -58,6 +59,38 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /// Verifies README sanitization and mandatory fail-closed permission review in the plugin store UI model.
 @NotNullByDefault
 public final class PluginStorePageTest {
+    /// Displays the selected current-platform artifact size for a schema-v5 matrix.
+    @Test
+    public void selectedVersionSizeUsesCurrentPlatformArtifact() throws IOException {
+        String pluginId = "dev.test.current-platform-size";
+        PluginStoreManifest manifest = PluginStoreManifest.fromJson(JsonParser.parseString("""
+                {
+                  "schemaVersion": 2,
+                  "id": "%s",
+                  "versions": [{
+                    "version": "1.0.0",
+                    "pluginApiVersion": 5,
+                    "permissions": [],
+                    "requiredPermissions": [],
+                    "launcherVersion": "*",
+                    "runtime": "java",
+                    "abi": 2,
+                    "platforms": [],
+                    "pluginKind": "normal",
+                    "dependencies": [],
+                    "artifacts": [{
+                      "platform": "%s",
+                      "packageUrl": "https://example.test/current.npl",
+                      "sha256": "%s",
+                      "size": 73
+                    }]
+                  }]
+                }
+                """.formatted(pluginId, PluginPlatformTarget.current().getId(), "a".repeat(64))), pluginId);
+
+        assertEquals(Long.valueOf(73), PluginStorePage.selectedVersionSize(manifest.getVersions().get(0)));
+    }
+
     /// Allows official-reference certification to proceed without a legacy proof receipt.
     @Test
     public void delegatedCertificationDoesNotRequireInstallationReceipt() {

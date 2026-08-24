@@ -22,10 +22,12 @@ import com.sun.net.httpserver.HttpServer;
 import org.jackhuang.hmcl.plugin.PluginArtifactIdentity;
 import org.jackhuang.hmcl.plugin.PluginManifest;
 import org.jackhuang.hmcl.plugin.PluginPermission;
+import org.jackhuang.hmcl.plugin.runtime.PluginPlatformTarget;
 import org.jackhuang.hmcl.plugin.trust.PluginTrustLevel;
 import org.jackhuang.hmcl.plugin.trust.PluginTrustResult;
 import org.jackhuang.hmcl.util.gson.JsonUtils;
 import org.jetbrains.annotations.NotNullByDefault;
+import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -55,6 +57,151 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /// Verifies complete-graph dependency selection for plugin-store installation plans.
 @NotNullByDefault
 public final class PluginStoreDependencyResolverTest {
+    /// Adds a compatible runtime Host before its Rust dependent and records the exact binding and artifact.
+    @Test
+    public void addsCompatibleRuntimeProviderBeforeRustPlugin() throws Exception {
+        @Unmodifiable Map<String, PluginStoreItem> catalog = runtimeCatalog(true, "");
+        PluginStoreManifest.PluginVersionEntry rootVersion = runtimeVersion(catalog, "dev.test.rust-tool");
+
+        PluginInstallPlan plan = new PluginStoreDependencyResolver(catalog).resolveInstallPlan(
+                "dev.test.rust-tool", rootVersion, Map.of(), Map.of(), Map.of()
+        );
+
+        assertEquals(List.of("dev.test.rust-host", "dev.test.rust-tool"), plan.getEntries().stream()
+                .map(PluginInstallPlan.Entry::getPluginId)
+                .toList());
+        @SuppressWarnings("unchecked")
+        Map<String, Object> bindings = (Map<String, Object>) plan.getClass()
+                .getMethod("getRuntimeBindings")
+                .invoke(plan);
+        assertEquals("dev.test.rust-host", bindings.get("dev.test.rust-tool").getClass()
+                .getMethod("providerId")
+                .invoke(bindings.get("dev.test.rust-tool")));
+        PluginStoreArtifact artifact = (PluginStoreArtifact) plan.getEntries().get(0).getClass()
+                .getMethod("getSelectedArtifact")
+                .invoke(plan.getEntries().get(0));
+        assertEquals(PluginPlatformTarget.current(), artifact.platform());
+        assertEquals(41, artifact.size());
+    }
+
+    /// Reuses one already installed compatible Host instead of planning a duplicate download.
+    @Test
+    public void reusesInstalledRuntimeProvider() throws Exception {
+        @Unmodifiable Map<String, PluginStoreItem> catalog = runtimeCatalog(true, "");
+        PluginManifest installedHost = installedRuntimeProviderManifest();
+        PluginArtifactIdentity hostIdentity = PluginArtifactIdentity.of(installedHost, "a".repeat(64));
+
+        PluginInstallPlan plan = new PluginStoreDependencyResolver(catalog).resolveInstallPlan(
+                "dev.test.rust-tool",
+                runtimeVersion(catalog, "dev.test.rust-tool"),
+                Map.of(installedHost.getId(), installedHost),
+                Map.of(installedHost.getId(), hostIdentity),
+                Map.of(installedHost.getId(), hostIdentity)
+        );
+
+        assertEquals(2, plan.getEntries().size());
+        assertEquals("dev.test.rust-host", plan.getEntries().get(0).getPluginId());
+        assertEquals(PluginInstallPlan.Action.REUSE, plan.getEntries().get(0).getAction());
+    }
+
+    /// Reuses an exact installed but disabled Host and records its atomic enablement instead of downloading it again.
+    @Test
+    public void enablesInstalledDisabledRuntimeProvider() throws Exception {
+        @Unmodifiable Map<String, PluginStoreItem> catalog = runtimeCatalog(true, "");
+        PluginManifest installedHost = installedRuntimeProviderManifest();
+        PluginArtifactIdentity hostIdentity = PluginArtifactIdentity.of(installedHost, "a".repeat(64));
+
+        PluginInstallPlan plan = new PluginStoreDependencyResolver(catalog).resolveInstallPlan(
+                "dev.test.rust-tool",
+                runtimeVersion(catalog, "dev.test.rust-tool"),
+                Map.of(installedHost.getId(), installedHost),
+                Map.of(installedHost.getId(), hostIdentity),
+                Map.of()
+        );
+
+        assertEquals(PluginInstallPlan.Action.ENABLE, plan.getEntries().get(0).getAction());
+        assertEquals(List.of("dev.test.rust-host"), plan.getEnablementPluginIds());
+        assertEquals(17, plan.getTotalDownloadSize());
+    }
+
+    /// Selects one shared Host when two language packages in the same concrete graph require the same runtime.
+    @Test
+    public void sharesOneRuntimeProviderAcrossTwoDependents() throws Exception {
+        @Unmodifiable Map<String, PluginStoreItem> catalog = runtimeGraphCatalog(
+                "[{\"id\":\"dev.test.rust-addon\",\"version\":\"*\"}]",
+                "[]",
+                true
+        );
+
+        PluginInstallPlan plan = new PluginStoreDependencyResolver(catalog).resolveInstallPlan(
+                "dev.test.rust-tool",
+                runtimeVersion(catalog, "dev.test.rust-tool"),
+                Map.of(),
+                Map.of(),
+                Map.of()
+        );
+
+        assertEquals(List.of("dev.test.rust-host", "dev.test.rust-addon", "dev.test.rust-tool"),
+                plan.getEntries().stream().map(PluginInstallPlan.Entry::getPluginId).toList());
+        assertEquals(Set.of("dev.test.rust-tool", "dev.test.rust-addon"), plan.getRuntimeBindings().keySet());
+        assertEquals(1, plan.getRuntimeBindings().values().stream()
+                .map(binding -> binding.providerId())
+                .distinct()
+                .count());
+    }
+
+    /// Rejects a cycle formed only after a language package's virtual Provider edge is added.
+    @Test
+    public void rejectsRuntimeProviderVirtualEdgeCycle() throws Exception {
+        @Unmodifiable Map<String, PluginStoreItem> catalog = runtimeGraphCatalog(
+                "[]",
+                "[{\"id\":\"dev.test.rust-tool\",\"version\":\"*\"}]",
+                false
+        );
+
+        IOException exception = assertThrows(IOException.class, () -> new PluginStoreDependencyResolver(catalog)
+                .resolveInstallPlan(
+                        "dev.test.rust-tool",
+                        runtimeVersion(catalog, "dev.test.rust-tool"),
+                        Map.of(),
+                        Map.of(),
+                        Map.of()
+                ));
+
+        assertTrue(Objects.requireNonNull(exception.getMessage()).contains("Cyclic"));
+        assertTrue(exception.getMessage().contains("dev.test.rust-tool"));
+    }
+
+    /// Requires a separate receipt when the only compatible Host comes from a custom source.
+    @Test
+    public void customSourceRuntimeProviderRequiresConfirmation() throws Exception {
+        @Unmodifiable Map<String, PluginStoreItem> catalog = runtimeCatalog(false, "");
+
+        PluginInstallPlan plan = new PluginStoreDependencyResolver(catalog).resolveInstallPlan(
+                "dev.test.rust-tool", runtimeVersion(catalog, "dev.test.rust-tool"),
+                Map.of(), Map.of(), Map.of()
+        );
+
+        assertEquals(true, plan.getClass().getMethod("requiresCustomSourceConfirmation").invoke(plan));
+    }
+
+    /// Makes an unavailable explicit provider pin fail closed without selecting another compatible Host.
+    @Test
+    public void unavailableRuntimeProviderPinDoesNotFallBack() throws Exception {
+        @Unmodifiable Map<String, PluginStoreItem> catalog = runtimeCatalog(
+                true,
+                "dev.test.missing-rust-host"
+        );
+
+        IOException exception = assertThrows(IOException.class, () -> new PluginStoreDependencyResolver(catalog)
+                .resolveInstallPlan(
+                        "dev.test.rust-tool", runtimeVersion(catalog, "dev.test.rust-tool"),
+                        Map.of(), Map.of(), Map.of()
+                ));
+
+        assertTrue(Objects.requireNonNull(exception.getMessage()).contains("dev.test.missing-rust-host"));
+    }
+
     /// Uses the exact selected version's trust instead of inheriting certification from another version or item.
     @Test
     public void selectedVersionTrustControlsDependencyResolution() throws Exception {
@@ -876,6 +1023,217 @@ public final class PluginStoreDependencyResolverTest {
             );
         }
         return Map.copyOf(identities);
+    }
+
+    /// Builds one official Rust consumer and one official or custom Rust Host catalog.
+    ///
+    /// @param providerOfficial whether the Host belongs to the official source
+    /// @param providerPin optional provider ID pin, or an empty string for unpinned selection
+    /// @return immutable winning catalog indexed by plugin ID
+    /// @throws IOException if generated Store metadata is invalid
+    private static @Unmodifiable Map<String, PluginStoreItem> runtimeCatalog(
+            boolean providerOfficial,
+            String providerPin
+    ) throws IOException {
+        String target = PluginPlatformTarget.current().getId();
+        PluginStoreRegistry registry = Objects.requireNonNull(JsonUtils.GSON.fromJson("""
+                {"schemaVersion":1,"name":"Runtime Fixtures","plugins":[
+                  {"id":"dev.test.rust-tool","name":"Rust Tool",
+                   "manifestUrl":"https://example.com/rust-tool.json"},
+                  {"id":"dev.test.rust-host","name":"Rust Host",
+                   "manifestUrl":"https://example.com/rust-host.json"}
+                ]}
+                """, PluginStoreRegistry.class));
+        registry.validate();
+        PluginStoreManifest rootManifest = parseRuntimeStoreManifest("dev.test.rust-tool", """
+                "runtime": "rust",
+                "abi": 2,
+                "pluginKind": "normal",
+                "executionMode": "embedded",
+                %s
+                "artifacts": [{"platform": "%s", "packageUrl": "https://example.com/rust-tool.npl",
+                  "sha256": "%s", "size": 17}]
+                """.formatted(
+                providerPin.isEmpty() ? "" : "\"runtimeProvider\": \"" + providerPin + "\",",
+                target,
+                "b".repeat(64)
+        ));
+        PluginStoreManifest hostManifest = parseRuntimeStoreManifest("dev.test.rust-host", """
+                "runtime": "java",
+                "abi": 2,
+                "pluginKind": "runtime-provider",
+                "providesRuntimes": [{"runtime": "rust", "abis": [2], "bridgeAbi": 1,
+                  "executionModes": ["embedded"], "features": ["bridge"]}],
+                "artifacts": [{"platform": "%s", "packageUrl": "https://example.com/rust-host.npl",
+                  "sha256": "%s", "size": 41}]
+                """.formatted(target, "c".repeat(64)));
+        PluginStoreManifest.PluginVersionEntry rootVersion = rootManifest.getVersions().get(0);
+        PluginStoreManifest.PluginVersionEntry hostVersion = hostManifest.getVersions().get(0);
+        rootVersion.setTrust(PluginTrustResult.official("root-key"));
+        hostVersion.setTrust(providerOfficial
+                ? PluginTrustResult.official("provider-key")
+                : PluginTrustResult.community());
+        PluginStoreManager manager = new PluginStoreManager();
+        PluginSource rootSource = new PluginSource(
+                "official", "https://example.com/official.json", "Official", true, true
+        );
+        PluginSource providerSource = providerOfficial
+                ? rootSource
+                : new PluginSource("custom", "https://custom.example/plugins.json", "Custom", true, false);
+        Map<String, PluginStoreItem> items = new LinkedHashMap<>();
+        items.put("dev.test.rust-tool", new PluginStoreItem(
+                rootSource, registry, manager, registry.getPlugins().get(0), rootManifest
+        ));
+        items.put("dev.test.rust-host", new PluginStoreItem(
+                providerSource, registry, manager, registry.getPlugins().get(1), hostManifest
+        ));
+        return Map.copyOf(items);
+    }
+
+    /// Builds a runtime graph with configurable root and Host dependencies and an optional second Rust consumer.
+    ///
+    /// @param rootDependenciesJson root dependency array JSON
+    /// @param hostDependenciesJson Host dependency array JSON
+    /// @param includeSecondConsumer whether the root dependency target is published
+    /// @return immutable source-priority catalog
+    /// @throws IOException if generated Store metadata is invalid
+    private static @Unmodifiable Map<String, PluginStoreItem> runtimeGraphCatalog(
+            String rootDependenciesJson,
+            String hostDependenciesJson,
+            boolean includeSecondConsumer
+    ) throws IOException {
+        String target = PluginPlatformTarget.current().getId();
+        String secondRegistryEntry = includeSecondConsumer
+                ? ",{\"id\":\"dev.test.rust-addon\",\"name\":\"Rust Addon\","
+                + "\"manifestUrl\":\"https://example.com/rust-addon.json\"}"
+                : "";
+        PluginStoreRegistry registry = Objects.requireNonNull(JsonUtils.GSON.fromJson("""
+                {"schemaVersion":1,"name":"Runtime Graph","plugins":[
+                  {"id":"dev.test.rust-tool","name":"Rust Tool",
+                   "manifestUrl":"https://example.com/rust-tool.json"},
+                  {"id":"dev.test.rust-host","name":"Rust Host",
+                   "manifestUrl":"https://example.com/rust-host.json"}%s
+                ]}
+                """.formatted(secondRegistryEntry), PluginStoreRegistry.class));
+        registry.validate();
+        PluginStoreManifest rootManifest = parseRuntimeStoreManifest("dev.test.rust-tool", """
+                "runtime": "rust",
+                "abi": 2,
+                "pluginKind": "normal",
+                "executionMode": "embedded",
+                "dependencies": %s,
+                "artifacts": [{"platform": "%s", "packageUrl": "https://example.com/rust-tool.npl",
+                  "sha256": "%s", "size": 17}]
+                """.formatted(rootDependenciesJson, target, "b".repeat(64)));
+        PluginStoreManifest hostManifest = parseRuntimeStoreManifest("dev.test.rust-host", """
+                "runtime": "java",
+                "abi": 2,
+                "pluginKind": "runtime-provider",
+                "providesRuntimes": [{"runtime": "rust", "abis": [2], "bridgeAbi": 1,
+                  "executionModes": ["embedded"], "features": ["bridge"]}],
+                "dependencies": %s,
+                "artifacts": [{"platform": "%s", "packageUrl": "https://example.com/rust-host.npl",
+                  "sha256": "%s", "size": 41}]
+                """.formatted(hostDependenciesJson, target, "c".repeat(64)));
+        @Nullable PluginStoreManifest addonManifest = includeSecondConsumer
+                ? parseRuntimeStoreManifest("dev.test.rust-addon", """
+                        "runtime": "rust",
+                        "abi": 2,
+                        "pluginKind": "normal",
+                        "executionMode": "embedded",
+                        "artifacts": [{"platform": "%s", "packageUrl": "https://example.com/rust-addon.npl",
+                          "sha256": "%s", "size": 19}]
+                        """.formatted(target, "d".repeat(64)))
+                : null;
+        rootManifest.getVersions().get(0).setTrust(PluginTrustResult.official("root-key"));
+        hostManifest.getVersions().get(0).setTrust(PluginTrustResult.official("host-key"));
+        if (addonManifest != null) {
+            addonManifest.getVersions().get(0).setTrust(PluginTrustResult.official("addon-key"));
+        }
+        PluginSource source = new PluginSource(
+                "official", "https://example.com/official.json", "Official", true, true
+        );
+        PluginStoreManager manager = new PluginStoreManager();
+        Map<String, PluginStoreItem> items = new LinkedHashMap<>();
+        items.put("dev.test.rust-tool", new PluginStoreItem(
+                source, registry, manager, registry.getPlugins().get(0), rootManifest
+        ));
+        items.put("dev.test.rust-host", new PluginStoreItem(
+                source, registry, manager, registry.getPlugins().get(1), hostManifest
+        ));
+        if (addonManifest != null) {
+            items.put("dev.test.rust-addon", new PluginStoreItem(
+                    source, registry, manager, registry.getPlugins().get(2), addonManifest
+            ));
+        }
+        return Map.copyOf(items);
+    }
+
+    /// Parses one schema-v5 Store version with exact current-platform artifacts.
+    ///
+    /// @param pluginId repository plugin ID
+    /// @param declarations runtime role and artifact declarations
+    /// @return validated repository manifest
+    /// @throws IOException if generated metadata violates Store validation
+    private static PluginStoreManifest parseRuntimeStoreManifest(
+            String pluginId,
+            String declarations
+    ) throws IOException {
+        return PluginStoreManifest.fromJson(JsonUtils.GSON.fromJson("""
+                {
+                  "schemaVersion": 2,
+                  "id": "%s",
+                  "versions": [{
+                    "version": "1.0.0",
+                    "pluginApiVersion": 5,
+                    "permissions": [],
+                    "requiredPermissions": [],
+                    "launcherVersion": "*",
+                    "platforms": ["%s"],
+                    "dependencies": [],
+                    %s
+                  }]
+                }
+                """.formatted(pluginId, PluginPlatformTarget.current().getId(), declarations),
+                com.google.gson.JsonElement.class), pluginId);
+    }
+
+    /// Returns the selected version for one complete catalog item.
+    ///
+    /// @param catalog winning catalog
+    /// @param pluginId selected plugin ID
+    /// @return sole fixture version
+    private static PluginStoreManifest.PluginVersionEntry runtimeVersion(
+            @Unmodifiable Map<String, PluginStoreItem> catalog,
+            String pluginId
+    ) {
+        return Objects.requireNonNull(catalog.get(pluginId).getManifest()).getVersions().get(0);
+    }
+
+    /// Parses one installed Java Host that provides the Rust runtime.
+    ///
+    /// @return installed provider manifest
+    /// @throws IOException if the package fixture is invalid
+    private static PluginManifest installedRuntimeProviderManifest() throws IOException {
+        return PluginManifest.fromJson(new StringReader("""
+                {
+                  "schemaVersion": 5,
+                  "id": "dev.test.rust-host",
+                  "name": "Rust Host",
+                  "version": "1.0.0",
+                  "type": "java",
+                  "entrypoint": "dev.test.RustHost",
+                  "permissions": [],
+                  "requiredPermissions": [],
+                  "launcherVersion": "*",
+                  "runtime": "java",
+                  "abi": 2,
+                  "platforms": ["%s"],
+                  "pluginKind": "runtime-provider",
+                  "providesRuntimes": [{"runtime": "rust", "abis": [2], "bridgeAbi": 1,
+                    "executionModes": ["embedded"], "features": ["bridge"]}]
+                }
+                """.formatted(PluginPlatformTarget.current().getId())));
     }
 
     /// Creates one schema-v2 repository manifest around already serialized version entries.

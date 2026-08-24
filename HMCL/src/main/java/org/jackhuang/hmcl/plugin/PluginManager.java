@@ -30,6 +30,10 @@ import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityEvaluator;
 import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityRequirements;
 import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityResult;
 import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityStatus;
+import org.jackhuang.hmcl.plugin.runtime.PluginRuntimeTypes;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderBinding;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderDeclaration;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeRequirement;
 import org.jackhuang.hmcl.plugin.trust.PluginCertificationReceipt;
 import org.jackhuang.hmcl.plugin.trust.PluginCertificationReceiptStore;
 import org.jackhuang.hmcl.plugin.trust.PluginRuntimeTrustGuard;
@@ -80,6 +84,8 @@ public final class PluginManager {
     private final PluginStateStore stateStore;
     /// Proof-backed certified installation receipts changed in the same transaction as packages.
     private final PluginCertificationReceiptStore certificationReceiptStore;
+    /// Dependent-scoped runtime Provider bindings changed atomically with package publication.
+    private final PluginRuntimeBindingStore runtimeBindingStore;
     /// Read-only installed package and manifest repository.
     private final PluginPackageRepository packageRepository;
     /// Exact installed and loaded artifact identity resolver.
@@ -179,11 +185,12 @@ public final class PluginManager {
         pluginsDirectory = localHome.resolve("plugins");
         pluginPackageDirectory = localHome.resolve("plugin-data");
         pluginStorageDirectory = localHome.resolve("plugin-storage");
+        mutationLock = new PluginMutationLock(localHome);
+        runtimeBindingStore = new PluginRuntimeBindingStore(localHome, mutationLock);
         packageRepository = new PluginPackageRepository(pluginsDirectory);
         artifactResolver = new PluginArtifactResolver(packageRepository, pluginMap, runtimeState);
         installationStateGuard = new PluginInstallationStateGuard(artifactResolver);
-        dependencyPlanner = new PluginDependencyPlanner(packageRepository);
-        mutationLock = new PluginMutationLock(localHome);
+        dependencyPlanner = new PluginDependencyPlanner(packageRepository, runtimeBindingStore);
         stateStore = new PluginStateStore(localHome.resolve("plugin-states.json"), mutationLock);
         certificationReceiptStore = new PluginCertificationReceiptStore(localHome);
         packageMutationService = new PluginPackageMutationService(
@@ -1260,9 +1267,7 @@ public final class PluginManager {
     /// @param pluginId plugin ID
     /// @throws IOException if the installed dependency graph cannot be read
     private void disablePluginLocked(String pluginId) throws IOException {
-        @Unmodifiable Map<String, PluginManifest> installedManifests =
-                packageRepository.readInstalledManifests(plugins);
-        disablePluginLocked(pluginId, installedManifests, new HashSet<>());
+        disablePluginLocked(pluginId, new HashSet<>());
         saveStates();
     }
 
@@ -1272,30 +1277,22 @@ public final class PluginManager {
     /// manifests are also considered so an updated package cannot hide a dependency edge still active in this process.
     ///
     /// @param pluginId plugin ID to disable
-    /// @param installedManifests immutable installed manifests indexed by plugin ID
     /// @param visited IDs already processed during reverse traversal
+    /// @throws IOException if installed manifests or runtime bindings cannot be read
     private void disablePluginLocked(
             String pluginId,
-            @Unmodifiable Map<String, PluginManifest> installedManifests,
             Set<String> visited
-    ) {
+    ) throws IOException {
         if (!visited.add(pluginId)) {
             return;
         }
-        @Unmodifiable List<String> dependentIds = Stream.concat(
-                        installedManifests.values().stream(),
-                        plugins.stream().map(PluginContainer::getManifest)
-                )
-                .filter(manifest -> !manifest.getId().equals(pluginId))
-                .filter(manifest -> manifest.getSchemaVersion()
-                        >= PluginManifest.MIN_EXECUTABLE_SCHEMA_VERSION)
-                .filter(manifest -> manifest.getDependencies().contains(pluginId))
-                .map(PluginManifest::getId)
-                .distinct()
-                .sorted()
-                .toList();
+        @Unmodifiable List<String> dependentIds = dependencyPlanner.findBlockingDependents(
+                pluginId,
+                plugins,
+                pendingUninstall
+        );
         for (String dependentId : dependentIds) {
-            disablePluginLocked(dependentId, installedManifests, visited);
+            disablePluginLocked(dependentId, visited);
         }
 
         @Nullable PluginContainer container = pluginMap.get(pluginId);
@@ -1427,6 +1424,31 @@ public final class PluginManager {
     /// @return immutable package inspection
     /// @throws IOException if the package, manifest, compatibility, or digest is invalid
     public LocalPluginInspection inspectLocalPluginPackage(Path sourcePackage) throws IOException {
+        return inspectPluginPackage(sourcePackage, true);
+    }
+
+    /// Inspects a Store-staged package while deferring non-Java runtime selection to the confirmed batch plan.
+    ///
+    /// Java packages, including Runtime Hosts, still pass the complete current-process compatibility gate. External
+    /// runtime consumers are bound against the prospective Provider graph under the mutation lock during publication.
+    ///
+    /// @param sourcePackage Store-staged `.npl` package
+    /// @return immutable package inspection
+    /// @throws IOException if the package, manifest, Java compatibility, or digest is invalid
+    public LocalPluginInspection inspectStorePluginPackage(Path sourcePackage) throws IOException {
+        return inspectPluginPackage(sourcePackage, false);
+    }
+
+    /// Creates an immutable inspection with caller-selected external-runtime availability enforcement.
+    ///
+    /// @param sourcePackage package to inspect
+    /// @param requireAvailableExternalRuntime whether non-Java runtimes must already be process-registered
+    /// @return immutable package inspection
+    /// @throws IOException if package validation, compatibility, or hashing fails
+    private LocalPluginInspection inspectPluginPackage(
+            Path sourcePackage,
+            boolean requireAvailableExternalRuntime
+    ) throws IOException {
         Path source = sourcePackage.toAbsolutePath().normalize();
         PluginPackageRepository.validateLocalPackage(source);
 
@@ -1436,7 +1458,9 @@ public final class PluginManager {
         if (!initialSha256.equals(verifiedSha256)) {
             throw new IOException("Plugin package changed while it was being inspected: " + source);
         }
-        requireCompatible(manifest);
+        if (requireAvailableExternalRuntime || PluginRuntimeTypes.JAVA.equals(manifest.getRuntime())) {
+            requireCompatible(manifest);
+        }
         if (manifest.getSchemaVersion() >= PluginManifest.MIN_EXECUTABLE_SCHEMA_VERSION
                 && !PluginManifest.isCanonicalExecutableId(manifest.getId())) {
             throw new IOException("Executable plugin ID must be portable canonical lower-case text: "
@@ -1841,7 +1865,8 @@ public final class PluginManager {
                 Map.of(),
                 false,
                 expectedPriorArtifacts,
-                Map.of()
+                Map.of(),
+                PluginRuntimeInstallAuthorization.empty()
         ));
     }
 
@@ -1872,7 +1897,46 @@ public final class PluginManager {
                 expectedSnapshot,
                 true,
                 expectedPriorArtifacts,
-                Map.of()
+                Map.of(),
+                PluginRuntimeInstallAuthorization.empty()
+        ));
+    }
+
+    /// Publishes a confirmed Store plan with runtime Provider bindings and explicit custom-source receipts.
+    ///
+    /// Runtime authorization is validated before transaction recovery, package inspection, or journal preparation.
+    ///
+    /// @param inspections immutable inspected packages in dependency-first order
+    /// @param grantsByPluginId explicit user decisions indexed by inspected plugin ID
+    /// @param expectedReusableArtifacts exact identities for unchanged plan entries
+    /// @param expectedPriorArtifacts exact prior state for every installation or update
+    /// @param certificationReceipts proof-backed receipts for certified replacement artifacts
+    /// @param runtimeAuthorization confirmed bindings, Host enablements, and custom-source receipts
+    /// @return immutable replacement manifests in the supplied order
+    /// @throws IOException if current state differs from the confirmed plan or publication fails
+    public @Unmodifiable List<PluginManifest> stagePluginInstallations(
+            @Unmodifiable List<LocalPluginInspection> inspections,
+            @Unmodifiable Map<String, @Unmodifiable Set<PluginPermission>> grantsByPluginId,
+            @Unmodifiable Map<String, PluginArtifactIdentity> expectedReusableArtifacts,
+            @Unmodifiable Map<String, Optional<PluginArtifactIdentity>> expectedPriorArtifacts,
+            @Unmodifiable Map<String, PluginCertificationReceipt> certificationReceipts,
+            PluginRuntimeInstallAuthorization runtimeAuthorization
+    ) throws IOException {
+        administrativeGuard.checkTrustedCaller();
+        runtimeAuthorization.requireAcknowledgements();
+        validateDangerousPermissionAcknowledgements(runtimeAuthorization, inspections);
+        validateExpectedPackageRuntimeContracts(runtimeAuthorization, inspections);
+        @Unmodifiable Map<String, PluginArtifactIdentity> reusableSnapshot = Map.copyOf(expectedReusableArtifacts);
+        @Unmodifiable Map<String, Optional<PluginArtifactIdentity>> priorSnapshot = Map.copyOf(expectedPriorArtifacts);
+        @Unmodifiable Map<String, PluginCertificationReceipt> receiptSnapshot = Map.copyOf(certificationReceipts);
+        return mutationLock.call(() -> stagePluginInstallationsLocked(
+                inspections,
+                grantsByPluginId,
+                reusableSnapshot,
+                true,
+                priorSnapshot,
+                receiptSnapshot,
+                runtimeAuthorization
         ));
     }
 
@@ -1905,7 +1969,8 @@ public final class PluginManager {
                 reusableSnapshot,
                 true,
                 priorSnapshot,
-                Map.of()
+                Map.of(),
+                PluginRuntimeInstallAuthorization.empty()
         ));
     }
 
@@ -1941,7 +2006,8 @@ public final class PluginManager {
                 reusableSnapshot,
                 true,
                 priorSnapshot,
-                receiptSnapshot
+                receiptSnapshot,
+                PluginRuntimeInstallAuthorization.empty()
         ));
     }
 
@@ -1953,6 +2019,7 @@ public final class PluginManager {
     /// @param requireExpectedReusableArtifacts whether every reused dependency must match the planning snapshot
     /// @param expectedPriorArtifacts exact prior state for every replacement ID
     /// @param certificationReceipts proof-backed receipts for certified replacements
+    /// @param runtimeAuthorization confirmed virtual bindings and Provider enablements
     /// @return immutable replacement manifests in the supplied order
     /// @throws IOException if validation, persistence, publication, or rollback fails
     private @Unmodifiable List<PluginManifest> stagePluginInstallationsLocked(
@@ -1961,14 +2028,17 @@ public final class PluginManager {
             @Unmodifiable Map<String, PluginArtifactIdentity> expectedReusableArtifacts,
             boolean requireExpectedReusableArtifacts,
             @Unmodifiable Map<String, Optional<PluginArtifactIdentity>> expectedPriorArtifacts,
-            @Unmodifiable Map<String, PluginCertificationReceipt> certificationReceipts
+            @Unmodifiable Map<String, PluginCertificationReceipt> certificationReceipts,
+            PluginRuntimeInstallAuthorization runtimeAuthorization
     ) throws IOException {
+        runtimeAuthorization.requireAcknowledgements();
         stateStore.load(enabledStates, pendingUninstall);
         if (inspections.isEmpty()) {
             if (!grantsByPluginId.isEmpty()
                     || !expectedReusableArtifacts.isEmpty()
                     || !expectedPriorArtifacts.isEmpty()
-                    || !certificationReceipts.isEmpty()) {
+                    || !certificationReceipts.isEmpty()
+                    || !runtimeAuthorization.isEmpty()) {
                 throw new IllegalArgumentException("State expectations were supplied for an empty installation");
             }
             return List.of();
@@ -1983,7 +2053,9 @@ public final class PluginManager {
             PluginPackageRepository.validateLocalPackage(source);
             PluginPackageMutationService.verifyPackageHash(source, inspection.sha256);
             PluginManifest manifest = inspection.manifest;
-            requireCompatible(manifest);
+            if (PluginRuntimeTypes.JAVA.equals(manifest.getRuntime())) {
+                requireCompatible(manifest);
+            }
             if (inspectionsById.putIfAbsent(manifest.getId(), inspection) != null) {
                 throw new IOException("Plugin installation batch contains duplicate ID: " + manifest.getId());
             }
@@ -2021,13 +2093,25 @@ public final class PluginManager {
                 dependencyPlanner.readInstallPlanningManifests(plugins, pendingUninstall);
         Map<String, PluginManifest> effectiveManifests = new LinkedHashMap<>(installedBefore);
         effectiveManifests.putAll(replacements);
+        validateRuntimeInstallAuthorization(
+                runtimeAuthorization,
+                Map.copyOf(effectiveManifests),
+                Set.copyOf(replacements.keySet()),
+                expectedReusableArtifacts
+        );
         dependencyPlanner.validateReplacementGraph(effectiveManifests, replacements.keySet());
+        Set<String> virtualProviderIds = runtimeAuthorization.getRuntimeBindings().values().stream()
+                .map(RuntimeProviderBinding::providerId)
+                .filter(providerId -> !replacements.containsKey(providerId))
+                .collect(Collectors.toUnmodifiableSet());
+        Map<String, PluginArtifactIdentity> concreteReusableArtifacts = new LinkedHashMap<>(expectedReusableArtifacts);
+        virtualProviderIds.forEach(concreteReusableArtifacts::remove);
         @Unmodifiable Set<String> plannedDependencyIds = requireExpectedReusableArtifacts
                 ? reusePolicy.validateDependencyClosure(
                         Map.copyOf(effectiveManifests),
                         Set.copyOf(replacements.keySet()),
                         Set.copyOf(enabledStates),
-                        expectedReusableArtifacts
+                        Map.copyOf(concreteReusableArtifacts)
                 )
                 : reusePolicy.validateDependencyClosure(
                         Map.copyOf(effectiveManifests),
@@ -2037,6 +2121,7 @@ public final class PluginManager {
 
         Set<String> nextEnabledStates = new HashSet<>(enabledStates);
         nextEnabledStates.addAll(plannedDependencyIds);
+        nextEnabledStates.addAll(runtimeAuthorization.getEnablementPluginIds());
         Set<String> nextPendingUninstall = new HashSet<>(pendingUninstall);
         for (String pluginId : replacements.keySet()) {
             if (!installedBefore.containsKey(pluginId)) {
@@ -2055,7 +2140,9 @@ public final class PluginManager {
         }
         // Runtime providers are live process state, so close the planning-to-publication compatibility window.
         for (PluginManifest replacement : replacements.values()) {
-            requireCompatible(replacement);
+            if (PluginRuntimeTypes.JAVA.equals(replacement.getRuntime())) {
+                requireCompatible(replacement);
+            }
         }
         packageMutationService.publishInstallations(
                 installArtifacts,
@@ -2071,6 +2158,7 @@ public final class PluginManager {
                             Set.copyOf(replacements.keySet()),
                             certificationReceipts
                     );
+                    runtimeBindingStore.mergeStrict(runtimeAuthorization.getRuntimeBindings());
                 },
                 () -> stateStore.saveStrict(nextEnabledStates, nextPendingUninstall),
                 permissionService::reload
@@ -2099,6 +2187,123 @@ public final class PluginManager {
             LOG.info("Staged plugin for next restart: " + pluginId + " " + replacement.getValue().getVersion());
         }
         return List.copyOf(replacements.values());
+    }
+
+    /// Verifies that Store authorization exactly covers every changed artifact declaring a dangerous permission.
+    ///
+    /// @param authorization confirmed Store authorization
+    /// @param inspections inspected replacement packages
+    /// @throws IOException if the authorization omits or invents a dangerous-permission artifact
+    private static void validateDangerousPermissionAcknowledgements(
+            PluginRuntimeInstallAuthorization authorization,
+            @Unmodifiable List<LocalPluginInspection> inspections
+    ) throws IOException {
+        Set<String> actualDangerousPluginIds = inspections.stream()
+                .map(LocalPluginInspection::getManifest)
+                .filter(manifest -> java.util.stream.Stream.concat(
+                                manifest.getRequiredPermissions().stream(),
+                                manifest.getOptionalPermissions().stream())
+                        .anyMatch(permission -> PluginPermissionTier.tierOf(permission)
+                                == PluginPermissionTier.DANGEROUS))
+                .map(PluginManifest::getId)
+                .collect(Collectors.toUnmodifiableSet());
+        if (!actualDangerousPluginIds.equals(authorization.getRequiredDangerousPermissionPluginIds())) {
+            throw new IOException("Dangerous-permission confirmation does not match inspected Store packages");
+        }
+    }
+
+    /// Verifies exact Store runtime metadata against every inspected downloaded package before transaction recovery.
+    ///
+    /// @param authorization confirmed Store authorization
+    /// @param inspections inspected replacement packages
+    /// @throws IOException if a package is absent from the plan or differs from its confirmed runtime contract
+    private static void validateExpectedPackageRuntimeContracts(
+            PluginRuntimeInstallAuthorization authorization,
+            @Unmodifiable List<LocalPluginInspection> inspections
+    ) throws IOException {
+        Map<String, PluginPackageRuntimeContract> actualContracts = new LinkedHashMap<>();
+        for (LocalPluginInspection inspection : inspections) {
+            PluginManifest manifest = inspection.getManifest();
+            if (actualContracts.putIfAbsent(
+                    manifest.getId(),
+                    PluginPackageRuntimeContract.fromManifest(manifest)
+            ) != null) {
+                throw new IOException("Plugin installation batch contains duplicate ID: " + manifest.getId());
+            }
+        }
+        @Unmodifiable Map<String, PluginPackageRuntimeContract> expectedContracts =
+                authorization.getExpectedPackageRuntimeContracts();
+        if (!actualContracts.keySet().equals(expectedContracts.keySet())) {
+            throw new IOException("Downloaded package set does not match confirmed Store runtime contracts");
+        }
+        for (Map.Entry<String, PluginPackageRuntimeContract> entry : actualContracts.entrySet()) {
+            if (!entry.getValue().equals(expectedContracts.get(entry.getKey()))) {
+                throw new IOException("Downloaded package runtime contract does not match Store metadata: "
+                        + entry.getKey());
+            }
+        }
+    }
+
+    /// Validates virtual bindings and exact installed Provider identities against the prospective package graph.
+    ///
+    /// @param authorization confirmed runtime authorization
+    /// @param effectiveManifests prospective installed manifests
+    /// @param replacementIds package IDs replaced by this transaction
+    /// @param expectedReusableArtifacts exact identities captured by Store planning
+    /// @throws IOException if a binding or installed Provider differs from the confirmed plan
+    private void validateRuntimeInstallAuthorization(
+            PluginRuntimeInstallAuthorization authorization,
+            @Unmodifiable Map<String, PluginManifest> effectiveManifests,
+            @Unmodifiable Set<String> replacementIds,
+            @Unmodifiable Map<String, PluginArtifactIdentity> expectedReusableArtifacts
+    ) throws IOException {
+        for (RuntimeProviderBinding binding : authorization.getRuntimeBindings().values()) {
+            @Nullable PluginManifest dependent = effectiveManifests.get(binding.dependentPluginId());
+            @Nullable PluginManifest provider = effectiveManifests.get(binding.providerId());
+            if (dependent == null || provider == null) {
+                throw new IOException("Runtime Provider binding references a missing package: "
+                        + binding.dependentPluginId() + " -> " + binding.providerId());
+            }
+            RuntimeRequirement requirement = dependent.getRuntimeRequirement();
+            boolean compatible = binding.runtime().equals(requirement.getRuntime())
+                    && provider.getProvidesRuntimes().stream().anyMatch(declaration ->
+                    supportsRuntimeRequirement(declaration, requirement));
+            if (!compatible) {
+                throw new IOException("Runtime Provider " + binding.providerId()
+                        + " cannot satisfy " + binding.dependentPluginId());
+            }
+            if (!replacementIds.contains(binding.providerId())) {
+                @Nullable PluginArtifactIdentity expected = expectedReusableArtifacts.get(binding.providerId());
+                @Nullable PluginArtifactIdentity current = artifactResolver.resolveInstalledIdentity(
+                        binding.providerId());
+                if (expected == null || !expected.equals(current)) {
+                    throw new IOException("Installed Runtime Provider changed after planning: "
+                            + binding.providerId());
+                }
+            }
+        }
+        if (!authorization.getRuntimeBindings().values().stream()
+                .map(RuntimeProviderBinding::providerId)
+                .collect(Collectors.toUnmodifiableSet())
+                .containsAll(authorization.getEnablementPluginIds())) {
+            throw new IOException("Runtime Provider enablement is not part of the confirmed bindings");
+        }
+    }
+
+    /// Returns whether one Provider declaration satisfies the dependent's runtime, ABI, mode, and feature contract.
+    ///
+    /// @param declaration Provider capability declaration
+    /// @param requirement dependent runtime requirement
+    /// @return whether the declaration satisfies every derived requirement
+    private static boolean supportsRuntimeRequirement(
+            RuntimeProviderDeclaration declaration,
+            RuntimeRequirement requirement
+    ) {
+        return declaration.getRuntime().equals(requirement.getRuntime())
+                && declaration.getAbis().contains(requirement.getPluginAbi())
+                && declaration.getBridgeAbi() == requirement.getBridgeAbi()
+                && declaration.getExecutionModes().contains(requirement.getExecutionMode())
+                && declaration.getFeatures().containsAll(requirement.getRequiredFeatures());
     }
 
     /// Best-effort removes hidden staging files without changing transaction success or permission decisions.

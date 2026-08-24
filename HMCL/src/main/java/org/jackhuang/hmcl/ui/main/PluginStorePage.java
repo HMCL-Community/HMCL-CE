@@ -46,8 +46,11 @@ import org.jackhuang.hmcl.plugin.PluginInstallationPlanningSnapshot;
 import org.jackhuang.hmcl.plugin.PluginManager;
 import org.jackhuang.hmcl.plugin.PluginManifest;
 import org.jackhuang.hmcl.plugin.PluginPermission;
+import org.jackhuang.hmcl.plugin.PluginRuntimeInstallAuthorization;
 import org.jackhuang.hmcl.plugin.PluginRuntimeStatus;
 import org.jackhuang.hmcl.Metadata;
+import org.jackhuang.hmcl.plugin.runtime.PluginPlatformTarget;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderBinding;
 import org.jackhuang.hmcl.plugin.store.PluginInstallPlan;
 import org.jackhuang.hmcl.plugin.store.PluginSource;
 import org.jackhuang.hmcl.plugin.store.PluginSourceConfiguration;
@@ -1384,12 +1387,27 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                 List.copyOf(requests),
                 formatInstallPlan(plan),
                 degradedCatalogWarning(snapshot),
-                grantsByPluginId -> {
+                plan.getCustomSourceProviderIds(),
+                plan.getDangerousPermissionPluginIds(),
+                (grantsByPluginId, confirmedCustomSourceProviderIds, confirmedDangerousPermissionPluginIds) -> {
                     if (!canUseSnapshotForInstallation(snapshot, sourceRepository.getSourceConfiguration())) {
                         showError(i18n("plugin.store.install.conflict"), i18n("plugin.store.catalog.unavailable"));
                         return;
                     }
-                    executeInstallPlan(plan, snapshot, grantsByPluginId);
+                    executeInstallPlan(
+                            plan,
+                            snapshot,
+                            grantsByPluginId,
+                            new PluginRuntimeInstallAuthorization(
+                                    plan.getRuntimeBindings(),
+                                    Set.copyOf(plan.getEnablementPluginIds()),
+                                    Set.copyOf(plan.getCustomSourceProviderIds()),
+                                    confirmedCustomSourceProviderIds,
+                                    Set.copyOf(plan.getDangerousPermissionPluginIds()),
+                                    confirmedDangerousPermissionPluginIds,
+                                    plan.getExpectedPackageRuntimeContracts()
+                            )
+                    );
                 }
         );
     }
@@ -1557,6 +1575,11 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                         entry.getDisplayName(),
                         entry.getVersion()
                 ));
+                case ENABLE -> rows.add(i18n(
+                        "plugin.store.plan.enable",
+                        entry.getDisplayName(),
+                        entry.getVersion()
+                ));
                 case INSTALL -> rows.add(i18n(
                         "plugin.store.source.plan_entry",
                         i18n(
@@ -1588,6 +1611,34 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                         dependency.getVersion()
                 ));
             }
+            if (entry.requiresDownload()) {
+                rows.add(i18n(
+                        "plugin.store.plan.artifact",
+                        entry.getPluginId(),
+                        entry.requireSelectedArtifact().platform().getId(),
+                        entry.getSelectedDownloadSize()
+                ));
+            }
+            if (entry.isRuntimeProvider()) {
+                rows.add(i18n("plugin.store.plan.runtime_provider", entry.getPluginId()));
+            }
+        }
+        for (RuntimeProviderBinding binding : plan.getRuntimeBindings().values()) {
+            PluginInstallPlan.Entry dependent = plan.getEntries().stream()
+                    .filter(entry -> entry.getPluginId().equals(binding.dependentPluginId()))
+                    .findFirst()
+                    .orElseThrow(() -> new IllegalStateException(
+                            "Runtime binding dependent is absent from the plan: " + binding.dependentPluginId()));
+            rows.add(i18n(
+                    "plugin.store.plan.runtime_binding",
+                    binding.dependentPluginId(),
+                    binding.providerId(),
+                    binding.runtime(),
+                    dependent.getExecutionMode().getId()
+            ));
+        }
+        if (!plan.getDownloadEntries().isEmpty()) {
+            rows.add(i18n("plugin.store.plan.download_total", plan.getTotalDownloadSize()));
         }
         return List.copyOf(rows);
     }
@@ -1597,10 +1648,12 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
     /// @param plan confirmed installation plan
     /// @param snapshot aggregate snapshot that selected every remote plan entry
     /// @param grantsByPluginId immutable grants chosen for every changed plugin
+    /// @param runtimeAuthorization confirmed runtime Provider authorization
     private void executeInstallPlan(
             PluginInstallPlan plan,
             PluginStoreSnapshot snapshot,
-            @Unmodifiable Map<String, @Unmodifiable Set<PluginPermission>> grantsByPluginId
+            @Unmodifiable Map<String, @Unmodifiable Set<PluginPermission>> grantsByPluginId,
+            PluginRuntimeInstallAuthorization runtimeAuthorization
     ) {
         PluginDialogs.ProgressDialog progressDialog = PluginDialogs.showProgress(
                 i18n("plugin.store.installing"),
@@ -1645,7 +1698,8 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                         stagingDirectory,
                         stagedPackages,
                         grantsByPluginId,
-                        certificationReceipts
+                        certificationReceipts,
+                        runtimeAuthorization
                 );
             } catch (IOException | RuntimeException exception) {
                 if (stagingDirectory != null) {
@@ -1722,7 +1776,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                             operation.stagedPackages.get(entry.getPluginId()),
                             "No staged package for " + entry.getPluginId()
                     );
-                    inspections.add(pluginManager.inspectLocalPluginPackage(stagedPackage));
+                    inspections.add(pluginManager.inspectStorePluginPackage(stagedPackage));
                 }
                 sourceRepository.executeIfSourcesMatch(
                         operation.snapshot.getSourceConfiguration(),
@@ -1731,7 +1785,8 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                                 operation.grantsByPluginId,
                                 operation.plan.getReusableArtifactIdentities(),
                                 operation.plan.getExpectedPriorArtifacts(),
-                                operation.certificationReceipts
+                                operation.certificationReceipts,
+                                operation.runtimeAuthorization
                         )
                 );
             } catch (IOException exception) {
@@ -1782,6 +1837,18 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
             return String.format(Locale.ROOT, "%.1f KB", size / 1024.0);
         }
         return String.format(Locale.ROOT, "%.1f MB", size / 1024.0 / 1024.0);
+    }
+
+    /// Selects the exact current-platform package size shown for one Store version.
+    ///
+    /// @param version selected Store version
+    /// @return exact platform artifact bytes, or `null` when the current platform is unavailable
+    static @Nullable Long selectedVersionSize(PluginStoreManifest.PluginVersionEntry version) {
+        try {
+            return version.requireArtifact(PluginPlatformTarget.current()).size();
+        } catch (IOException exception) {
+            return null;
+        }
     }
 
     /// Shows an application-owned HMCL error dialog on the JavaFX thread.
@@ -2153,7 +2220,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
             launcherVersionRow.setSubtitle(launcherVersionRequirementText(launcherVersion));
             channelRow.setSubtitle(version.getChannel());
             releaseDateRow.setSubtitle(version.getReleaseDate().isBlank() ? "-" : version.getReleaseDate());
-            @Nullable Long size = version.getSize();
+            @Nullable Long size = selectedVersionSize(version);
             sizeRow.setSubtitle(size == null ? "-" : formatSize(size));
             restartRow.setSubtitle(i18n(version.isRequiresRestart()
                     ? "plugin.store.requires_restart.yes"
@@ -2390,6 +2457,9 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
         /// Proof-backed receipts for certified downloads indexed by exact replacement plugin ID.
         private final @Unmodifiable Map<String, PluginCertificationReceipt> certificationReceipts;
 
+        /// Confirmed virtual bindings, Host enablements, and custom-source acknowledgements.
+        private final PluginRuntimeInstallAuthorization runtimeAuthorization;
+
         /// Creates an operation after every required package has downloaded successfully.
         ///
         /// @param plan confirmed plan
@@ -2398,13 +2468,15 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
         /// @param stagedPackages staged packages by plugin ID
         /// @param grantsByPluginId confirmed permission grants by changed plugin ID
         /// @param certificationReceipts proof-backed receipts for certified downloads
+        /// @param runtimeAuthorization confirmed runtime Provider authorization
         private InstallOperation(
                 PluginInstallPlan plan,
                 PluginStoreSnapshot snapshot,
                 Path stagingDirectory,
                 Map<String, Path> stagedPackages,
                 Map<String, @Unmodifiable Set<PluginPermission>> grantsByPluginId,
-                Map<String, PluginCertificationReceipt> certificationReceipts
+                Map<String, PluginCertificationReceipt> certificationReceipts,
+                PluginRuntimeInstallAuthorization runtimeAuthorization
         ) {
             this.plan = plan;
             this.snapshot = snapshot;
@@ -2412,6 +2484,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
             this.stagedPackages = Map.copyOf(stagedPackages);
             this.grantsByPluginId = Map.copyOf(grantsByPluginId);
             this.certificationReceipts = Map.copyOf(certificationReceipts);
+            this.runtimeAuthorization = runtimeAuthorization;
         }
     }
 }

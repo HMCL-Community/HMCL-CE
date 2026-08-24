@@ -17,9 +17,16 @@
  */
 package org.jackhuang.hmcl.plugin.store;
 
+import org.jackhuang.hmcl.Metadata;
 import org.jackhuang.hmcl.plugin.PluginArtifactIdentity;
 import org.jackhuang.hmcl.plugin.PluginDependency;
 import org.jackhuang.hmcl.plugin.PluginManifest;
+import org.jackhuang.hmcl.plugin.runtime.PluginPlatformTarget;
+import org.jackhuang.hmcl.plugin.runtime.PluginRuntimeTypes;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderBinding;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderDescriptor;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderSelector;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeRequirement;
 import org.jackhuang.hmcl.plugin.trust.PluginTrustResult;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
@@ -41,6 +48,12 @@ public final class PluginStoreDependencyResolver {
     /// Source-priority catalog winners indexed by plugin ID.
     private final @Unmodifiable Map<String, PluginStoreItem> winningItems;
 
+    /// Shared deterministic runtime Provider compatibility and ranking policy.
+    private final RuntimeProviderSelector runtimeProviderSelector = new RuntimeProviderSelector();
+
+    /// Source priority derived from the aggregate winner insertion order.
+    private final @Unmodifiable Map<String, Integer> sourcePriorities;
+
     /// Creates a resolver bound to one immutable aggregate catalog snapshot.
     ///
     /// Conflict candidates are deliberately not accepted: once a source wins a plugin ID, its metadata is the only
@@ -49,6 +62,11 @@ public final class PluginStoreDependencyResolver {
     /// @param winningItems selected catalog winners indexed by plugin ID
     public PluginStoreDependencyResolver(@Unmodifiable Map<String, PluginStoreItem> winningItems) {
         this.winningItems = Map.copyOf(winningItems);
+        Map<String, Integer> priorities = new LinkedHashMap<>();
+        for (PluginStoreItem item : winningItems.values()) {
+            priorities.computeIfAbsent(item.getSource().getId(), ignored -> priorities.size());
+        }
+        sourcePriorities = Map.copyOf(priorities);
     }
 
     /// Resolves a requested version and all transitive dependencies using one complete exact-artifact snapshot.
@@ -78,7 +96,7 @@ public final class PluginStoreDependencyResolver {
                 rootManifest,
                 requestedVersion
         );
-        rootItem.getSourceManager().validateCompatibility(rootVersion);
+        validateResolvableCompatibility(rootItem, rootVersion);
 
         @Unmodifiable Map<String, PluginManifest> installed = Map.copyOf(installedManifests);
         @Unmodifiable Map<String, PluginArtifactIdentity> installedArtifacts =
@@ -105,12 +123,23 @@ public final class PluginStoreDependencyResolver {
             throw new IOException("Plugin dependency graph cannot be satisfied for " + pluginId);
         }
 
+        Map<String, RuntimeProviderBinding> runtimeBindings = new LinkedHashMap<>();
+        resolveRuntimeProviders(
+                pluginId,
+                installed,
+                reusableInstalled.keySet(),
+                solution,
+                runtimeBindings,
+                failures
+        );
         validateReverseDependents(installed, solution);
         Map<String, PluginArtifactIdentity> selectedReusableArtifacts = new LinkedHashMap<>();
         Map<String, Optional<PluginArtifactIdentity>> expectedPriorArtifacts = new LinkedHashMap<>();
         for (PluginInstallPlan.Entry entry : solution.values()) {
-            if (entry.getAction() == PluginInstallPlan.Action.REUSE) {
-                @Nullable PluginArtifactIdentity identity = reusableInstalled.get(entry.getPluginId());
+            if (!entry.requiresDownload()) {
+                @Nullable PluginArtifactIdentity identity = entry.getAction() == PluginInstallPlan.Action.ENABLE
+                        ? installedArtifacts.get(entry.getPluginId())
+                        : reusableInstalled.get(entry.getPluginId());
                 if (identity == null) {
                     throw new IllegalStateException("Selected reusable entry has no exact artifact identity: "
                             + entry.getPluginId());
@@ -129,10 +158,196 @@ public final class PluginStoreDependencyResolver {
         }
         return new PluginInstallPlan(
                 pluginId,
-                buildDependencyOrder(pluginId, solution),
+                buildDependencyOrder(pluginId, solution, runtimeBindings),
                 Map.copyOf(selectedReusableArtifacts),
-                Map.copyOf(expectedPriorArtifacts)
+                Map.copyOf(expectedPriorArtifacts),
+                Map.copyOf(runtimeBindings)
         );
+    }
+
+    /// Adds separate virtual runtime edges and their selected concrete Provider package entries.
+    ///
+    /// @param rootPluginId requested root plugin ID
+    /// @param installedManifests installed manifest snapshot
+    /// @param reusableInstalledPluginIds installed artifacts eligible for exact reuse
+    /// @param solution mutable complete concrete package selection
+    /// @param runtimeBindings mutable virtual bindings indexed by dependent ID
+    /// @param failures solver diagnostics
+    /// @throws IOException if a runtime has no compatible Provider or adds an unsatisfied concrete graph
+    private void resolveRuntimeProviders(
+            String rootPluginId,
+            @Unmodifiable Map<String, PluginManifest> installedManifests,
+            @Unmodifiable Set<String> reusableInstalledPluginIds,
+            Map<String, PluginInstallPlan.Entry> solution,
+            Map<String, RuntimeProviderBinding> runtimeBindings,
+            List<IOException> failures
+    ) throws IOException {
+        while (true) {
+            @Nullable PluginInstallPlan.Entry dependent = solution.values().stream()
+                    .filter(entry -> !entry.isRuntimeProvider())
+                    .filter(entry -> !PluginRuntimeTypes.JAVA.equals(entry.getRuntimeRequirement().getRuntime()))
+                    .filter(entry -> !runtimeBindings.containsKey(entry.getPluginId()))
+                    .findFirst()
+                    .orElse(null);
+            if (dependent == null) {
+                return;
+            }
+            RuntimeRequirement requirement = dependent.getRuntimeRequirement();
+            ProviderCandidate provider = selectRuntimeProvider(
+                    requirement,
+                    installedManifests,
+                    reusableInstalledPluginIds,
+                    solution
+            );
+            @Nullable PluginInstallPlan.Entry existing = solution.get(provider.entry.getPluginId());
+            if (existing != null && (!existing.getVersion().equals(provider.entry.getVersion())
+                    || existing.getAction() != provider.entry.getAction())) {
+                throw new IOException("Runtime Provider selection conflicts with package selection for "
+                        + provider.entry.getPluginId());
+            }
+            solution.putIfAbsent(provider.entry.getPluginId(), provider.entry);
+            runtimeBindings.put(dependent.getPluginId(), new RuntimeProviderBinding(
+                    dependent.getPluginId(),
+                    provider.entry.getPluginId(),
+                    requirement.getRuntime()
+            ));
+
+            Map<String, PluginInstallPlan.Entry> expanded = new LinkedHashMap<>();
+            if (!solvePlanSelections(
+                    rootPluginId,
+                    installedManifests,
+                    reusableInstalledPluginIds,
+                    new LinkedHashMap<>(solution),
+                    expanded,
+                    failures
+            )) {
+                throw failures.isEmpty()
+                        ? new IOException("Runtime Provider dependency graph cannot be satisfied")
+                        : failures.get(failures.size() - 1);
+            }
+            solution.clear();
+            solution.putAll(expanded);
+        }
+    }
+
+    /// Selects one compatible installed or remote Provider and retains its concrete plan entry.
+    ///
+    /// @param requirement dependent runtime requirement
+    /// @param installedManifests installed manifest snapshot
+    /// @param reusableInstalledPluginIds installed artifacts eligible for exact reuse
+    /// @param selected current package selection
+    /// @return selected Provider candidate
+    /// @throws IOException if no Provider satisfies the requirement
+    private ProviderCandidate selectRuntimeProvider(
+            RuntimeRequirement requirement,
+            @Unmodifiable Map<String, PluginManifest> installedManifests,
+            @Unmodifiable Set<String> reusableInstalledPluginIds,
+            Map<String, PluginInstallPlan.Entry> selected
+    ) throws IOException {
+        List<ProviderCandidate> candidates = new ArrayList<>();
+        for (PluginManifest manifest : installedManifests.values()) {
+            if (manifest.getProvidesRuntimes().isEmpty()) {
+                continue;
+            }
+            boolean enabled = reusableInstalledPluginIds.contains(manifest.getId());
+            PluginInstallPlan.Entry entry = new PluginInstallPlan.Entry(
+                    manifest.getId(), manifest.getName(), manifest.getVersion(), enabled
+                    ? PluginInstallPlan.Action.REUSE
+                    : PluginInstallPlan.Action.ENABLE,
+                    null, null, manifest, null, null, null, null
+            );
+            candidates.add(new ProviderCandidate(new RuntimeProviderDescriptor(
+                    manifest.getId(), manifest.getVersion(), manifest.getProvidesRuntimes(),
+                    true, enabled, Integer.MAX_VALUE, false
+            ), entry));
+        }
+        for (PluginInstallPlan.Entry entry : selected.values()) {
+            if (!entry.getProvidesRuntimes().isEmpty()
+                    && candidates.stream().noneMatch(candidate -> candidate.entry.getPluginId()
+                    .equals(entry.getPluginId()))) {
+                candidates.add(new ProviderCandidate(new RuntimeProviderDescriptor(
+                        entry.getPluginId(), entry.getVersion(), entry.getProvidesRuntimes(),
+                        entry.getAction() == PluginInstallPlan.Action.REUSE,
+                        entry.getAction() == PluginInstallPlan.Action.REUSE,
+                        sourcePriority(entry), false
+                ), entry));
+            }
+        }
+        for (Map.Entry<String, PluginStoreItem> itemEntry : winningItems.entrySet()) {
+            PluginStoreItem item = itemEntry.getValue();
+            PluginStoreManifest manifest = requireManifest(item, itemEntry.getKey());
+            for (PluginStoreManifest.PluginVersionEntry version : manifest.getVersionsNewestFirst()) {
+                if (version.getProvidesRuntimes().isEmpty()) {
+                    continue;
+                }
+                try {
+                    validateResolvableCompatibility(item, version);
+                    PluginInstallPlan.Entry entry = createRemotePlanEntry(
+                            itemEntry.getKey(), item, version, installedManifests
+                    );
+                    candidates.add(new ProviderCandidate(new RuntimeProviderDescriptor(
+                            itemEntry.getKey(), version.getVersion(), version.getProvidesRuntimes(),
+                            false, false, sourcePriority(item), false
+                    ), entry));
+                } catch (IOException ignored) {
+                    // Other versions and Providers remain eligible for deterministic selection.
+                }
+            }
+        }
+        Optional<RuntimeProviderDescriptor> selectedDescriptor = runtimeProviderSelector.select(
+                requirement,
+                candidates.stream().map(candidate -> candidate.descriptor).toList()
+        );
+        if (selectedDescriptor.isEmpty()) {
+            @Nullable String pin = requirement.getPinnedProviderId();
+            throw new IOException(pin == null
+                    ? "No compatible runtime Provider for " + requirement.getRuntime()
+                    : "Pinned runtime Provider " + pin + " cannot satisfy " + requirement.getRuntime());
+        }
+        RuntimeProviderDescriptor descriptor = selectedDescriptor.orElseThrow();
+        return candidates.stream().filter(candidate -> candidate.descriptor.equals(descriptor)).findFirst()
+                .orElseThrow(() -> new IllegalStateException("Selected runtime Provider candidate was lost"));
+    }
+
+    /// Returns one winning item's zero-based source priority.
+    ///
+    /// @param item source-bound Store item
+    /// @return stable non-negative source priority
+    private int sourcePriority(PluginStoreItem item) {
+        return sourcePriorities.getOrDefault(item.getSource().getId(), sourcePriorities.size());
+    }
+
+    /// Returns one selected entry's source priority, or the installed tier fallback.
+    ///
+    /// @param entry selected plan entry
+    /// @return stable non-negative source priority
+    private int sourcePriority(PluginInstallPlan.Entry entry) {
+        @Nullable String sourceId = entry.getSourceId();
+        return sourceId == null ? Integer.MAX_VALUE : sourcePriorities.getOrDefault(sourceId, sourcePriorities.size());
+    }
+
+    /// Validates launcher, platform, Java, and built-in Java compatibility while allowing runtime resolution later.
+    ///
+    /// @param item source-bound Store item
+    /// @param version candidate version
+    /// @throws IOException if non-runtime compatibility fails
+    private static void validateResolvableCompatibility(
+            PluginStoreItem item,
+            PluginStoreManifest.PluginVersionEntry version
+    ) throws IOException {
+        if (!version.matchesLauncherVersion(Metadata.VERSION)) {
+            throw new IOException("Plugin requires launcher " + version.getLauncherVersion());
+        }
+        PluginPlatformTarget host = PluginPlatformTarget.current();
+        if (!version.getPlatforms().isEmpty() && version.getPlatforms().stream()
+                .map(PluginPlatformTarget::parse)
+                .noneMatch(platform -> platform.matches(host))) {
+            throw new IOException("Plugin does not support " + host.getId());
+        }
+        version.requireArtifact(host);
+        if (PluginRuntimeTypes.JAVA.equals(version.getRuntime())) {
+            item.getSourceManager().validateCompatibility(version);
+        }
     }
 
     /// Validates that installed and reusable snapshots describe the same exact artifacts.
@@ -208,7 +423,7 @@ public final class PluginStoreDependencyResolver {
                 .orElse(null);
         if (unresolvedPluginId == null) {
             try {
-                buildDependencyOrder(rootPluginId, selected);
+                buildDependencyOrder(rootPluginId, selected, Map.of());
                 solution.clear();
                 solution.putAll(selected);
                 return true;
@@ -340,9 +555,15 @@ public final class PluginStoreDependencyResolver {
 
         PluginStoreItem winningItem = requireWinningItem(pluginId);
         PluginStoreManifest manifest = requireManifest(winningItem, pluginId);
-        for (PluginStoreManifest.PluginVersionEntry version : winningItem.getSourceManager().getCompatibleVersions(manifest)) {
-            if (matchesAll(version.getVersion(), requirements)) {
+        for (PluginStoreManifest.PluginVersionEntry version : manifest.getVersionsNewestFirst()) {
+            if (!matchesAll(version.getVersion(), requirements)) {
+                continue;
+            }
+            try {
+                validateResolvableCompatibility(winningItem, version);
                 candidates.add(createRemotePlanEntry(pluginId, winningItem, version, installedManifests));
+            } catch (IOException ignored) {
+                // Continue to an older package version that can run on this launcher and platform.
             }
         }
         if (candidates.isEmpty() && installedVersionMatches) {
@@ -425,7 +646,9 @@ public final class PluginStoreDependencyResolver {
                 item.getSource().getId(),
                 getSourceDisplayName(item),
                 PluginSourceProvenance.from(item, version),
-                item.getSourceManager()
+                item.getSourceManager(),
+                version.requireArtifact(PluginPlatformTarget.current()),
+                !item.getSource().isBuiltIn()
         );
     }
 
@@ -458,12 +681,13 @@ public final class PluginStoreDependencyResolver {
     /// @throws IOException if the selected dependency graph contains a cycle or incomplete edge
     private static @Unmodifiable List<PluginInstallPlan.Entry> buildDependencyOrder(
             String rootPluginId,
-            Map<String, PluginInstallPlan.Entry> selected
+            Map<String, PluginInstallPlan.Entry> selected,
+            @Unmodifiable Map<String, RuntimeProviderBinding> runtimeBindings
     ) throws IOException {
         List<PluginInstallPlan.Entry> order = new ArrayList<>();
         Set<String> visiting = new HashSet<>();
         Set<String> visited = new HashSet<>();
-        appendDependencyOrder(rootPluginId, selected, visiting, visited, order);
+        appendDependencyOrder(rootPluginId, selected, runtimeBindings, visiting, visited, order);
         return List.copyOf(order);
     }
 
@@ -478,6 +702,7 @@ public final class PluginStoreDependencyResolver {
     private static void appendDependencyOrder(
             String pluginId,
             Map<String, PluginInstallPlan.Entry> selected,
+            @Unmodifiable Map<String, RuntimeProviderBinding> runtimeBindings,
             Set<String> visiting,
             Set<String> visited,
             List<PluginInstallPlan.Entry> order
@@ -493,7 +718,11 @@ public final class PluginStoreDependencyResolver {
             throw new IOException("Dependency plan has no selected version for " + pluginId);
         }
         for (PluginDependency dependency : entry.getDependencies()) {
-            appendDependencyOrder(dependency.getId(), selected, visiting, visited, order);
+            appendDependencyOrder(dependency.getId(), selected, runtimeBindings, visiting, visited, order);
+        }
+        @Nullable RuntimeProviderBinding binding = runtimeBindings.get(pluginId);
+        if (binding != null) {
+            appendDependencyOrder(binding.providerId(), selected, runtimeBindings, visiting, visited, order);
         }
         visiting.remove(pluginId);
         visited.add(pluginId);
@@ -548,6 +777,25 @@ public final class PluginStoreDependencyResolver {
                             + " would resolve to " + (effectiveVersion == null ? "missing" : effectiveVersion));
                 }
             }
+        }
+    }
+
+    /// Couples one ranked Provider descriptor to the exact concrete package plan entry that produced it.
+    @NotNullByDefault
+    private static final class ProviderCandidate {
+        /// Descriptor consumed by the shared deterministic selector.
+        private final RuntimeProviderDescriptor descriptor;
+
+        /// Concrete package operation contributed when selected.
+        private final PluginInstallPlan.Entry entry;
+
+        /// Creates one immutable candidate pair.
+        ///
+        /// @param descriptor runtime capability and ranking descriptor
+        /// @param entry exact concrete package plan entry
+        private ProviderCandidate(RuntimeProviderDescriptor descriptor, PluginInstallPlan.Entry entry) {
+            this.descriptor = descriptor;
+            this.entry = entry;
         }
     }
 }

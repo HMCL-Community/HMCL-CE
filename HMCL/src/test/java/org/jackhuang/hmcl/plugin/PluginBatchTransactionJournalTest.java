@@ -176,6 +176,33 @@ public final class PluginBatchTransactionJournalTest {
         assertFalse(Files.exists(fixture.target()));
     }
 
+    /// Restores the old runtime Provider binding document when a prepared publication rolls back.
+    ///
+    /// @param temporaryDirectory isolated launcher-local home
+    /// @throws Exception if transaction setup or recovery fails
+    @Test
+    public void rollbackRestoresRuntimeProviderBindingDocument(@TempDir Path temporaryDirectory) throws Exception {
+        PreparedFixture fixture = createPreparedFixtureFiles(temporaryDirectory);
+        Path bindingFile = temporaryDirectory.resolve("plugin-runtime-bindings.json");
+        Files.writeString(bindingFile, "old-bindings", StandardCharsets.UTF_8);
+        PluginBatchTransactionJournal journal = new PluginBatchTransactionJournal(
+                temporaryDirectory,
+                fixture.pluginsDirectory()
+        );
+        journal.begin(
+                Map.of(fixture.original(), fixture.backup()),
+                List.of(fixture.target()),
+                List.of(fixture.prepared())
+        );
+        Files.writeString(bindingFile, "new-bindings", StandardCharsets.UTF_8);
+
+        assertTrue(journal.recover());
+
+        assertEquals("old-bindings", Files.readString(bindingFile, StandardCharsets.UTF_8));
+        assertEquals("old", Files.readString(fixture.original(), StandardCharsets.UTF_8));
+        assertFalse(Files.exists(fixture.target()));
+    }
+
     /// Rejects invalid snapshot Base64 before package mutation begins.
     ///
     /// @param temporaryDirectory isolated launcher-local home
@@ -229,7 +256,7 @@ public final class PluginBatchTransactionJournalTest {
         Path persistedQuarantine = quarantines.get(0);
         assertTrue(Files.exists(persistedQuarantine));
         JsonObject upgradedTransaction = readTransaction(temporaryDirectory);
-        assertEquals(4, upgradedTransaction.get("schemaVersion").getAsInt());
+        assertEquals(5, upgradedTransaction.get("schemaVersion").getAsInt());
         JsonObject cleanupSnapshot = upgradedTransaction.getAsJsonObject("cleanupSnapshot");
         assertFalse(cleanupSnapshot.get("existed").getAsBoolean());
         assertFalse(cleanupSnapshot.has("contents"));
@@ -252,6 +279,31 @@ public final class PluginBatchTransactionJournalTest {
                 Files.readString(persistedQuarantine, StandardCharsets.UTF_8)
         );
         assertFalse(Files.exists(transactionFile(temporaryDirectory)));
+    }
+
+    /// Upgrades schema 3 and 4 journals by synthesizing only the document snapshots introduced later.
+    ///
+    /// @param temporaryDirectory isolated root for both legacy recovery fixtures
+    /// @throws Exception if transaction setup, mutation, upgrade, or recovery fails
+    @Test
+    public void recoverSchemaThreeAndFourJournals(@TempDir Path temporaryDirectory) throws Exception {
+        for (int schemaVersion : List.of(3, 4)) {
+            Path localHome = temporaryDirectory.resolve("schema-" + schemaVersion);
+            Files.createDirectories(localHome);
+            PreparedFixture fixture = createPublishedPreparedFixture(localHome, false);
+            JsonObject legacyTransaction = readTransaction(localHome);
+            legacyTransaction.addProperty("schemaVersion", schemaVersion);
+            legacyTransaction.remove("runtimeBindingSnapshot");
+            if (schemaVersion == 3) {
+                legacyTransaction.remove("certificationReceiptSnapshot");
+            }
+            writeTransaction(localHome, legacyTransaction);
+
+            assertTrue(new PluginBatchTransactionJournal(localHome, fixture.pluginsDirectory()).recover());
+            assertEquals("old", Files.readString(fixture.original(), StandardCharsets.UTF_8));
+            assertFalse(Files.exists(fixture.target()));
+            assertFalse(Files.exists(transactionFile(localHome)));
+        }
     }
 
     /// Does not publish an object that replaced a backup quarantine immediately before restore acquisition.

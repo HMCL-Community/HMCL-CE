@@ -17,6 +17,9 @@
  */
 package org.jackhuang.hmcl.plugin;
 
+import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderBinding;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderDeclaration;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeRequirement;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
@@ -35,11 +38,19 @@ final class PluginDependencyPlanner {
     /// Installed package repository used to include readable packages that did not load.
     private final PluginPackageRepository packageRepository;
 
+    /// Persisted virtual runtime edges included in reverse-dependency decisions.
+    private final PluginRuntimeBindingStore runtimeBindingStore;
+
     /// Creates a dependency planner over one installed package repository.
     ///
     /// @param packageRepository installed package repository
-    PluginDependencyPlanner(PluginPackageRepository packageRepository) {
+    /// @param runtimeBindingStore persisted runtime Provider binding store
+    PluginDependencyPlanner(
+            PluginPackageRepository packageRepository,
+            PluginRuntimeBindingStore runtimeBindingStore
+    ) {
         this.packageRepository = packageRepository;
+        this.runtimeBindingStore = runtimeBindingStore;
     }
 
     /// Reads manifests that will remain after pending restart-time removals complete.
@@ -91,6 +102,42 @@ final class PluginDependencyPlanner {
                 }
             }
         }
+        for (RuntimeProviderBinding binding : runtimeBindingStore.readStrict().values()) {
+            if (!replacementIds.contains(binding.dependentPluginId())
+                    && !replacementIds.contains(binding.providerId())) {
+                continue;
+            }
+            @Nullable PluginManifest dependent = manifests.get(binding.dependentPluginId());
+            @Nullable PluginManifest provider = manifests.get(binding.providerId());
+            if (dependent == null || provider == null) {
+                throw new IOException("Runtime binding " + binding.dependentPluginId()
+                        + " -> " + binding.providerId() + " references a missing package");
+            }
+            RuntimeRequirement requirement = dependent.getRuntimeRequirement();
+            boolean compatible = binding.runtime().equals(requirement.getRuntime())
+                    && provider.getProvidesRuntimes().stream().anyMatch(declaration ->
+                    supportsRuntimeRequirement(declaration, requirement));
+            if (!compatible) {
+                throw new IOException("Runtime Provider " + binding.providerId()
+                        + " no longer satisfies bound dependent " + binding.dependentPluginId());
+            }
+        }
+    }
+
+    /// Returns whether one Provider declaration satisfies a dependent's complete runtime contract.
+    ///
+    /// @param declaration Provider capability declaration
+    /// @param requirement dependent runtime requirement
+    /// @return whether every runtime selection field is supported
+    private static boolean supportsRuntimeRequirement(
+            RuntimeProviderDeclaration declaration,
+            RuntimeRequirement requirement
+    ) {
+        return declaration.getRuntime().equals(requirement.getRuntime())
+                && declaration.getAbis().contains(requirement.getPluginAbi())
+                && declaration.getBridgeAbi() == requirement.getBridgeAbi()
+                && declaration.getExecutionModes().contains(requirement.getExecutionMode())
+                && declaration.getFeatures().containsAll(requirement.getRequiredFeatures());
     }
 
     /// Returns installed plugins that directly require one prospective uninstall target.
@@ -105,13 +152,23 @@ final class PluginDependencyPlanner {
             List<PluginContainer> loadedPlugins,
             Set<String> pendingUninstall
     ) throws IOException {
-        return packageRepository.readInstalledManifests(loadedPlugins).values().stream()
+        @Unmodifiable Map<String, PluginManifest> installed =
+                packageRepository.readInstalledManifests(loadedPlugins);
+        @Unmodifiable Map<String, RuntimeProviderBinding> runtimeBindings = runtimeBindingStore.readStrict();
+        return java.util.stream.Stream.concat(
+                installed.values().stream()
                 .filter(manifest -> !manifest.getId().equals(pluginId))
                 .filter(manifest -> !pendingUninstall.contains(manifest.getId()))
                 .filter(manifest -> manifest.getSchemaVersion()
                         >= PluginManifest.MIN_EXECUTABLE_SCHEMA_VERSION)
                 .filter(manifest -> manifest.getDependencies().contains(pluginId))
-                .map(PluginManifest::getId)
+                .map(PluginManifest::getId),
+                runtimeBindings.values().stream()
+                        .filter(binding -> binding.providerId().equals(pluginId))
+                        .map(RuntimeProviderBinding::dependentPluginId)
+                        .filter(installed::containsKey)
+                        .filter(dependentId -> !pendingUninstall.contains(dependentId))
+        )
                 .distinct()
                 .sorted()
                 .toList();

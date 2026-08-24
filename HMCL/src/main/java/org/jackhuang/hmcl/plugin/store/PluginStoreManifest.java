@@ -29,8 +29,12 @@ import org.jackhuang.hmcl.plugin.PluginVersion;
 import org.jackhuang.hmcl.plugin.PluginVersionConstraint;
 import org.jackhuang.hmcl.plugin.runtime.PluginAbi;
 import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityRequirements;
+import org.jackhuang.hmcl.plugin.runtime.PluginExecutionMode;
 import org.jackhuang.hmcl.plugin.runtime.PluginPlatformTarget;
 import org.jackhuang.hmcl.plugin.runtime.PluginRuntimeTypes;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeFeature;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderDeclaration;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeRequirement;
 import org.jackhuang.hmcl.plugin.trust.PluginTrustResult;
 import org.jackhuang.hmcl.util.gson.JsonUtils;
 import org.jetbrains.annotations.NotNullByDefault;
@@ -239,6 +243,15 @@ public final class PluginStoreManifest {
                     && pluginKindElement.getAsJsonPrimitive().isString()
                     ? pluginKindElement.getAsString()
                     : null;
+            entry.executionModeDeclared = versionObject.has("executionMode");
+            @Nullable JsonElement executionModeElement = versionObject.get("executionMode");
+            entry.executionModeToken = executionModeElement != null
+                    && executionModeElement.isJsonPrimitive()
+                    && executionModeElement.getAsJsonPrimitive().isString()
+                    ? executionModeElement.getAsString()
+                    : null;
+            entry.runtimeProviderDeclared = versionObject.has("runtimeProvider");
+            entry.providesRuntimesDeclared = versionObject.has("providesRuntimes");
             entry.packageUrlDeclared = versionObject.has("packageUrl");
             entry.sha256Declared = versionObject.has("sha256");
             entry.sizeDeclared = versionObject.has("size");
@@ -369,6 +382,30 @@ public final class PluginStoreManifest {
 
         /// Exact serialized plugin role token retained for canonical-spelling validation.
         private transient @Nullable String pluginKindToken;
+
+        /// Execution boundary requested by a schema-v5 runtime consumer.
+        @SerializedName("executionMode")
+        private @Nullable PluginExecutionMode executionMode;
+
+        /// Whether the source JSON explicitly contained the execution boundary.
+        private transient boolean executionModeDeclared;
+
+        /// Exact serialized execution mode retained for canonical-spelling validation.
+        private transient @Nullable String executionModeToken;
+
+        /// Optional provider plugin ID pinned by a schema-v5 runtime consumer.
+        @SerializedName("runtimeProvider")
+        private @Nullable String runtimeProvider;
+
+        /// Whether the source JSON explicitly contained a provider pin.
+        private transient boolean runtimeProviderDeclared;
+
+        /// Runtime capabilities advertised by a schema-v5 Provider package.
+        @SerializedName("providesRuntimes")
+        private @Nullable List<@Nullable RuntimeProviderDeclaration> providesRuntimes;
+
+        /// Whether the source JSON explicitly contained Provider capabilities.
+        private transient boolean providesRuntimesDeclared;
 
         /// Whether installation or update is expected to require a launcher restart.
         @SerializedName("requiresRestart")
@@ -544,6 +581,45 @@ public final class PluginStoreManifest {
             return Objects.requireNonNullElse(pluginKind, PluginKind.NORMAL);
         }
 
+        /// Returns the requested runtime execution boundary, defaulting to embedded execution.
+        ///
+        /// @return runtime execution boundary
+        public PluginExecutionMode getExecutionMode() {
+            return Objects.requireNonNullElse(executionMode, PluginExecutionMode.EMBEDDED);
+        }
+
+        /// Returns the optional pinned runtime Provider ID.
+        ///
+        /// @return pinned Provider ID, or `null` for deterministic selection
+        public @Nullable String getRuntimeProvider() {
+            return runtimeProvider;
+        }
+
+        /// Returns immutable runtime capabilities advertised by a Provider package.
+        ///
+        /// @return immutable Provider declarations
+        public @Unmodifiable List<RuntimeProviderDeclaration> getProvidesRuntimes() {
+            @Nullable List<@Nullable RuntimeProviderDeclaration> values = providesRuntimes;
+            if (values == null || values.isEmpty()) {
+                return List.of();
+            }
+            return values.stream().map(Objects::requireNonNull).toList();
+        }
+
+        /// Derives the virtual runtime requirement represented by this Store version.
+        ///
+        /// @return immutable runtime requirement
+        public RuntimeRequirement getRuntimeRequirement() {
+            return new RuntimeRequirement(
+                    getRuntime(),
+                    getAbi(),
+                    1,
+                    getExecutionMode(),
+                    Set.of(RuntimeFeature.BRIDGE),
+                    getRuntimeProvider()
+            );
+        }
+
         /// Returns the canonical required runtime, defaulting legacy packages to built-in Java.
         ///
         /// @return canonical runtime identifier
@@ -717,6 +793,7 @@ public final class PluginStoreManifest {
             }
             validateArtifactMetadata();
             validateRuntimeCompatibilityMetadata();
+            validateRuntimeProviderContract();
             if (releaseDate != null && !releaseDate.isBlank()) {
                 try {
                     LocalDate.parse(releaseDate);
@@ -869,6 +946,12 @@ public final class PluginStoreManifest {
                 if (platformsDeclared || platforms != null) {
                     throw new IOException("Plugin API " + pluginApiVersion + " cannot declare platforms");
                 }
+                if (executionModeDeclared || executionMode != null
+                        || runtimeProviderDeclared || runtimeProvider != null
+                        || providesRuntimesDeclared || providesRuntimes != null) {
+                    throw new IOException("Plugin API " + pluginApiVersion
+                            + " cannot declare runtime Provider metadata");
+                }
                 return;
             }
 
@@ -892,6 +975,22 @@ public final class PluginStoreManifest {
             }
             if (abi == null) {
                 throw new IOException("Plugin API 5 version " + version + " has null abi");
+            }
+
+            if (executionModeDeclared && (executionMode == null
+                    || !executionMode.getId().equals(executionModeToken))) {
+                throw new IOException("Plugin API 5 version " + version + " has invalid executionMode");
+            }
+            if (runtimeProviderDeclared) {
+                if (runtimeProvider == null || !PluginManifest.isCanonicalExecutableId(runtimeProvider)) {
+                    throw new IOException("Plugin API 5 version " + version + " has invalid runtimeProvider");
+                }
+            }
+            if (providesRuntimesDeclared && providesRuntimes == null) {
+                throw new IOException("Plugin API 5 version " + version + " has null providesRuntimes");
+            }
+            if (providesRuntimes != null && providesRuntimes.stream().anyMatch(Objects::isNull)) {
+                throw new IOException("Plugin API 5 version " + version + " has a null runtime declaration");
             }
             try {
                 PluginAbi.requireValid(abi);
@@ -920,6 +1019,48 @@ public final class PluginStoreManifest {
                     }
                 } catch (IllegalArgumentException exception) {
                     throw new IOException("Invalid plugin platform target: " + platform, exception);
+                }
+            }
+        }
+
+        /// Validates Store role metadata needed for deterministic virtual runtime resolution.
+        ///
+        /// @throws IOException if consumer and Provider declarations are inconsistent
+        private void validateRuntimeProviderContract() throws IOException {
+            if (pluginApiVersion < 5) {
+                return;
+            }
+            @Unmodifiable List<RuntimeProviderDeclaration> declarations = getProvidesRuntimes();
+            if (getPluginKind() == PluginKind.NORMAL) {
+                if (!declarations.isEmpty()) {
+                    throw new IOException("Normal Store plugins cannot provide runtimes");
+                }
+                try {
+                    getRuntimeRequirement();
+                } catch (IllegalArgumentException exception) {
+                    throw new IOException("Invalid Store runtime requirement: " + exception.getMessage(), exception);
+                }
+                return;
+            }
+            if (!PluginRuntimeTypes.JAVA.equals(getRuntime())) {
+                throw new IOException("Store runtime Providers must use the java runtime");
+            }
+            if (getExecutionMode() != PluginExecutionMode.EMBEDDED) {
+                throw new IOException("Store runtime Providers must use embedded Java bootstrap execution");
+            }
+            if (runtimeProvider != null) {
+                throw new IOException("Store runtime Providers cannot pin another Provider");
+            }
+            if (declarations.isEmpty()) {
+                throw new IOException("Store runtime Providers must advertise at least one runtime");
+            }
+            Set<String> runtimeIds = new HashSet<>();
+            for (RuntimeProviderDeclaration declaration : declarations) {
+                if (PluginRuntimeTypes.JAVA.equals(declaration.getRuntime())) {
+                    throw new IOException("Store runtime Providers cannot replace the built-in java runtime");
+                }
+                if (!runtimeIds.add(declaration.getRuntime())) {
+                    throw new IOException("Duplicate Store provided runtime: " + declaration.getRuntime());
                 }
             }
         }

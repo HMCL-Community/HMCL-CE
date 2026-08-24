@@ -18,6 +18,7 @@
 package org.jackhuang.hmcl.ui.main;
 
 import com.jfoenix.controls.JFXButton;
+import com.jfoenix.controls.JFXCheckBox;
 import com.jfoenix.controls.JFXDialogLayout;
 import com.jfoenix.controls.JFXSpinner;
 import javafx.application.Platform;
@@ -71,7 +72,8 @@ final class PluginDialogs {
             List<String> installPlan,
             Consumer<@Unmodifiable Map<String, @Unmodifiable Set<PluginPermission>>> callback
     ) {
-        confirmPluginInstall(pluginName, update, permissionRequests, installPlan, null, callback);
+        confirmPluginInstall(pluginName, update, permissionRequests, installPlan, null, List.of(),
+                List.of(), (grants, ignoredSource, ignoredDangerous) -> callback.accept(grants));
     }
 
     /// Shows permission review with an optional aggregate-source warning.
@@ -90,14 +92,57 @@ final class PluginDialogs {
             @Nullable String catalogWarning,
             Consumer<@Unmodifiable Map<String, @Unmodifiable Set<PluginPermission>>> callback
     ) {
+        confirmPluginInstall(pluginName, update, permissionRequests, installPlan, catalogWarning, List.of(),
+                List.of(), (grants, ignoredSource, ignoredDangerous) -> callback.accept(grants));
+    }
+
+    /// Shows permission review with independent acknowledgement for custom-source Runtime Hosts.
+    ///
+    /// @param pluginName display name of the root package
+    /// @param update whether the root package replaces an installed artifact
+    /// @param permissionRequests permission forms for every package that will be installed or updated
+    /// @param installPlan localized dependency-first installation plan
+    /// @param catalogWarning aggregate-source warning, or `null`
+    /// @param customSourceProviderIds Runtime Host IDs requiring independent source acknowledgement
+    /// @param dangerousPermissionPluginIds changed plugin IDs requiring dangerous-permission acknowledgement
+    /// @param callback receives confirmed grants and both independent acknowledgement sets
+    static void confirmPluginInstall(
+            String pluginName,
+            boolean update,
+            List<PluginPermissionRequest> permissionRequests,
+            List<String> installPlan,
+            @Nullable String catalogWarning,
+            List<String> customSourceProviderIds,
+            List<String> dangerousPermissionPluginIds,
+            PluginInstallConfirmationHandler callback
+    ) {
         Platform.runLater(() -> Controllers.dialog(new PluginInstallPermissionDialog(
                 pluginName,
                 update,
                 permissionRequests,
                 installPlan,
                 catalogWarning,
+                customSourceProviderIds,
+                dangerousPermissionPluginIds,
                 callback
         )));
+    }
+
+    /// Returns whether every independently required install acknowledgement has been selected.
+    ///
+    /// @param customSourceRequired whether custom-source confirmation is required
+    /// @param customSourceAcknowledged whether the custom-source checkbox is selected
+    /// @param dangerousPermissionRequired whether dangerous-permission confirmation is required
+    /// @param dangerousPermissionAcknowledged whether the dangerous-permission checkbox is selected
+    /// @return whether confirmation may proceed
+    static boolean canConfirmPluginInstall(
+            boolean customSourceRequired,
+            boolean customSourceAcknowledged,
+            boolean dangerousPermissionRequired,
+            boolean dangerousPermissionAcknowledged
+    ) {
+        return (!customSourceRequired || customSourceAcknowledged)
+                && (!dangerousPermissionRequired || dangerousPermissionAcknowledged);
     }
 
     /// Opens a non-blocking HMCL progress dialog and returns its update handle.
@@ -252,14 +297,18 @@ final class PluginDialogs {
         /// @param permissionRequests permission groups for mutable packages
         /// @param installPlan localized dependency-first plan rows
         /// @param catalogWarning aggregate-source warning without source URLs, or `null` when unavailable
-        /// @param callback receives confirmed immutable grants
+        /// @param customSourceProviderIds Runtime Host IDs requiring source acknowledgement
+        /// @param dangerousPermissionPluginIds changed plugin IDs requiring dangerous-permission acknowledgement
+        /// @param callback receives confirmed immutable grants and both acknowledgement sets
         private PluginInstallPermissionDialog(
                 String pluginName,
                 boolean update,
                 List<PluginPermissionRequest> permissionRequests,
                 List<String> installPlan,
                 @Nullable String catalogWarning,
-                Consumer<@Unmodifiable Map<String, @Unmodifiable Set<PluginPermission>>> callback
+                List<String> customSourceProviderIds,
+                List<String> dangerousPermissionPluginIds,
+                PluginInstallConfirmationHandler callback
         ) {
             setHeading(new HBox(new Label(i18n(
                     update ? "plugin.update.permissions.title" : "plugin.install.permissions.title",
@@ -282,6 +331,30 @@ final class PluginDialogs {
                 HintPane catalogWarningHint = new HintPane(MessageDialogPane.MessageType.WARNING);
                 catalogWarningHint.setText(catalogWarning);
                 content.getChildren().add(catalogWarningHint);
+            }
+            @Nullable JFXCheckBox customSourceAcknowledgement = null;
+            if (!customSourceProviderIds.isEmpty()) {
+                HintPane sourceHint = new HintPane(MessageDialogPane.MessageType.WARNING);
+                sourceHint.setText(i18n(
+                        "plugin.install.runtime_provider.custom_source_warning",
+                        String.join(", ", customSourceProviderIds)
+                ));
+                customSourceAcknowledgement = new JFXCheckBox(
+                        i18n("plugin.install.runtime_provider.custom_source_acknowledgement")
+                );
+                content.getChildren().addAll(sourceHint, customSourceAcknowledgement);
+            }
+            @Nullable JFXCheckBox dangerousPermissionAcknowledgement = null;
+            if (!dangerousPermissionPluginIds.isEmpty()) {
+                HintPane dangerousPermissionHint = new HintPane(MessageDialogPane.MessageType.WARNING);
+                dangerousPermissionHint.setText(i18n(
+                        "plugin.install.dangerous_permission.warning",
+                        String.join(", ", dangerousPermissionPluginIds)
+                ));
+                dangerousPermissionAcknowledgement = new JFXCheckBox(
+                        i18n("plugin.install.dangerous_permission.acknowledgement")
+                );
+                content.getChildren().addAll(dangerousPermissionHint, dangerousPermissionAcknowledgement);
             }
 
             content.getChildren().add(ComponentList.createComponentListTitle(i18n("plugin.install.plan")));
@@ -339,12 +412,31 @@ final class PluginDialogs {
                     ? "plugin.install.warning.update_anyway"
                     : "plugin.install.warning.install_anyway"));
             confirmButton.getStyleClass().add("dialog-accept");
+            if (customSourceAcknowledgement != null && dangerousPermissionAcknowledgement != null) {
+                confirmButton.disableProperty().bind(customSourceAcknowledgement.selectedProperty().not()
+                        .or(dangerousPermissionAcknowledgement.selectedProperty().not()));
+            } else if (customSourceAcknowledgement != null) {
+                confirmButton.disableProperty().bind(customSourceAcknowledgement.selectedProperty().not());
+            } else if (dangerousPermissionAcknowledgement != null) {
+                confirmButton.disableProperty().bind(dangerousPermissionAcknowledgement.selectedProperty().not());
+            }
+            @Nullable JFXCheckBox finalCustomSourceAcknowledgement = customSourceAcknowledgement;
+            @Nullable JFXCheckBox finalDangerousPermissionAcknowledgement = dangerousPermissionAcknowledgement;
             confirmButton.setOnAction(event -> {
                 Map<String, @Unmodifiable Set<PluginPermission>> grants = new LinkedHashMap<>();
                 permissionPanes.forEach((pluginId, pane) ->
                         grants.put(pluginId, pane.getGrantedPermissions()));
                 fireEvent(new DialogCloseEvent());
-                callback.accept(Map.copyOf(grants));
+                callback.confirm(
+                        Map.copyOf(grants),
+                        finalCustomSourceAcknowledgement != null && finalCustomSourceAcknowledgement.isSelected()
+                                ? Set.copyOf(customSourceProviderIds)
+                                : Set.of(),
+                        finalDangerousPermissionAcknowledgement != null
+                                && finalDangerousPermissionAcknowledgement.isSelected()
+                                ? Set.copyOf(dangerousPermissionPluginIds)
+                                : Set.of()
+                );
             });
 
             JFXButton cancelButton = new JFXButton(i18n("button.cancel"));
@@ -354,6 +446,22 @@ final class PluginDialogs {
             setActions(confirmButton, cancelButton);
             onEscPressed(this, cancelButton::fire);
         }
+    }
+
+    /// Receives immutable install decisions after all independent acknowledgements are selected.
+    @FunctionalInterface
+    @NotNullByDefault
+    interface PluginInstallConfirmationHandler {
+        /// Accepts permission grants, custom-source receipts, and dangerous-permission acknowledgements.
+        ///
+        /// @param grantsByPluginId immutable grants indexed by changed plugin ID
+        /// @param confirmedCustomSourceProviderIds acknowledged custom-source Runtime Host IDs
+        /// @param confirmedDangerousPermissionPluginIds acknowledged dangerous-permission plugin IDs
+        void confirm(
+                @Unmodifiable Map<String, @Unmodifiable Set<PluginPermission>> grantsByPluginId,
+                @Unmodifiable Set<String> confirmedCustomSourceProviderIds,
+                @Unmodifiable Set<String> confirmedDangerousPermissionPluginIds
+        );
     }
 
     /// Non-dismissible HMCL progress pane updated by asynchronous plugin workflows.
