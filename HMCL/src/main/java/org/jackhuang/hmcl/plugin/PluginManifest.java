@@ -923,6 +923,9 @@ public final class PluginManifest {
         Set<String> providedRuntimeIds = new HashSet<>();
         boolean requiresNativeCode = false;
         for (RuntimeProviderDeclaration declaration : providedRuntimes) {
+            if (PluginRuntimeTypes.JAVA.equals(declaration.getRuntime())) {
+                throw new IOException("Runtime-provider plugins cannot provide the built-in java runtime");
+            }
             if (!providedRuntimeIds.add(declaration.getRuntime())) {
                 throw new IOException("Duplicate provided runtime: " + declaration.getRuntime());
             }
@@ -943,6 +946,9 @@ public final class PluginManifest {
     public static PluginManifest fromJson(Reader reader) throws IOException, JsonParseException {
         @Nullable JsonElement json = JsonParser.parseReader(reader);
         @Nullable JsonObject root = json != null && json.isJsonObject() ? json.getAsJsonObject() : null;
+        if (root != null) {
+            requireCanonicalRuntimeProviderTokens(root);
+        }
         @Nullable PluginManifest manifest = JsonUtils.GSON.fromJson(json, PluginManifest.class);
         if (manifest == null) {
             throw new IOException("Plugin manifest is empty");
@@ -969,6 +975,164 @@ public final class PluginManifest {
         }
         manifest.validate();
         return manifest;
+    }
+
+    /// Validates raw schema-v5 runtime-provider field types and canonical enum spellings before semantic validation.
+    ///
+    /// The shared enum adapter intentionally remains case-insensitive for existing schemas, so schema-v5 provider
+    /// fields preserve their executable contract by checking their original JSON tokens here.
+    ///
+    /// @param root parsed manifest root
+    /// @throws IOException if a new runtime-provider field has the wrong JSON type or a non-canonical enum token
+    private static void requireCanonicalRuntimeProviderTokens(JsonObject root) throws IOException {
+        requireCanonicalEnumToken(root, "pluginKind", PluginKind.class);
+        requireCanonicalEnumToken(root, "executionMode", PluginExecutionMode.class);
+        requireNullableStringToken(root, "runtimeProvider");
+        if (!root.has("providesRuntimes")) {
+            return;
+        }
+        @Nullable JsonElement values = root.get("providesRuntimes");
+        if (values == null || !values.isJsonArray()) {
+            throw new IOException("Plugin providesRuntimes must be an array");
+        }
+        for (JsonElement declaration : values.getAsJsonArray()) {
+            requireRuntimeProviderDeclarationTokens(declaration);
+        }
+    }
+
+    /// Requires an optional schema-v5 enum property to be an exact canonical string token.
+    ///
+    /// @param root parsed manifest root
+    /// @param fieldName property name
+    /// @param enumClass expected enum type
+    /// @param <E> enum type
+    /// @throws IOException if the property is not a supported canonical string token
+    private static <E extends Enum<E>> void requireCanonicalEnumToken(
+            JsonObject root,
+            String fieldName,
+            Class<E> enumClass) throws IOException {
+        if (!root.has(fieldName)) {
+            return;
+        }
+        @Nullable JsonElement value = root.get(fieldName);
+        if (value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isString()) {
+            throw new IOException("Plugin " + fieldName + " must be a string");
+        }
+        String token = value.getAsString();
+        @Nullable E parsed = LowerCaseEnumTypeAdapter.fromJson(enumClass, token);
+        if (parsed == null || !parsed.toString().equals(token)) {
+            throw new IOException("Plugin " + fieldName + " must be canonical: " + token);
+        }
+    }
+
+    /// Requires an optional schema-v5 nullable string property to use a string or JSON null representation.
+    ///
+    /// @param root parsed manifest root
+    /// @param fieldName property name
+    /// @throws IOException if a present property is neither a string nor JSON null
+    private static void requireNullableStringToken(JsonObject root, String fieldName) throws IOException {
+        if (!root.has(fieldName)) {
+            return;
+        }
+        @Nullable JsonElement value = root.get(fieldName);
+        if (value == null || (!value.isJsonNull()
+                && (!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isString()))) {
+            throw new IOException("Plugin " + fieldName + " must be a string or null");
+        }
+    }
+
+    /// Requires one raw runtime-provider declaration to use exact schema-v5 JSON token types.
+    ///
+    /// Enum token validation remains local to schema-v5 runtime declarations so legacy enum fields retain their
+    /// existing case-insensitive Gson behavior.
+    ///
+    /// @param value declaration JSON value
+    /// @throws IOException if the declaration is not a complete object with canonical typed values
+    private static void requireRuntimeProviderDeclarationTokens(JsonElement value) throws IOException {
+        if (!value.isJsonObject()) {
+            throw new IOException("Runtime provider declaration must be an object");
+        }
+        JsonObject declaration = value.getAsJsonObject();
+        requireStringToken(declaration, "runtime");
+        @Nullable JsonElement abis = requireRuntimeProviderProperty(declaration, "abis");
+        if (!abis.isJsonArray()) {
+            throw new IOException("Runtime provider abis must be an array");
+        }
+        for (JsonElement abi : abis.getAsJsonArray()) {
+            requireIntegerToken(abi, "abis");
+        }
+        requireIntegerToken(requireRuntimeProviderProperty(declaration, "bridgeAbi"), "bridgeAbi");
+        requireCanonicalEnumArrayToken(declaration, "executionModes", PluginExecutionMode.class);
+        requireCanonicalEnumArrayToken(declaration, "features", RuntimeFeature.class);
+    }
+
+    /// Requires one declaration property to be present and returns its raw JSON value.
+    ///
+    /// @param declaration runtime-provider declaration object
+    /// @param fieldName required property name
+    /// @return raw property value
+    /// @throws IOException if the property is absent
+    private static JsonElement requireRuntimeProviderProperty(JsonObject declaration, String fieldName) throws IOException {
+        @Nullable JsonElement value = declaration.get(fieldName);
+        if (value == null) {
+            throw new IOException("Runtime provider declaration has no " + fieldName);
+        }
+        return value;
+    }
+
+    /// Requires one declaration property to be a JSON string.
+    ///
+    /// @param declaration runtime-provider declaration object
+    /// @param fieldName required string property name
+    /// @throws IOException if the property is not a string
+    private static void requireStringToken(JsonObject declaration, String fieldName) throws IOException {
+        JsonElement value = requireRuntimeProviderProperty(declaration, fieldName);
+        if (!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isString()) {
+            throw new IOException("Runtime provider " + fieldName + " must be a string");
+        }
+    }
+
+    /// Requires a raw JSON number to be a lexical 32-bit integer.
+    ///
+    /// @param value JSON value to validate
+    /// @param fieldName property name used in diagnostics
+    /// @throws IOException if the value is not an integer number
+    private static void requireIntegerToken(JsonElement value, String fieldName) throws IOException {
+        if (!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber()) {
+            throw new IOException("Runtime provider " + fieldName + " must be a number");
+        }
+        try {
+            Integer.parseInt(value.getAsString());
+        } catch (NumberFormatException exception) {
+            throw new IOException("Runtime provider " + fieldName + " must be an integer", exception);
+        }
+    }
+
+    /// Requires an array of exact canonical enum string tokens in one runtime-provider declaration.
+    ///
+    /// @param declaration runtime-provider declaration object
+    /// @param fieldName array property name
+    /// @param enumClass expected enum type
+    /// @param <E> enum type
+    /// @throws IOException if the property is not an array of canonical enum string tokens
+    private static <E extends Enum<E>> void requireCanonicalEnumArrayToken(
+            JsonObject declaration,
+            String fieldName,
+            Class<E> enumClass) throws IOException {
+        JsonElement values = requireRuntimeProviderProperty(declaration, fieldName);
+        if (!values.isJsonArray()) {
+            throw new IOException("Runtime provider " + fieldName + " must be an array");
+        }
+        for (JsonElement value : values.getAsJsonArray()) {
+            if (!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isString()) {
+                throw new IOException("Runtime provider " + fieldName + " values must be strings");
+            }
+            String token = value.getAsString();
+            @Nullable E parsed = LowerCaseEnumTypeAdapter.fromJson(enumClass, token);
+            if (parsed == null || !parsed.toString().equals(token)) {
+                throw new IOException("Runtime provider " + fieldName + " value must be canonical: " + token);
+            }
+        }
     }
 
     /// Rejects unknown string hook identifiers before enum deserialization loses the source token.

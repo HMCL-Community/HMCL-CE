@@ -288,6 +288,9 @@ public final class RuntimeProviderDeclaration {
                 if (value == null) {
                     throw new JsonParseException("Unknown runtime provider " + fieldName + " value: " + token);
                 }
+                if (!value.toString().equals(token)) {
+                    throw new JsonParseException("Runtime provider " + fieldName + " value must be canonical: " + token);
+                }
                 if (!values.add(value)) {
                     throw new JsonParseException("Duplicate runtime provider " + fieldName + " value: " + token);
                 }
@@ -296,18 +299,23 @@ public final class RuntimeProviderDeclaration {
             return values;
         }
 
-        /// Reads one required integer JSON value.
+        /// Reads one required lexical JSON integer without accepting decimal or exponential notation.
         ///
         /// @param reader JSON input
         /// @param fieldName property name used in diagnostics
         /// @return parsed integer
         /// @throws IOException if token reading fails
-        /// @throws JsonParseException if the value is not a number
+        /// @throws JsonParseException if the value is not an integer number
         private static int readInteger(JsonReader reader, String fieldName) throws IOException {
             if (reader.peek() != JsonToken.NUMBER) {
                 throw new JsonParseException("Runtime provider " + fieldName + " must be a number");
             }
-            return reader.nextInt();
+            String token = reader.nextString();
+            try {
+                return Integer.parseInt(token);
+            } catch (NumberFormatException exception) {
+                throw new JsonParseException("Runtime provider " + fieldName + " must be an integer", exception);
+            }
         }
 
         /// Reads one required string JSON value.

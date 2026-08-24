@@ -320,6 +320,82 @@ public final class PluginManifestTest {
                 "\"runtime\": \"java\", \"abi\": 2, \"providesRuntimes\": [null]"));
     }
 
+    /// Rejects attempts to publish the launcher's reserved built-in Java runtime from a plugin package.
+    @Test
+    public void rejectProvidedBuiltInJavaRuntime() {
+        assertManifestRejected(schemaFiveWithDeclarations("""
+                "runtime": "java",
+                "abi": 2,
+                "pluginKind": "runtime-provider",
+                "providesRuntimes": [{"runtime": "java", "abis": [2], "bridgeAbi": 1,
+                                      "executionModes": ["embedded"], "features": ["bridge"]}]
+                """));
+    }
+
+    /// Rejects non-canonical schema-v5 enum spellings at the manifest and runtime-provider declaration levels.
+    @Test
+    public void rejectNonCanonicalSchemaVersionFiveRuntimeProviderEnumTokens() {
+        assertManifestRejected(schemaFiveWithDeclarations("""
+                "runtime": "java",
+                "abi": 2,
+                "pluginKind": "RUNTIME-PROVIDER",
+                "providesRuntimes": [{"runtime": "rust", "abis": [2], "bridgeAbi": 1,
+                                      "executionModes": ["isolated"], "features": ["bridge"]}]
+                """));
+        assertManifestRejected(schemaFiveWithDeclarations(
+                "\"runtime\": \"java\", \"abi\": 2, \"executionMode\": \"ISOLATED\""));
+        assertManifestRejectedAtParsingOrValidation(schemaFiveWithDeclarations("""
+                "runtime": "java",
+                "abi": 2,
+                "pluginKind": "runtime-provider",
+                "providesRuntimes": [{"runtime": "rust", "abis": [2], "bridgeAbi": 1,
+                                      "executionModes": ["ISOLATED"], "features": ["bridge"]}]
+                """));
+        assertManifestRejectedAtParsingOrValidation(schemaFiveWithDeclarations("""
+                "runtime": "java",
+                "abi": 2,
+                "pluginKind": "runtime-provider",
+                "providesRuntimes": [{"runtime": "rust", "abis": [2], "bridgeAbi": 1,
+                                      "executionModes": ["isolated"], "features": ["Bridge"]}]
+                """));
+        assertManifestRejectedAtParsingOrValidation(schemaFiveWithDeclarations("""
+                "runtime": "java",
+                "abi": 2,
+                "pluginKind": "runtime-provider",
+                "providesRuntimes": [{"runtime": "rust", "abis": [2], "bridgeAbi": 1,
+                                      "executionModes": ["isolated"], "features": ["RAW-JVM"]}]
+                """));
+    }
+
+    /// Rejects coercible JSON values and non-integer provider ABI values before manifest validation uses them.
+    @Test
+    public void rejectInvalidSchemaVersionFiveRuntimeProviderFieldTypes() {
+        assertManifestRejectedAtParsingOrValidation(schemaFiveWithDeclarations(
+                "\"runtime\": \"java\", \"abi\": 2, \"pluginKind\": true"));
+        assertManifestRejectedAtParsingOrValidation(schemaFiveWithDeclarations(
+                "\"runtime\": \"java\", \"abi\": 2, \"executionMode\": 1"));
+        assertManifestRejectedAtParsingOrValidation(schemaFiveWithDeclarations(
+                "\"runtime\": \"java\", \"abi\": 2, \"runtimeProvider\": true"));
+        assertManifestRejectedAtParsingOrValidation(schemaFiveWithDeclarations(
+                "\"runtime\": \"java\", \"abi\": 2, \"runtimeProvider\": 123"));
+        assertManifestRejectedAtParsingOrValidation(schemaFiveWithDeclarations(
+                "\"runtime\": \"java\", \"abi\": 2, \"providesRuntimes\": true"));
+        assertManifestRejectedAtParsingOrValidation(schemaFiveWithDeclarations("""
+                "runtime": "java",
+                "abi": 2,
+                "pluginKind": "runtime-provider",
+                "providesRuntimes": [{"runtime": "rust", "abis": [2.5], "bridgeAbi": 1,
+                                      "executionModes": ["isolated"], "features": ["bridge"]}]
+                """));
+        assertManifestRejectedAtParsingOrValidation(schemaFiveWithDeclarations("""
+                "runtime": "java",
+                "abi": 2,
+                "pluginKind": "runtime-provider",
+                "providesRuntimes": [{"runtime": "rust", "abis": [2], "bridgeAbi": 1.5,
+                                      "executionModes": ["isolated"], "features": ["bridge"]}]
+                """));
+    }
+
     /// Includes the schema-v5 provider vocabulary in manifest value identity.
     @Test
     public void compareSchemaVersionFiveRuntimeProviderIdentity() throws IOException {
@@ -1252,6 +1328,13 @@ public final class PluginManifestTest {
     /// @param reader manifest JSON reader
     private static void assertManifestRejected(StringReader reader) {
         assertThrows(IOException.class, () -> PluginManifest.fromJson(reader));
+    }
+
+    /// Asserts that malformed JSON is rejected either while parsing or during semantic manifest validation.
+    ///
+    /// @param json manifest JSON
+    private static void assertManifestRejectedAtParsingOrValidation(String json) {
+        assertThrows(Exception.class, () -> PluginManifest.fromJson(new StringReader(json)));
     }
 
     /// Asserts that a malformed patch declaration fails semantic validation.
