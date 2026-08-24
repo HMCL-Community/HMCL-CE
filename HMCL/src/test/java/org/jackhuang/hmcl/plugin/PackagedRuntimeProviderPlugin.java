@@ -28,6 +28,7 @@ import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderDescriptor;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
 
+import java.io.IOException;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
@@ -43,6 +44,9 @@ public final class PackagedRuntimeProviderPlugin implements Plugin, RuntimeProvi
 
     /// Process property forcing the health check to fail when set to `true`.
     public static final String FAIL_HEALTH_PROPERTY = "hmcl.test.runtime-provider.fail-health";
+
+    /// Process property forcing the next payload unload to fail once when set to `true`.
+    public static final String FAIL_UNLOAD_ONCE_PROPERTY = "hmcl.test.runtime-provider.fail-unload-once";
 
     /// Manifest received during Host loading, or `null` before registration.
     private @Nullable PluginManifest manifest;
@@ -92,7 +96,7 @@ public final class PackagedRuntimeProviderPlugin implements Plugin, RuntimeProvi
     public RuntimeProviderDescriptor descriptor() {
         return new RuntimeProviderDescriptor(
                 PROVIDER_ID,
-                "1.0.0",
+                getManifest().getVersion(),
                 List.of(new RuntimeProviderDeclaration(
                         "rust",
                         Set.of(PluginAbi.ABI_2),
@@ -145,8 +149,12 @@ public final class PackagedRuntimeProviderPlugin implements Plugin, RuntimeProvi
 
     /// Records payload unloading.
     @Override
-    public void unloadPayload(RuntimePayloadHandle handle) {
+    public void unloadPayload(RuntimePayloadHandle handle) throws IOException {
         append("payload.unload");
+        if (Boolean.getBoolean(FAIL_UNLOAD_ONCE_PROPERTY)) {
+            System.clearProperty(FAIL_UNLOAD_ONCE_PROPERTY);
+            throw new IOException("Configured one-shot payload unload failure");
+        }
     }
 
     /// Records Provider-wide resource shutdown.

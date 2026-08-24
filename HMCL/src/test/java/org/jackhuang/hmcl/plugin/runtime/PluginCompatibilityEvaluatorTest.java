@@ -37,6 +37,24 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /// Verifies shared plugin compatibility requirements and ordered compatibility diagnostics.
 @NotNullByDefault
 public final class PluginCompatibilityEvaluatorTest {
+    /// Evaluates only the bound Provider and never substitutes another compatible candidate.
+    @Test
+    public void rejectIncompatibleBoundProviderWithoutCandidateFallback() {
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        registry.register(provider("dev.host.rust.bound", "rust", 1,
+                Set.of(PluginExecutionMode.ISOLATED), Set.of(RuntimeFeature.BRIDGE)));
+        registry.register(provider("dev.host.rust.fallback", "rust", 1,
+                Set.of(PluginExecutionMode.EMBEDDED), Set.of(RuntimeFeature.BRIDGE)));
+        PluginCompatibilityEvaluator evaluator = new PluginCompatibilityEvaluator(
+                registry, PluginPlatformTarget.parse("windows"));
+        PluginCompatibilityRequirements requirements = requirements(new RuntimeRequirement(
+                "rust", PluginAbi.ABI_2, 1, PluginExecutionMode.EMBEDDED,
+                Set.of(RuntimeFeature.BRIDGE), null));
+
+        assertStatus(PluginCompatibilityStatus.UNSUPPORTED_EXECUTION_MODE,
+                evaluator.evaluateForProvider(requirements, "26.8", "dev.host.rust.bound"));
+    }
+
     /// Shares one mutable provider registry and evaluator across production compatibility consumers.
     @Test
     public void exposeProcessWideCompatibilityServices() {

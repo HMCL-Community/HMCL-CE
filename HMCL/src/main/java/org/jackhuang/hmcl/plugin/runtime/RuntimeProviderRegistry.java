@@ -196,8 +196,10 @@ public final class RuntimeProviderRegistry {
     /// must either restore that edge or fail closed.
     ///
     /// @param binding persisted dependent-to-Provider edge
-    /// @throws IllegalStateException if the Provider is absent, lacks the bound runtime, or another binding exists
-    public synchronized void restoreBinding(RuntimeProviderBinding binding) {
+    /// @param requirement complete runtime requirement of the dependent package
+    /// @throws IllegalStateException if the exact Provider cannot satisfy every requirement or another binding exists
+    public synchronized void restoreBinding(RuntimeProviderBinding binding, RuntimeRequirement requirement) {
+        requireCompatibleBinding(binding, requirement);
         @Nullable RuntimeProviderBinding existing = bindingsByDependent.get(binding.dependentPluginId());
         if (existing != null) {
             if (existing.equals(binding)) {
@@ -206,12 +208,42 @@ public final class RuntimeProviderRegistry {
             throw new IllegalStateException("Plugin already has another runtime Provider binding: "
                     + binding.dependentPluginId());
         }
-        @Nullable RuntimeProviderDescriptor descriptor = descriptorsById.get(binding.providerId());
-        if (descriptor == null || descriptor.capability(binding.runtime()).isEmpty()) {
-            throw new IllegalStateException("Persisted runtime Provider binding is unavailable: "
-                    + binding.dependentPluginId() + " -> " + binding.providerId());
-        }
         bindingsByDependent.put(binding.dependentPluginId(), binding);
+    }
+
+    /// Requires an exact binding to satisfy the complete dependent runtime contract.
+    ///
+    /// @param binding exact dependent-to-Provider edge
+    /// @param requirement complete dependent requirement
+    /// @throws IllegalStateException if the edge or exact live Provider is incompatible
+    private void requireCompatibleBinding(RuntimeProviderBinding binding, RuntimeRequirement requirement) {
+        if (!binding.runtime().equals(requirement.getRuntime())) {
+            throw incompatibleBinding(binding, "bound runtime differs from the package requirement");
+        }
+        @Nullable String pinnedProviderId = requirement.getPinnedProviderId();
+        if (pinnedProviderId != null && !binding.providerId().equals(pinnedProviderId)) {
+            throw incompatibleBinding(binding, "bound Provider differs from the package pin");
+        }
+        @Nullable RuntimeProvider provider = providersById.get(binding.providerId());
+        @Nullable RuntimeProviderDescriptor descriptor = descriptorsById.get(binding.providerId());
+        if (provider == null || descriptor == null) {
+            throw incompatibleBinding(binding, "Provider is unavailable");
+        }
+        if (new RuntimeProviderSelector().select(requirement, List.of(descriptor)).isEmpty()
+                || !provider.supportsAbi(requirement.getRuntime(), requirement.getPluginAbi())
+                || providersById.get(binding.providerId()) != provider) {
+            throw incompatibleBinding(binding, "Provider does not satisfy the complete runtime requirement");
+        }
+    }
+
+    /// Creates a deterministic exact-binding rejection.
+    ///
+    /// @param binding rejected binding
+    /// @param reason incompatibility reason
+    /// @return binding rejection
+    private static IllegalStateException incompatibleBinding(RuntimeProviderBinding binding, String reason) {
+        return new IllegalStateException("Persisted runtime Provider binding is incompatible: "
+                + binding.dependentPluginId() + " -> " + binding.providerId() + " (" + reason + ")");
     }
 
     /// Returns one registered provider by provider plugin ID.

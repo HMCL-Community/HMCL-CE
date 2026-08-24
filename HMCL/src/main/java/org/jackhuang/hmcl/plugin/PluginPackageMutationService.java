@@ -110,12 +110,14 @@ final class PluginPackageMutationService {
     /// @param artifacts inspected install artifacts indexed in publication order
     /// @param writePermissions writes exact artifact-bound permission decisions
     /// @param writeState writes desired enablement and pending-removal state after package publication
+    /// @param validateBeforeCommit validates published packages and documents while rollback remains available
     /// @param reloadAfterRollback reloads in-memory permission state after journal recovery
     /// @throws IOException if staging, publication, document persistence, or recovery fails
     void publishInstallations(
             Map<String, InstallArtifact> artifacts,
             PluginMutationLock.IORunnable writePermissions,
             PluginMutationLock.IORunnable writeState,
+            PluginMutationLock.IORunnable validateBeforeCommit,
             PluginMutationLock.IORunnable reloadAfterRollback
     ) throws IOException {
         requireRecoveredJournal();
@@ -129,7 +131,10 @@ final class PluginPackageMutationService {
             executePreparedTransaction(
                     transaction,
                     writePermissions,
-                    writeState,
+                    () -> {
+                        writeState.run();
+                        validateBeforeCommit.run();
+                    },
                     reloadAfterRollback
             );
         } finally {

@@ -83,6 +83,37 @@ public final class PluginCompatibilityEvaluator {
     public PluginCompatibilityResult evaluate(
             PluginCompatibilityRequirements requirements,
             String launcherVersion) {
+        return evaluate(requirements, launcherVersion, null);
+    }
+
+    /// Evaluates package requirements against one exact previously selected Provider.
+    ///
+    /// @param requirements package compatibility requirements
+    /// @param launcherVersion current launcher version
+    /// @param providerId exact bound Provider plugin ID
+    /// @return first incompatibility, or a compatible result when the bound Provider satisfies every dimension
+    public PluginCompatibilityResult evaluateForProvider(
+            PluginCompatibilityRequirements requirements,
+            String launcherVersion,
+            String providerId
+    ) {
+        if (!PluginManifest.isCanonicalExecutableId(providerId)) {
+            throw new IllegalArgumentException("Bound runtime Provider ID must be canonical: " + providerId);
+        }
+        return evaluate(requirements, launcherVersion, providerId);
+    }
+
+    /// Evaluates common package requirements with an optional exact Provider constraint.
+    ///
+    /// @param requirements package compatibility requirements
+    /// @param launcherVersion current launcher version
+    /// @param exactProviderId exact bound Provider ID, or `null` for ordinary candidate selection
+    /// @return first incompatibility, or a compatible result
+    private PluginCompatibilityResult evaluate(
+            PluginCompatibilityRequirements requirements,
+            String launcherVersion,
+            @Nullable String exactProviderId
+    ) {
         int schemaVersion = requirements.schemaVersion();
         if (schemaVersion < PluginManifest.MIN_EXECUTABLE_SCHEMA_VERSION
                 || schemaVersion > PluginManifest.CURRENT_SCHEMA_VERSION) {
@@ -112,6 +143,17 @@ public final class PluginCompatibilityEvaluator {
         }
         String runtime = requirements.runtime();
         @Unmodifiable List<RuntimeProviderDescriptor> candidates = runtimeProviders.candidates(runtime);
+        if (exactProviderId != null) {
+            candidates = candidates.stream()
+                    .filter(candidate -> exactProviderId.equals(candidate.providerId()))
+                    .toList();
+            if (candidates.isEmpty()) {
+                return new PluginCompatibilityResult(
+                        PluginCompatibilityStatus.MISSING_RUNTIME,
+                        "Bound runtime Provider " + exactProviderId + " does not advertise " + runtime
+                );
+            }
+        }
         @Nullable String pinnedProviderId = requirements.pinnedProviderId();
         if (pinnedProviderId != null) {
             Optional<RuntimeProviderDescriptor> pinnedDescriptor = candidates.stream()

@@ -18,7 +18,13 @@
 package org.jackhuang.hmcl.plugin;
 
 import org.jackhuang.hmcl.FXThreadTestSupport;
+import org.jackhuang.hmcl.plugin.runtime.PluginAbi;
+import org.jackhuang.hmcl.plugin.runtime.PluginExecutionMode;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeFeature;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeProvider;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderBinding;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderDeclaration;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderDescriptor;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderRegistry;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
@@ -28,17 +34,23 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// Verifies Provider-first Manager startup, ready-gated payload delegation, rollback, and reverse shutdown.
@@ -47,6 +59,32 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 public final class PluginManagerRuntimeProviderLifecycleTest {
     /// Canonical external payload plugin ID used by generated packages and bindings.
     private static final String PAYLOAD_ID = "dev.hmclce.test.runtime-payload";
+
+    /// Rejects an external payload without an exact binding even when a compatible Provider is registered.
+    ///
+    /// @param temporaryDirectory isolated launcher home
+    /// @throws Exception if package creation, discovery, or cleanup fails
+    @Test
+    public void rejectExternalPayloadWithoutExactBinding(@TempDir Path temporaryDirectory) throws Exception {
+        Path localHome = temporaryDirectory.resolve("home");
+        RuntimeProviderRegistry registry = RuntimeProviderRegistry.processWide();
+        clearFixture(registry);
+        registry.register(compatibleProvider());
+        try {
+            PluginManager manager = new PluginManager(localHome);
+            writeJavaBackedExternalPayloadPackage(manager.getPluginsDirectory().resolve("payload.npl"));
+            manager.enablePlugin(PAYLOAD_ID);
+
+            FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
+
+            assertNull(manager.getPlugin(PAYLOAD_ID));
+            assertEquals(PluginRuntimeStatus.LOAD_FAILED, manager.getPluginRuntimeStatus(PAYLOAD_ID));
+            assertTrue(Objects.requireNonNull(manager.getPluginRuntimeDetail(PAYLOAD_ID))
+                    .contains("runtime Provider binding"));
+        } finally {
+            clearFixture(registry);
+        }
+    }
 
     /// Loads a virtual runtime dependency before its lexically later Host package and tears it down first.
     ///
@@ -95,6 +133,45 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
         }
     }
 
+    /// Re-enables a disabled bound Host before delegating dependent payload enablement.
+    ///
+    /// @param temporaryDirectory isolated launcher home
+    /// @throws Exception if package creation, binding persistence, discovery, or state persistence fails
+    @Test
+    public void reenableBoundHostBeforeDependentPayload(@TempDir Path temporaryDirectory) throws Exception {
+        Path localHome = temporaryDirectory.resolve("home");
+        RuntimeProviderRegistry registry = RuntimeProviderRegistry.processWide();
+        clearFixture(registry);
+        try {
+            PluginManager manager = new PluginManager(localHome);
+            writePayloadPackage(manager.getPluginsDirectory().resolve("00-payload.npl"));
+            writeHostPackage(manager.getPluginsDirectory().resolve("99-host.npl"));
+            writeBinding(localHome);
+            manager.enablePlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID);
+            manager.enablePlugin(PAYLOAD_ID);
+            FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
+
+            manager.disablePlugin(PAYLOAD_ID);
+            manager.disablePlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID);
+            assertTrue(!Objects.requireNonNull(
+                    manager.getPlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID)).isEnabled());
+            assertThrows(UncheckedIOException.class, () -> Objects.requireNonNull(
+                    manager.getPlugin(PAYLOAD_ID)).getPlugin().onEnable());
+
+            assertTrue(manager.enablePlugin(PAYLOAD_ID));
+
+            assertTrue(Objects.requireNonNull(
+                    manager.getPlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID)).isEnabled());
+            assertEquals(List.of(
+                    "host.onLoad", "provider.initialize", "provider.health", "host.onEnable",
+                    "payload.load", "payload.enable", "payload.disable", "host.onDisable",
+                    "host.onEnable", "payload.enable"
+            ), events());
+        } finally {
+            clearFixture(registry);
+        }
+    }
+
     /// Rolls an unhealthy Host out of the registry and blocks its bound payload before payload loading.
     ///
     /// @param temporaryDirectory isolated launcher home
@@ -129,6 +206,114 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
         }
     }
 
+    /// Restores the old Host package, binding, and enablement when a replacement fails health validation.
+    ///
+    /// @param temporaryDirectory isolated launcher home
+    /// @throws Exception if package creation, discovery, staging, or rollback verification fails
+    @Test
+    public void rollbackUnhealthyProviderUpdateBeforeCommit(@TempDir Path temporaryDirectory) throws Exception {
+        Path localHome = temporaryDirectory.resolve("home");
+        RuntimeProviderRegistry registry = RuntimeProviderRegistry.processWide();
+        clearFixture(registry);
+        try {
+            PluginManager manager = new PluginManager(localHome);
+            Path oldHostPackage = manager.getPluginsDirectory().resolve("99-host.npl");
+            writePayloadPackage(manager.getPluginsDirectory().resolve("00-payload.npl"));
+            writeHostPackage(oldHostPackage);
+            writeBinding(localHome);
+            manager.enablePlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID);
+            manager.enablePlugin(PAYLOAD_ID);
+            FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
+
+            String oldHostSha256 = org.jackhuang.hmcl.plugin.internal.PluginPackageVersions
+                    .calculateSha256(oldHostPackage);
+            RuntimeProvider oldProvider = registry.findById(PackagedRuntimeProviderPlugin.PROVIDER_ID)
+                    .orElseThrow();
+            Map<String, RuntimeProviderBinding> oldBindings =
+                    new PluginRuntimeBindingStore(localHome, new PluginMutationLock(localHome)).readStrict();
+            Path replacement = temporaryDirectory.resolve("runtime-host-v2.npl");
+            writeHostPackage(replacement, "2.0.0");
+            System.setProperty(PackagedRuntimeProviderPlugin.FAIL_HEALTH_PROPERTY, "true");
+
+            IOException failure = assertThrows(IOException.class, () -> manager.stagePluginInstallations(List.of(
+                    manager.inspectLocalPluginPackage(replacement)
+            )));
+
+            assertTrue(Objects.requireNonNull(failure.getMessage()).contains("health check failed"));
+            assertTrue(Files.isRegularFile(oldHostPackage));
+            assertEquals(oldHostSha256, org.jackhuang.hmcl.plugin.internal.PluginPackageVersions
+                    .calculateSha256(oldHostPackage));
+            assertEquals("1.0.0", manager.inspectLocalPluginPackage(oldHostPackage).getManifest().getVersion());
+            assertEquals(oldBindings,
+                    new PluginRuntimeBindingStore(localHome, new PluginMutationLock(localHome)).readStrict());
+
+            Set<String> enabled = new HashSet<>();
+            Set<String> pendingUninstall = new HashSet<>();
+            new PluginStateStore(localHome.resolve("plugin-states.json"), new PluginMutationLock(localHome))
+                    .load(enabled, pendingUninstall);
+            assertEquals(Set.of(PackagedRuntimeProviderPlugin.PROVIDER_ID, PAYLOAD_ID), enabled);
+            assertTrue(pendingUninstall.isEmpty());
+            assertTrue(Objects.requireNonNull(manager.getPlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID)).isEnabled());
+            assertTrue(Objects.requireNonNull(manager.getPlugin(PAYLOAD_ID)).isEnabled());
+            assertEquals("1.0.0", Objects.requireNonNull(
+                    manager.getPlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID)).getManifest().getVersion());
+            assertSame(oldProvider, registry.findById(PackagedRuntimeProviderPlugin.PROVIDER_ID).orElseThrow());
+            assertFalse(Files.exists(localHome.resolve("plugin-install-transaction.json")));
+            assertFalse(Files.exists(manager.getPluginsDirectory().resolve(
+                    PackagedRuntimeProviderPlugin.PROVIDER_ID + ".npl")));
+            try (var packages = Files.list(manager.getPluginsDirectory())) {
+                assertFalse(packages.map(path -> path.getFileName().toString()).anyMatch(
+                        name -> name.endsWith(".backup") || name.endsWith(".installing")
+                ));
+            }
+            assertTrue(events().subList(events().size() - 5, events().size()).equals(List.of(
+                    "host.onLoad", "provider.initialize", "provider.health", "provider.close", "host.onUnload"
+            )));
+        } finally {
+            clearFixture(registry);
+        }
+    }
+
+    /// Retains a failed external payload unload so the same container, handle, and binding can be retried.
+    ///
+    /// @param temporaryDirectory isolated launcher home
+    /// @throws Exception if package creation, discovery, unload, or cleanup fails
+    @Test
+    public void retryFailedExternalPayloadUnload(@TempDir Path temporaryDirectory) throws Exception {
+        Path localHome = temporaryDirectory.resolve("home");
+        RuntimeProviderRegistry registry = RuntimeProviderRegistry.processWide();
+        clearFixture(registry);
+        try {
+            PluginManager manager = new PluginManager(localHome);
+            writePayloadPackage(manager.getPluginsDirectory().resolve("00-payload.npl"));
+            writeHostPackage(manager.getPluginsDirectory().resolve("99-host.npl"));
+            writeBinding(localHome);
+            manager.enablePlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID);
+            manager.enablePlugin(PAYLOAD_ID);
+            FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
+            PluginContainer payloadContainer = Objects.requireNonNull(manager.getPlugin(PAYLOAD_ID));
+            RuntimeProviderBinding binding = registry.bindingFor(PAYLOAD_ID).orElseThrow();
+            System.setProperty(PackagedRuntimeProviderPlugin.FAIL_UNLOAD_ONCE_PROPERTY, "true");
+
+            FXThreadTestSupport.runOnFxThread(() -> manager.unloadPlugin(PAYLOAD_ID));
+
+            assertSame(payloadContainer, manager.getPlugin(PAYLOAD_ID));
+            assertFalse(payloadContainer.isEnabled());
+            assertEquals(binding, registry.bindingFor(PAYLOAD_ID).orElseThrow());
+            assertEquals(1, events().stream().filter("payload.load"::equals).count());
+            assertEquals(1, events().stream().filter("payload.unload"::equals).count());
+
+            FXThreadTestSupport.runOnFxThread(() -> manager.unloadPlugin(PAYLOAD_ID));
+
+            assertNull(manager.getPlugin(PAYLOAD_ID));
+            assertTrue(registry.bindingFor(PAYLOAD_ID).isEmpty());
+            assertEquals(1, events().stream().filter("payload.load"::equals).count());
+            assertEquals(2, events().stream().filter("payload.unload"::equals).count());
+        } finally {
+            clearFixture(registry);
+        }
+    }
+
     /// Persists the exact virtual Provider binding selected for the external payload.
     ///
     /// @param localHome launcher-local home
@@ -146,12 +331,21 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
     /// @param target Host package path
     /// @throws IOException if package creation fails
     private static void writeHostPackage(Path target) throws IOException {
+        writeHostPackage(target, "1.0.0");
+    }
+
+    /// Writes a versioned Java bootstrap Host package with its runtime declaration.
+    ///
+    /// @param target Host package path
+    /// @param version Host package and Provider descriptor version
+    /// @throws IOException if package creation fails
+    private static void writeHostPackage(Path target, String version) throws IOException {
         String manifest = """
                 {
                   "schemaVersion": 5,
                   "id": "%s",
                   "name": "Runtime Host",
-                  "version": "1.0.0",
+                  "version": "%s",
                   "type": "java",
                   "entrypoint": "%s",
                   "permissions": [],
@@ -168,7 +362,7 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
                     "features": ["bridge"]
                   }]
                 }
-                """.formatted(PackagedRuntimeProviderPlugin.PROVIDER_ID,
+                """.formatted(PackagedRuntimeProviderPlugin.PROVIDER_ID, version,
                 PackagedRuntimeProviderPlugin.class.getName());
         writePackage(target, manifest, PackagedRuntimeProviderPlugin.class, false);
     }
@@ -195,6 +389,58 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
                 }
                 """.formatted(PAYLOAD_ID);
         writePackage(target, manifest, null, true);
+    }
+
+    /// Writes an external payload whose entrypoint would be executable by the Java loader if fallback occurred.
+    ///
+    /// @param target payload package path
+    /// @throws IOException if package creation fails
+    private static void writeJavaBackedExternalPayloadPackage(Path target) throws IOException {
+        String manifest = """
+                {
+                  "schemaVersion": 5,
+                  "id": "%s",
+                  "name": "Unbound Runtime Payload",
+                  "version": "1.0.0",
+                  "type": "java",
+                  "entrypoint": "%s",
+                  "permissions": [],
+                  "requiredPermissions": [],
+                  "launcherVersion": "*",
+                  "runtime": "rust",
+                  "abi": 2,
+                  "executionMode": "embedded"
+                }
+                """.formatted(PAYLOAD_ID, PackagedTestPlugin.class.getName());
+        writePackage(target, manifest, PackagedTestPlugin.class, false);
+    }
+
+    /// Creates one compatibility-only Provider which is not owned by a runtime Host lifecycle.
+    ///
+    /// @return compatible Rust Provider
+    private static RuntimeProvider compatibleProvider() {
+        RuntimeProviderDescriptor descriptor = new RuntimeProviderDescriptor(
+                PackagedRuntimeProviderPlugin.PROVIDER_ID,
+                "1.0.0",
+                List.of(new RuntimeProviderDeclaration(
+                        "rust",
+                        Set.of(PluginAbi.ABI_2),
+                        1,
+                        Set.of(PluginExecutionMode.EMBEDDED),
+                        Set.of(RuntimeFeature.BRIDGE)
+                )),
+                true,
+                true,
+                0,
+                false
+        );
+        return new RuntimeProvider() {
+            /// Returns the compatibility-only descriptor.
+            @Override
+            public RuntimeProviderDescriptor descriptor() {
+                return descriptor;
+            }
+        };
     }
 
     /// Writes one deterministic test package and optional lifecycle class or payload entry.
@@ -274,5 +520,6 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
         registry.unregister(PackagedRuntimeProviderPlugin.PROVIDER_ID);
         System.clearProperty(PackagedRuntimeProviderPlugin.EVENTS_PROPERTY);
         System.clearProperty(PackagedRuntimeProviderPlugin.FAIL_HEALTH_PROPERTY);
+        System.clearProperty(PackagedRuntimeProviderPlugin.FAIL_UNLOAD_ONCE_PROPERTY);
     }
 }

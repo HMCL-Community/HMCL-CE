@@ -173,12 +173,12 @@ public final class PluginManagerLifecycleStateTest {
         }
     }
 
-    /// Preserves dependency enablement intent while a non-schema runtime incompatibility is temporary.
+    /// Preserves dependency enablement intent while an available external Provider remains unbound.
     ///
     /// @param temporaryDirectory isolated launcher home
     /// @throws IOException if package creation, state persistence, or discovery fails
     @Test
-    public void enableDependencyAfterMissingRuntimeProviderBecomesAvailable(
+    public void keepDependencyBlockedAfterUnboundRuntimeProviderBecomesAvailable(
             @TempDir Path temporaryDirectory
     ) throws IOException {
         Path localHome = temporaryDirectory.resolve("home");
@@ -212,10 +212,13 @@ public final class PluginManagerLifecycleStateTest {
             runtimeProviders.register(runtimeProvider(runtimeType, Set.of(PluginAbi.ABI_1)));
             FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
 
-            assertTrue(Objects.requireNonNull(manager.getPlugin(dependencyId)).isEnabled());
-            assertTrue(Objects.requireNonNull(manager.getPlugin(dependentId)).isEnabled());
-            assertEquals(PluginRuntimeStatus.ENABLED, manager.getPluginRuntimeStatus(dependencyId));
-            assertEquals(PluginRuntimeStatus.ENABLED, manager.getPluginRuntimeStatus(dependentId));
+            assertNull(manager.getPlugin(dependencyId));
+            assertNull(manager.getPlugin(dependentId));
+            assertTrue(manager.isPluginEnabled(dependentId));
+            assertTrue(manager.isPluginEnabled(dependencyId));
+            assertEquals(PluginRuntimeStatus.LOAD_FAILED, manager.getPluginRuntimeStatus(dependencyId));
+            assertTrue(Objects.requireNonNull(manager.getPluginRuntimeDetail(dependencyId))
+                    .contains("runtime Provider binding"));
         } finally {
             runtimeProviders.unregister(runtimeType);
         }

@@ -25,9 +25,11 @@ import org.jetbrains.annotations.Unmodifiable;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 /// Serializes external runtime Provider startup, payload delegation, rollback, and reverse-order shutdown.
 @NotNullByDefault
@@ -43,6 +45,9 @@ public final class RuntimeSupervisor {
 
     /// Active Host-owned registrations keyed by Provider plugin ID.
     private final Map<String, RuntimeProviderRegistration> registrations = new LinkedHashMap<>();
+
+    /// Provider Hosts whose plugin containers currently permit dependent callbacks.
+    private final Set<String> enabledHosts = new LinkedHashSet<>();
 
     /// Loaded payloads in insertion order for strict reverse teardown.
     private final Map<RuntimePayloadHandle, PayloadRecord> payloads = new LinkedHashMap<>();
@@ -124,6 +129,7 @@ public final class RuntimeSupervisor {
             synchronized (this) {
                 transitionFrom(providerId, RuntimeProviderState.INITIALIZED, RuntimeProviderState.HEALTHY);
                 transitionFrom(providerId, RuntimeProviderState.HEALTHY, RuntimeProviderState.READY);
+                enabledHosts.add(providerId);
             }
         } catch (IOException | RuntimeException | Error exception) {
             rollbackFailedRegistration(registration, exception);
@@ -155,8 +161,25 @@ public final class RuntimeSupervisor {
         requireCanonicalId(providerId);
         @Nullable RuntimeProviderState state = states.get(providerId);
         if (state != null && state != RuntimeProviderState.STOPPED && state != RuntimeProviderState.FAILED) {
+            enabledHosts.remove(providerId);
             transition(providerId, RuntimeProviderState.FAILED);
         }
+    }
+
+    /// Allows dependent callbacks after the owning Host container enables successfully.
+    ///
+    /// @param providerId canonical Host plugin ID
+    public synchronized void hostEnabled(String providerId) {
+        requireState(providerId, RuntimeProviderState.READY);
+        enabledHosts.add(providerId);
+    }
+
+    /// Blocks dependent callbacks while the owning Host container is disabled.
+    ///
+    /// @param providerId canonical Host plugin ID
+    public synchronized void hostDisabled(String providerId) {
+        requireCanonicalId(providerId);
+        enabledHosts.remove(providerId);
     }
 
     /// Loads one bound payload only after its selected Provider reaches `READY`.
@@ -305,6 +328,7 @@ public final class RuntimeSupervisor {
                 return;
             }
             transition(providerId, RuntimeProviderState.STOPPING);
+            enabledHosts.remove(providerId);
         }
 
         @Nullable IOException failure = null;
@@ -322,6 +346,7 @@ public final class RuntimeSupervisor {
         }
         synchronized (this) {
             registrations.remove(providerId);
+            enabledHosts.remove(providerId);
             try {
                 registry.unregister(providerId);
             } catch (RuntimeException exception) {
@@ -351,6 +376,7 @@ public final class RuntimeSupervisor {
         }
         synchronized (this) {
             registrations.remove(providerId);
+            enabledHosts.remove(providerId);
             try {
                 registry.unregister(providerId);
             } catch (RuntimeException cleanupFailure) {
@@ -367,7 +393,7 @@ public final class RuntimeSupervisor {
     /// @throws IOException if the Provider is absent or not ready
     private synchronized void requireReady(String providerId) throws IOException {
         @Nullable RuntimeProviderState state = states.get(providerId);
-        if (state != RuntimeProviderState.READY) {
+        if (state != RuntimeProviderState.READY || !enabledHosts.contains(providerId)) {
             throw new IOException("Runtime Provider is not ready: " + providerId + " (" + state + ")");
         }
     }

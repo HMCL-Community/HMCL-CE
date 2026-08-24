@@ -48,6 +48,24 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /// Verifies multi-provider registration, deterministic selection, and dependent-scoped bindings.
 @NotNullByDefault
 public final class RuntimeProviderRegistryTest {
+    /// Rejects restoration when exact Provider A is incompatible even though Provider B could satisfy the requirement.
+    @Test
+    public void restoreBindingAgainstExactProviderRequirement() {
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        registry.register(provider("dev.host.rust.bound", "rust", "1.0.0", true, true, 0, 1,
+                Set.of(PluginExecutionMode.ISOLATED), Set.of(RuntimeFeature.BRIDGE)));
+        registry.register(provider("dev.host.rust.fallback", "rust", "2.0.0", true, true, 0, 1,
+                Set.of(PluginExecutionMode.EMBEDDED), Set.of(RuntimeFeature.BRIDGE, RuntimeFeature.HOOKS)));
+        RuntimeProviderBinding binding = new RuntimeProviderBinding(
+                "dev.plugin.bound", "dev.host.rust.bound", "rust");
+        RuntimeRequirement requirement = new RuntimeRequirement(
+                "rust", PluginAbi.ABI_2, 1, PluginExecutionMode.EMBEDDED,
+                Set.of(RuntimeFeature.BRIDGE, RuntimeFeature.HOOKS), "dev.host.rust.bound");
+
+        assertThrows(IllegalStateException.class, () -> registry.restoreBinding(binding, requirement));
+        assertTrue(registry.bindingFor("dev.plugin.bound").isEmpty());
+    }
+
     /// Binds each dependent to its selected provider and prevents removal while the binding exists.
     @Test
     public void bindEachDependentToItsSelectedProvider() {
