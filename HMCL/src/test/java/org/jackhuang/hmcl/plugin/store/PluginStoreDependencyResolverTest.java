@@ -253,6 +253,67 @@ public final class PluginStoreDependencyResolverTest {
         assertTrue(exception.getMessage().contains("dev.test.rust-tool"));
     }
 
+    /// Falls back to the next ranked Provider when the preferred Host has an unsatisfied concrete dependency.
+    @Test
+    public void fallsBackWhenPreferredRuntimeProviderDependencyIsMissing() throws Exception {
+        @Unmodifiable Map<String, PluginStoreItem> catalog = runtimeFallbackCatalog(
+                "",
+                "[{\"id\":\"dev.test.missing-host-dependency\",\"version\":\"*\"}]"
+        );
+
+        PluginInstallPlan plan = new PluginStoreDependencyResolver(catalog, configuredSources(catalog))
+                .resolveInstallPlan(
+                        "dev.test.fallback-rust-tool",
+                        runtimeVersion(catalog, "dev.test.fallback-rust-tool"),
+                        Map.of(), Map.of(), Map.of()
+                );
+
+        assertEquals(List.of("dev.test.fallback-rust-host", "dev.test.fallback-rust-tool"),
+                plan.getEntries().stream().map(PluginInstallPlan.Entry::getPluginId).toList());
+        assertEquals("dev.test.fallback-rust-host",
+                Objects.requireNonNull(plan.getRuntimeBindings().get("dev.test.fallback-rust-tool")).providerId());
+    }
+
+    /// Falls back without retaining a failed binding when the preferred Host forms a mixed runtime/concrete cycle.
+    @Test
+    public void fallsBackWhenPreferredRuntimeProviderFormsMixedCycle() throws Exception {
+        @Unmodifiable Map<String, PluginStoreItem> catalog = runtimeFallbackCatalog(
+                "",
+                "[{\"id\":\"dev.test.fallback-rust-tool\",\"version\":\"*\"}]"
+        );
+
+        PluginInstallPlan plan = new PluginStoreDependencyResolver(catalog, configuredSources(catalog))
+                .resolveInstallPlan(
+                        "dev.test.fallback-rust-tool",
+                        runtimeVersion(catalog, "dev.test.fallback-rust-tool"),
+                        Map.of(), Map.of(), Map.of()
+                );
+
+        assertEquals(List.of("dev.test.fallback-rust-host", "dev.test.fallback-rust-tool"),
+                plan.getEntries().stream().map(PluginInstallPlan.Entry::getPluginId).toList());
+        assertEquals("dev.test.fallback-rust-host",
+                Objects.requireNonNull(plan.getRuntimeBindings().get("dev.test.fallback-rust-tool")).providerId());
+    }
+
+    /// Keeps a pinned Provider fail-closed when its concrete dependency graph cannot be satisfied.
+    @Test
+    public void pinnedRuntimeProviderWithMissingDependencyDoesNotFallBack() throws Exception {
+        @Unmodifiable Map<String, PluginStoreItem> catalog = runtimeFallbackCatalog(
+                "dev.test.preferred-rust-host",
+                "[{\"id\":\"dev.test.missing-host-dependency\",\"version\":\"*\"}]"
+        );
+
+        IOException exception = assertThrows(IOException.class, () -> new PluginStoreDependencyResolver(
+                catalog, configuredSources(catalog))
+                .resolveInstallPlan(
+                        "dev.test.fallback-rust-tool",
+                        runtimeVersion(catalog, "dev.test.fallback-rust-tool"),
+                        Map.of(), Map.of(), Map.of()
+                ));
+
+        assertTrue(Objects.requireNonNull(exception.getMessage()).contains("dev.test.missing-host-dependency"));
+    }
+
     /// Requires a separate receipt when the only compatible Host comes from a custom source.
     @Test
     public void customSourceRuntimeProviderRequiresConfirmation() throws Exception {
@@ -1325,6 +1386,73 @@ public final class PluginStoreDependencyResolverTest {
         return Map.copyOf(items);
     }
 
+    /// Builds a Rust consumer with a higher-version preferred Host and a valid lower-version fallback Host.
+    ///
+    /// @param providerPin optional preferred Provider pin, or an empty string for ranked selection
+    /// @param preferredDependenciesJson concrete dependency array for the preferred Provider
+    /// @return immutable source-priority catalog
+    /// @throws IOException if generated Store metadata is invalid
+    private static @Unmodifiable Map<String, PluginStoreItem> runtimeFallbackCatalog(
+            String providerPin,
+            String preferredDependenciesJson
+    ) throws IOException {
+        String target = PluginPlatformTarget.current().getId();
+        PluginStoreRegistry registry = Objects.requireNonNull(JsonUtils.GSON.fromJson("""
+                {"schemaVersion":1,"name":"Runtime Fallback","plugins":[
+                  {"id":"dev.test.fallback-rust-tool","name":"Rust Tool",
+                   "manifestUrl":"https://example.com/rust-tool.json"},
+                  {"id":"dev.test.preferred-rust-host","name":"Preferred Rust Host",
+                   "manifestUrl":"https://example.com/preferred-rust-host.json"},
+                  {"id":"dev.test.fallback-rust-host","name":"Fallback Rust Host",
+                   "manifestUrl":"https://example.com/fallback-rust-host.json"}
+                ]}
+                """, PluginStoreRegistry.class));
+        registry.validate();
+        PluginStoreManifest rootManifest = parseRuntimeStoreManifest("dev.test.fallback-rust-tool", """
+                "runtime": "rust", "abi": 2, "pluginKind": "normal", "executionMode": "embedded",
+                %s
+                "artifacts": [{"platform": "%s", "packageUrl": "https://example.com/rust-tool.npl",
+                  "sha256": "%s", "size": 17}]
+                """.formatted(
+                providerPin.isEmpty() ? "" : "\"runtimeProvider\": \"" + providerPin + "\",",
+                target,
+                "a".repeat(64)
+        ));
+        String providerDeclarations = """
+                "runtime": "java", "abi": 2, "pluginKind": "runtime-provider",
+                "providesRuntimes": [{"runtime": "rust", "abis": [2], "bridgeAbi": 1,
+                  "executionModes": ["embedded"], "features": ["bridge"]}],
+                "dependencies": %s,
+                "artifacts": [{"platform": "%s", "packageUrl": "https://example.com/rust-host.npl",
+                  "sha256": "%s", "size": 41}]
+                """;
+        PluginStoreManifest preferredManifest = parseRuntimeStoreManifestVersion(
+                "dev.test.preferred-rust-host",
+                "2.0.0",
+                providerDeclarations.formatted(preferredDependenciesJson, target, "b".repeat(64))
+        );
+        PluginStoreManifest fallbackManifest = parseRuntimeStoreManifestVersion(
+                "dev.test.fallback-rust-host",
+                "1.0.0",
+                providerDeclarations.formatted("[]", target, "c".repeat(64))
+        );
+        for (PluginStoreManifest manifest : List.of(rootManifest, preferredManifest, fallbackManifest)) {
+            manifest.getVersions().get(0).setTrust(PluginTrustResult.official("runtime-fallback-key"));
+        }
+        PluginSource source = new PluginSource(
+                "official", "https://example.com/official.json", "Official", true, true
+        );
+        PluginStoreManager manager = new PluginStoreManager();
+        Map<String, PluginStoreItem> items = new LinkedHashMap<>();
+        items.put("dev.test.fallback-rust-tool", new PluginStoreItem(
+                source, registry, manager, registry.getPlugins().get(0), rootManifest));
+        items.put("dev.test.preferred-rust-host", new PluginStoreItem(
+                source, registry, manager, registry.getPlugins().get(1), preferredManifest));
+        items.put("dev.test.fallback-rust-host", new PluginStoreItem(
+                source, registry, manager, registry.getPlugins().get(2), fallbackManifest));
+        return Map.copyOf(items);
+    }
+
     /// Parses one schema-v5 Store version with exact current-platform artifacts.
     ///
     /// @param pluginId repository plugin ID
@@ -1335,12 +1463,27 @@ public final class PluginStoreDependencyResolverTest {
             String pluginId,
             String declarations
     ) throws IOException {
+        return parseRuntimeStoreManifestVersion(pluginId, "1.0.0", declarations);
+    }
+
+    /// Parses one schema-v5 Store version with an explicit version and exact current-platform artifacts.
+    ///
+    /// @param pluginId repository plugin ID
+    /// @param version package version
+    /// @param declarations runtime role and artifact declarations
+    /// @return validated repository manifest
+    /// @throws IOException if generated metadata violates Store validation
+    private static PluginStoreManifest parseRuntimeStoreManifestVersion(
+            String pluginId,
+            String version,
+            String declarations
+    ) throws IOException {
         return PluginStoreManifest.fromJson(JsonUtils.GSON.fromJson("""
                 {
                   "schemaVersion": 2,
                   "id": "%s",
                   "versions": [{
-                    "version": "1.0.0",
+                    "version": "%s",
                     "pluginApiVersion": 5,
                     "permissions": [],
                     "requiredPermissions": [],
@@ -1350,7 +1493,7 @@ public final class PluginStoreDependencyResolverTest {
                     %s
                   }]
                 }
-                """.formatted(pluginId, PluginPlatformTarget.current().getId(), declarations),
+                """.formatted(pluginId, version, PluginPlatformTarget.current().getId(), declarations),
                 com.google.gson.JsonElement.class), pluginId);
     }
 

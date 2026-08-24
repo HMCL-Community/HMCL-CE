@@ -213,6 +213,7 @@ public final class PluginStoreDependencyResolver {
     /// @param rootPluginId requested root plugin ID
     /// @param installedManifests installed manifest snapshot
     /// @param reusableInstalledPluginIds installed artifacts eligible for exact reuse
+    /// @param activatableInstalledPluginIds installed artifacts eligible for atomic enablement
     /// @param solution mutable complete concrete package selection
     /// @param runtimeBindings mutable virtual bindings indexed by dependent ID
     /// @param failures solver diagnostics
@@ -226,64 +227,134 @@ public final class PluginStoreDependencyResolver {
             Map<String, RuntimeProviderBinding> runtimeBindings,
             List<IOException> failures
     ) throws IOException {
-        while (true) {
-            @Nullable PluginInstallPlan.Entry dependent = solution.values().stream()
-                    .filter(entry -> !entry.isRuntimeProvider())
-                    .filter(entry -> !PluginRuntimeTypes.JAVA.equals(entry.getRuntimeRequirement().getRuntime()))
-                    .filter(entry -> !runtimeBindings.containsKey(entry.getPluginId()))
-                    .findFirst()
-                    .orElse(null);
-            if (dependent == null) {
-                return;
+        List<IOException> runtimeFailures = new ArrayList<>();
+        if (!solveRuntimeProviderSelections(
+                rootPluginId,
+                installedManifests,
+                reusableInstalledPluginIds,
+                activatableInstalledPluginIds,
+                solution,
+                runtimeBindings,
+                runtimeFailures
+        )) {
+            failures.addAll(runtimeFailures);
+            throw runtimeFailures.isEmpty()
+                    ? new IOException("Runtime Provider dependency graph cannot be satisfied")
+                    : runtimeFailures.get(runtimeFailures.size() - 1);
+        }
+    }
+
+    /// Searches ranked Provider candidates without publishing a partial concrete selection or virtual binding.
+    ///
+    /// Each candidate branch resolves the Provider's complete concrete closure, recursively resolves any virtual
+    /// requirements introduced by that closure, and validates the combined graph before committing its snapshots.
+    ///
+    /// @param rootPluginId requested root plugin ID
+    /// @param installedManifests installed manifest snapshot
+    /// @param reusableInstalledPluginIds installed artifacts eligible for exact reuse
+    /// @param activatableInstalledPluginIds installed artifacts eligible for atomic enablement
+    /// @param solution mutable concrete selection committed only when a complete branch succeeds
+    /// @param runtimeBindings mutable virtual bindings committed only when a complete branch succeeds
+    /// @param failures branch diagnostics retained for the final error
+    /// @return whether a complete concrete and virtual graph was found
+    private boolean solveRuntimeProviderSelections(
+            String rootPluginId,
+            @Unmodifiable Map<String, PluginManifest> installedManifests,
+            @Unmodifiable Set<String> reusableInstalledPluginIds,
+            @Unmodifiable Set<String> activatableInstalledPluginIds,
+            Map<String, PluginInstallPlan.Entry> solution,
+            Map<String, RuntimeProviderBinding> runtimeBindings,
+            List<IOException> failures
+    ) {
+        @Nullable PluginInstallPlan.Entry dependent = solution.values().stream()
+                .filter(entry -> !entry.isRuntimeProvider())
+                .filter(entry -> !PluginRuntimeTypes.JAVA.equals(entry.getRuntimeRequirement().getRuntime()))
+                .filter(entry -> !runtimeBindings.containsKey(entry.getPluginId()))
+                .findFirst()
+                .orElse(null);
+        if (dependent == null) {
+            try {
+                buildDependencyOrder(rootPluginId, solution, runtimeBindings);
+                return true;
+            } catch (IOException exception) {
+                failures.add(exception);
+                return false;
             }
-            RuntimeRequirement requirement = dependent.getRuntimeRequirement();
-            ProviderCandidate provider = selectRuntimeProvider(
+        }
+
+        RuntimeRequirement requirement = dependent.getRuntimeRequirement();
+        @Unmodifiable List<ProviderCandidate> candidates;
+        try {
+            candidates = getRuntimeProviderCandidates(
                     requirement,
                     installedManifests,
                     reusableInstalledPluginIds,
                     activatableInstalledPluginIds,
                     solution
             );
-            @Nullable PluginInstallPlan.Entry existing = solution.get(provider.entry.getPluginId());
+        } catch (IOException exception) {
+            failures.add(exception);
+            return false;
+        }
+
+        for (ProviderCandidate provider : candidates) {
+            // A rejected branch must not leak its package choices or bindings into the next ranked candidate.
+            Map<String, PluginInstallPlan.Entry> candidateSelection = new LinkedHashMap<>(solution);
+            @Nullable PluginInstallPlan.Entry existing = candidateSelection.get(provider.entry.getPluginId());
             if (existing != null && (!existing.getVersion().equals(provider.entry.getVersion())
                     || existing.getAction() != provider.entry.getAction())) {
-                throw new IOException("Runtime Provider selection conflicts with package selection for "
-                        + provider.entry.getPluginId());
+                failures.add(new IOException("Runtime Provider selection conflicts with package selection for "
+                        + provider.entry.getPluginId()));
+                continue;
             }
-            solution.putIfAbsent(provider.entry.getPluginId(), provider.entry);
-            runtimeBindings.put(dependent.getPluginId(), new RuntimeProviderBinding(
-                    dependent.getPluginId(),
-                    provider.entry.getPluginId(),
-                    requirement.getRuntime()
-            ));
+            candidateSelection.putIfAbsent(provider.entry.getPluginId(), provider.entry);
+            Map<String, RuntimeProviderBinding> candidateBindings = new LinkedHashMap<>(runtimeBindings);
+            candidateBindings.put(dependent.getPluginId(), new RuntimeProviderBinding(
+                    dependent.getPluginId(), provider.entry.getPluginId(), requirement.getRuntime()));
 
             Map<String, PluginInstallPlan.Entry> expanded = new LinkedHashMap<>();
-            if (!solvePlanSelections(
+            List<IOException> candidateFailures = new ArrayList<>();
+            if (solvePlanSelections(
                     rootPluginId,
                     installedManifests,
                     reusableInstalledPluginIds,
-                    new LinkedHashMap<>(solution),
+                    candidateSelection,
                     expanded,
-                    failures
+                    candidateFailures
+            ) && solveRuntimeProviderSelections(
+                    rootPluginId,
+                    installedManifests,
+                    reusableInstalledPluginIds,
+                    activatableInstalledPluginIds,
+                    expanded,
+                    candidateBindings,
+                    candidateFailures
             )) {
-                throw failures.isEmpty()
-                        ? new IOException("Runtime Provider dependency graph cannot be satisfied")
-                        : failures.get(failures.size() - 1);
+                solution.clear();
+                solution.putAll(expanded);
+                runtimeBindings.clear();
+                runtimeBindings.putAll(candidateBindings);
+                return true;
             }
-            solution.clear();
-            solution.putAll(expanded);
+            if (candidateFailures.isEmpty()) {
+                candidateFailures.add(new IOException("Runtime Provider dependency graph cannot be satisfied for "
+                        + provider.entry.getPluginId()));
+            }
+            failures.addAll(candidateFailures);
         }
+        return false;
     }
 
-    /// Selects one compatible installed or remote Provider and retains its concrete plan entry.
+    /// Returns all compatible installed or remote Providers in deterministic selection order.
     ///
     /// @param requirement dependent runtime requirement
     /// @param installedManifests installed manifest snapshot
     /// @param reusableInstalledPluginIds installed artifacts eligible for exact reuse
+    /// @param activatableInstalledPluginIds installed artifacts eligible for atomic enablement
     /// @param selected current package selection
-    /// @return selected Provider candidate
+    /// @return immutable ordered Provider candidates
     /// @throws IOException if no Provider satisfies the requirement
-    private ProviderCandidate selectRuntimeProvider(
+    private @Unmodifiable List<ProviderCandidate> getRuntimeProviderCandidates(
             RuntimeRequirement requirement,
             @Unmodifiable Map<String, PluginManifest> installedManifests,
             @Unmodifiable Set<String> reusableInstalledPluginIds,
@@ -344,19 +415,29 @@ public final class PluginStoreDependencyResolver {
                 }
             }
         }
-        Optional<RuntimeProviderDescriptor> selectedDescriptor = runtimeProviderSelector.select(
-                requirement,
-                candidates.stream().map(candidate -> candidate.descriptor).toList()
-        );
-        if (selectedDescriptor.isEmpty()) {
-            @Nullable String pin = requirement.getPinnedProviderId();
+        @Nullable String pin = requirement.getPinnedProviderId();
+        @Unmodifiable List<RuntimeProviderDescriptor> orderedDescriptors = pin == null
+                ? runtimeProviderSelector.ordered(candidates.stream().map(candidate -> candidate.descriptor).toList())
+                : candidates.stream().map(candidate -> candidate.descriptor)
+                        .filter(descriptor -> pin.equals(descriptor.providerId()))
+                        .toList();
+        List<ProviderCandidate> orderedCandidates = new ArrayList<>();
+        for (RuntimeProviderDescriptor descriptor : orderedDescriptors) {
+            if (!runtimeProviderSelector.isCompatible(descriptor, requirement)) {
+                continue;
+            }
+            // orderedDescriptors contains the exact descriptor instances created beside their plan entries above.
+            candidates.stream()
+                    .filter(candidate -> candidate.descriptor == descriptor)
+                    .findFirst()
+                    .ifPresent(orderedCandidates::add);
+        }
+        if (orderedCandidates.isEmpty()) {
             throw new IOException(pin == null
                     ? "No compatible runtime Provider for " + requirement.getRuntime()
                     : "Pinned runtime Provider " + pin + " cannot satisfy " + requirement.getRuntime());
         }
-        RuntimeProviderDescriptor descriptor = selectedDescriptor.orElseThrow();
-        return candidates.stream().filter(candidate -> candidate.descriptor.equals(descriptor)).findFirst()
-                .orElseThrow(() -> new IllegalStateException("Selected runtime Provider candidate was lost"));
+        return List.copyOf(orderedCandidates);
     }
 
     /// Returns one winning item's zero-based source priority.

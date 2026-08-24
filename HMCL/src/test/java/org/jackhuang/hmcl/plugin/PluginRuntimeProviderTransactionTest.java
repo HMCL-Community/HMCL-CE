@@ -161,6 +161,49 @@ public final class PluginRuntimeProviderTransactionTest {
         assertEquals("rust", binding.runtime());
     }
 
+    /// Rejects a replacement batch whose runtime and concrete dependency edges form one mixed cycle.
+    ///
+    /// @param temporaryDirectory isolated launcher home and package sources
+    /// @throws Exception if package creation, inspection, or graph validation fails unexpectedly
+    @Test
+    public void rejectsMixedRuntimeAndConcreteReplacementCycle(@TempDir Path temporaryDirectory) throws Exception {
+        Path localHome = temporaryDirectory.resolve("home");
+        PluginManager manager = new PluginManager(localHome);
+        String dependentId = "dev.test.mixed-cycle-dependent";
+        String providerId = "dev.test.mixed-cycle-provider";
+        Path dependentPackage = temporaryDirectory.resolve("dependent.npl");
+        Path providerPackage = temporaryDirectory.resolve("provider.npl");
+        writeRuntimeConsumerPackage(dependentPackage, dependentId);
+        writeRuntimeProviderPackage(
+                providerPackage,
+                providerId,
+                2,
+                "[{\"id\":\"" + dependentId + "\",\"version\":\"*\"}]"
+        );
+        LocalPluginInspection dependentInspection = manager.inspectStorePluginPackage(dependentPackage);
+        LocalPluginInspection providerInspection = manager.inspectStorePluginPackage(providerPackage);
+        PluginRuntimeInstallAuthorization authorization = new PluginRuntimeInstallAuthorization(
+                Map.of(dependentId, new RuntimeProviderBinding(dependentId, providerId, "rust")),
+                Set.of(), Set.of(), Set.of(), Set.of(), Set.of(),
+                Map.of(
+                        dependentId, PluginPackageRuntimeContract.fromManifest(dependentInspection.getManifest()),
+                        providerId, PluginPackageRuntimeContract.fromManifest(providerInspection.getManifest())
+                )
+        );
+
+        IOException exception = assertThrows(IOException.class, () -> manager.stagePluginInstallations(
+                List.of(providerInspection, dependentInspection),
+                Map.of(providerId, Set.of(), dependentId, Set.of()),
+                Map.of(),
+                Map.of(providerId, Optional.empty(), dependentId, Optional.empty()),
+                Map.of(),
+                authorization
+        ));
+
+        assertTrue(Objects.requireNonNull(exception.getMessage()).contains("Cyclic"));
+        assertNoRuntimeTransactionState(localHome, manager, providerId, dependentId);
+    }
+
     /// Rejects a Java package when the confirmed Store contract selected a Rust consumer.
     ///
     /// @param temporaryDirectory isolated launcher-local home and package source
@@ -668,12 +711,28 @@ public final class PluginRuntimeProviderTransactionTest {
     /// @throws IOException if package creation fails
     private static void writeRuntimeProviderPackage(Path target, String pluginId, int providedAbi)
             throws IOException {
+        writeRuntimeProviderPackage(target, pluginId, providedAbi, "[]");
+    }
+
+    /// Writes a schema-v5 Java Runtime Host with one explicit concrete dependency array.
+    ///
+    /// @param target target package path
+    /// @param pluginId Provider plugin ID
+    /// @param providedAbi provided Rust plugin ABI
+    /// @param dependenciesJson concrete dependency array JSON
+    /// @throws IOException if package creation fails
+    private static void writeRuntimeProviderPackage(
+            Path target,
+            String pluginId,
+            int providedAbi,
+            String dependenciesJson
+    ) throws IOException {
         writePackage(target, pluginId, "1.0.0", """
                 "runtime": "java", "abi": 2, "pluginKind": "runtime-provider",
                 "executionMode": "embedded", "platforms": [],
                 "providesRuntimes": [{"runtime": "rust", "abis": [%s], "bridgeAbi": 1,
                   "executionModes": ["embedded"], "features": ["bridge"]}]
-                """.formatted(providedAbi));
+                """.formatted(providedAbi), dependenciesJson);
     }
 
     /// Writes a schema-v5 embedded Rust ABI 2 consumer package.
@@ -741,18 +800,37 @@ public final class PluginRuntimeProviderTransactionTest {
     /// @throws IOException if package creation fails
     private static void writePackage(Path target, String pluginId, String version, String declarations)
             throws IOException {
+        writePackage(target, pluginId, version, declarations, "[]");
+    }
+
+    /// Writes one executable test package with optional schema-v5 declarations and concrete dependencies.
+    ///
+    /// @param target target package path
+    /// @param pluginId plugin ID
+    /// @param version package version
+    /// @param declarations schema-v5 declarations, or blank for API v4
+    /// @param dependenciesJson concrete dependency array JSON
+    /// @throws IOException if package creation fails
+    private static void writePackage(
+            Path target,
+            String pluginId,
+            String version,
+            String declarations,
+            String dependenciesJson
+    ) throws IOException {
         Files.createDirectories(Objects.requireNonNull(target.getParent()));
         boolean schemaFive = !declarations.isBlank();
         String manifest = """
                 {"schemaVersion": %s, "id": "%s", "name": "Runtime Transaction Test",
                  "version": "%s", "type": "java", "entrypoint": "%s",
                  "permissions": [], "requiredPermissions": [], "launcherVersion": "*",
-                 "dependencies": []%s}
+                 "dependencies": %s%s}
                 """.formatted(
                 schemaFive ? 5 : 4,
                 pluginId,
                 version,
                 PackagedTestPlugin.class.getName(),
+                dependenciesJson,
                 schemaFive ? "," + declarations : ""
         );
         try (ZipOutputStream output = new ZipOutputStream(Files.newOutputStream(target))) {

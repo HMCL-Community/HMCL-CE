@@ -27,6 +27,7 @@ import org.jetbrains.annotations.Unmodifiable;
 import java.io.IOException;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -93,9 +94,17 @@ final class PluginDependencyPlanner {
             Set<String> replacementIds,
             @Unmodifiable Map<String, RuntimeProviderBinding> runtimeBindings
     ) throws IOException {
+        Set<String> validationRoots = new LinkedHashSet<>(replacementIds);
+        // Provider replacements can affect bound dependents that are not themselves part of the replacement batch.
+        runtimeBindings.values().stream()
+                .filter(binding -> replacementIds.contains(binding.dependentPluginId())
+                        || replacementIds.contains(binding.providerId()))
+                .map(RuntimeProviderBinding::dependentPluginId)
+                .filter(manifests::containsKey)
+                .forEach(validationRoots::add);
         Set<String> visited = new HashSet<>();
-        for (String pluginId : replacementIds) {
-            validateDependencyClosure(pluginId, manifests, new HashSet<>(), visited);
+        for (String pluginId : validationRoots) {
+            validateDependencyClosure(pluginId, manifests, runtimeBindings, new HashSet<>(), visited);
         }
         for (PluginManifest manifest : manifests.values()) {
             if (replacementIds.contains(manifest.getId())) {
@@ -211,12 +220,14 @@ final class PluginDependencyPlanner {
     ///
     /// @param pluginId closure root
     /// @param manifests installed manifests indexed by ID
+    /// @param runtimeBindings complete prospective virtual runtime edges
     /// @param visiting IDs on the current traversal stack
     /// @param visited IDs already validated
     /// @throws IOException if the dependency closure is invalid
     private static void validateDependencyClosure(
             String pluginId,
             Map<String, PluginManifest> manifests,
+            @Unmodifiable Map<String, RuntimeProviderBinding> runtimeBindings,
             Set<String> visiting,
             Set<String> visited
     ) throws IOException {
@@ -242,7 +253,15 @@ final class PluginDependencyPlanner {
                 throw new IOException("Plugin " + pluginId + " requires dependency " + dependency.getId()
                         + " " + dependency.getVersion() + " but found " + installedDependency.getVersion());
             }
-            validateDependencyClosure(dependency.getId(), manifests, visiting, visited);
+            validateDependencyClosure(dependency.getId(), manifests, runtimeBindings, visiting, visited);
+        }
+        @Nullable RuntimeProviderBinding runtimeBinding = runtimeBindings.get(pluginId);
+        if (runtimeBinding != null) {
+            if (!manifests.containsKey(runtimeBinding.providerId())) {
+                throw new IOException("Plugin " + pluginId + " requires missing runtime Provider "
+                        + runtimeBinding.providerId());
+            }
+            validateDependencyClosure(runtimeBinding.providerId(), manifests, runtimeBindings, visiting, visited);
         }
         visiting.remove(pluginId);
         visited.add(pluginId);
