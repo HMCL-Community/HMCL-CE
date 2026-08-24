@@ -20,14 +20,23 @@ package org.jackhuang.hmcl.game;
 import org.jackhuang.hmcl.Metadata;
 import org.jackhuang.hmcl.auth.AuthInfo;
 import org.jackhuang.hmcl.launch.DefaultLauncher;
+import org.jackhuang.hmcl.launch.LaunchExecutionMode;
 import org.jackhuang.hmcl.launch.ProcessListener;
+import org.jackhuang.hmcl.plugin.GameLaunchHookCoordinator;
+import org.jackhuang.hmcl.plugin.PluginDataObject;
+import org.jackhuang.hmcl.plugin.PluginDataValue;
+import org.jackhuang.hmcl.plugin.PluginHookDispatchException;
 import org.jackhuang.hmcl.util.NativePatcher;
 import org.jackhuang.hmcl.util.i18n.LocaleUtils;
 import org.jackhuang.hmcl.util.io.FileUtils;
 import org.jackhuang.hmcl.util.io.JarUtils;
+import org.jackhuang.hmcl.util.platform.Architecture;
 import org.jackhuang.hmcl.util.platform.CommandBuilder;
 import org.jackhuang.hmcl.util.platform.ManagedProcess;
+import org.jackhuang.hmcl.util.platform.OperatingSystem;
 import org.jackhuang.hmcl.util.versioning.GameVersionNumber;
+import org.jetbrains.annotations.NotNullByDefault;
+import org.jetbrains.annotations.Nullable;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -37,23 +46,84 @@ import java.util.stream.Stream;
 
 import static org.jackhuang.hmcl.util.logging.Logger.LOG;
 
-/**
- * @author huangyuhui
- */
+/// Adapts HMCL-specific launch metadata and resource preparation to the launcher-neutral execution pipeline.
+@NotNullByDefault
 public final class HMCLGameLauncher extends DefaultLauncher {
+    /// Launch Hook coordinator used by both direct execution and script rendering.
+    private final GameLaunchHookCoordinator hookCoordinator;
 
+    /// Creates a launcher without a process listener.
+    ///
+    /// @param repository game repository
+    /// @param manifest resolved launch manifest
+    /// @param authInfo authenticated account information
+    /// @param options launch options
     public HMCLGameLauncher(GameRepository repository, GameInstanceManifest manifest, AuthInfo authInfo, LaunchOptions options) {
         this(repository, manifest, authInfo, options, null);
     }
 
-    public HMCLGameLauncher(GameRepository repository, GameInstanceManifest manifest, AuthInfo authInfo, LaunchOptions options, ProcessListener listener) {
+    /// Creates a launcher with an optional process listener.
+    ///
+    /// @param repository game repository
+    /// @param manifest resolved launch manifest
+    /// @param authInfo authenticated account information
+    /// @param options launch options
+    /// @param listener optional process listener
+    public HMCLGameLauncher(
+            GameRepository repository,
+            GameInstanceManifest manifest,
+            AuthInfo authInfo,
+            LaunchOptions options,
+            @Nullable ProcessListener listener
+    ) {
         this(repository, manifest, authInfo, options, listener, true);
     }
 
-    public HMCLGameLauncher(GameRepository repository, GameInstanceManifest manifest, AuthInfo authInfo, LaunchOptions options, ProcessListener listener, boolean daemon) {
-        super(repository, manifest, authInfo, options, listener, daemon);
+    /// Creates a launcher with explicit process-monitor daemon behavior.
+    ///
+    /// @param repository game repository
+    /// @param manifest resolved launch manifest
+    /// @param authInfo authenticated account information
+    /// @param options launch options
+    /// @param listener optional process listener
+    /// @param daemon whether process monitors use daemon threads
+    public HMCLGameLauncher(
+            GameRepository repository,
+            GameInstanceManifest manifest,
+            AuthInfo authInfo,
+            LaunchOptions options,
+            @Nullable ProcessListener listener,
+            boolean daemon
+    ) {
+        this(repository, manifest, authInfo, options, listener, daemon,
+                GameLaunchHookCoordinator.getInstance());
     }
 
+    /// Creates an injectable launcher for Hook pipeline tests.
+    ///
+    /// @param repository game repository
+    /// @param manifest resolved launch manifest
+    /// @param authInfo authenticated account information
+    /// @param options launch options
+    /// @param listener optional process listener
+    /// @param daemon whether process monitors use daemon threads
+    /// @param hookCoordinator launch Hook coordinator
+    HMCLGameLauncher(
+            GameRepository repository,
+            GameInstanceManifest manifest,
+            AuthInfo authInfo,
+            LaunchOptions options,
+            @Nullable ProcessListener listener,
+            boolean daemon,
+            GameLaunchHookCoordinator hookCoordinator
+    ) {
+        super(repository, manifest, authInfo, options, listener, daemon);
+        this.hookCoordinator = Objects.requireNonNull(hookCoordinator, "hookCoordinator");
+    }
+
+    /// Adds HMCL branding substitutions to the base launch configuration.
+    ///
+    /// @return mutable configuration map used during command generation
     @Override
     protected Map<String, String> getConfigurations() {
         Map<String, String> res = super.getConfigurations();
@@ -62,6 +132,7 @@ public final class HMCLGameLauncher extends DefaultLauncher {
         return res;
     }
 
+    /// Creates a default language option file only when the instance has no existing language configuration.
     private void generateOptionsTxt() {
         if (options.isDisableAutoGameOptions())
             return;
@@ -110,6 +181,11 @@ public final class HMCLGameLauncher extends DefaultLauncher {
         }
     }
 
+    /// Selects the legacy or modern Minecraft language identifier for one locale and game version.
+    ///
+    /// @param locale host locale
+    /// @param gameVersion resolved game version
+    /// @return normalized language identifier, or an empty string when no override is appropriate
     private static String normalizedLanguageTag(Locale locale, GameVersionNumber gameVersion) {
         String region = locale.getCountry();
 
@@ -142,18 +218,60 @@ public final class HMCLGameLauncher extends DefaultLauncher {
         };
     }
 
+    /// Coordinates before Hooks and executes the resulting direct process plan.
+    ///
+    /// @return managed game process
+    /// @throws IOException if preparation, Hook coordination, or process creation fails
+    /// @throws InterruptedException if an auxiliary process is interrupted
     @Override
     public ManagedProcess launch() throws IOException, InterruptedException {
         generateOptionsTxt();
-        return super.launch();
+        GameLaunchHookCoordinator.LaunchSession session = coordinateLaunch(LaunchExecutionMode.DIRECT);
+        return executeLaunch(session.preparation(), listener);
     }
 
+    /// Coordinates before Hooks and renders the resulting script process plan.
+    ///
+    /// @param scriptFile target script path
+    /// @throws IOException if preparation, Hook coordination, or rendering fails
     @Override
     public void makeLaunchScript(Path scriptFile) throws IOException {
         generateOptionsTxt();
-        super.makeLaunchScript(scriptFile);
+        GameLaunchHookCoordinator.LaunchSession session = coordinateLaunch(LaunchExecutionMode.SCRIPT);
+        renderLaunchScript(session.preparation(), scriptFile);
     }
 
+    /// Prepares and coordinates one launch before any auxiliary process or native extraction begins.
+    ///
+    /// @param mode direct or script mode
+    /// @return transformed launch session
+    /// @throws IOException if preparation or Hook coordination fails
+    private GameLaunchHookCoordinator.LaunchSession coordinateLaunch(LaunchExecutionMode mode) throws IOException {
+        try {
+            return hookCoordinator.beforeLaunch(prepareLaunch(mode), launchMetadata(mode));
+        } catch (PluginHookDispatchException failure) {
+            throw new GameLaunchHookIOException(failure);
+        }
+    }
+
+    /// Creates immutable launcher and host metadata that plugins cannot replace.
+    ///
+    /// @param mode direct or script execution mode
+    /// @return immutable launch metadata
+    private PluginDataObject launchMetadata(LaunchExecutionMode mode) {
+        return PluginDataObject.of(Map.of(
+                "instanceId", PluginDataValue.string(manifest.id().id()),
+                "gameVersion", PluginDataValue.string(repository.getGameVersion(manifest).orElse("unknown")),
+                "launcherVersion", PluginDataValue.string(Metadata.VERSION),
+                "hostOs", PluginDataValue.string(OperatingSystem.CURRENT_OS.getCheckedName()),
+                "hostArchitecture", PluginDataValue.string(Architecture.SYSTEM_ARCH.getCheckedName()),
+                "executionMode", PluginDataValue.string(mode.name().toLowerCase(Locale.ROOT))
+        ));
+    }
+
+    /// Appends HMCL-specific JVM agents after the base JVM arguments.
+    ///
+    /// @param result mutable command builder
     @Override
     protected void appendJvmArgs(CommandBuilder result) {
         super.appendJvmArgs(result);
@@ -171,6 +289,10 @@ public final class HMCLGameLauncher extends DefaultLauncher {
         }
     }
 
+    /// Extracts the bundled LWJGL unsafe agent when the launch requires it.
+    ///
+    /// @return absolute agent path
+    /// @throws IOException if the embedded agent is missing or cannot be written
     private Path extractLwjglUnsafeAgent() throws IOException {
         String agentVersion = JarUtils.getAttribute("hmcl.lwjgl-unsafe-agent.version", null);
         if (agentVersion == null) {

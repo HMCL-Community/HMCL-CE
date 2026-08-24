@@ -72,6 +72,28 @@ final class GameLaunchSecretStore {
         return Collections.unmodifiableSet(new LinkedHashSet<>(secrets.keySet()));
     }
 
+    /// Returns an immutable snapshot of currently committed slot values for final launcher use.
+    ///
+    /// @return immutable secret value snapshot
+    synchronized @Unmodifiable Map<String, String> snapshot() {
+        return Collections.unmodifiableMap(new LinkedHashMap<>(secrets));
+    }
+
+    /// Creates an isolated mutable copy for transactional candidate validation.
+    ///
+    /// @return independent secret store copy
+    synchronized GameLaunchSecretStore fork() {
+        return new GameLaunchSecretStore(secrets);
+    }
+
+    /// Replaces committed values with a previously validated immutable snapshot.
+    ///
+    /// @param validatedSnapshot complete validated secret state
+    synchronized void commitValidated(Map<String, String> validatedSnapshot) {
+        secrets.clear();
+        secrets.putAll(validatedSnapshot);
+    }
+
     /// Rejects ordinary callback data containing any secret visible to that callback.
     ///
     /// @param pluginId callback plugin ID

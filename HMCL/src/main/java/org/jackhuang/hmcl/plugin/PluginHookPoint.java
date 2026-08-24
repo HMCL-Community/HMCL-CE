@@ -23,8 +23,8 @@ import org.jetbrains.annotations.NotNullByDefault;
 /// Launcher lifecycle hook points a schema-v5 plugin may subscribe to.
 ///
 /// These identifiers define the schema-v5 hook contract and are parsed, validated, and exposed through plugin
-/// manifests. The launcher does not yet dispatch these hooks, marshal ABI context objects, or apply plugin
-/// adjustments to the corresponding operations.
+/// manifests. The launcher executes both game-launch points. The remaining ten points are declaration-only until
+/// their operation-specific coordinators are implemented.
 @NotNullByDefault
 public enum PluginHookPoint {
     /// Contract point before a file download queue starts; its future context will expose the target list.
@@ -35,11 +35,11 @@ public enum PluginHookPoint {
     @SerializedName("after-download")
     AFTER_DOWNLOAD("after-download"),
 
-    /// Contract point before the Minecraft process starts; its future context will expose JVM and game arguments.
+    /// Executable point before launch side effects; its context exposes the complete transformable process plan.
     @SerializedName("before-game-launch")
     BEFORE_GAME_LAUNCH("before-game-launch"),
 
-    /// Contract point after the Minecraft process exits; its future context will expose the exit code.
+    /// Executable notification point after the owned Minecraft process exits; its context exposes termination data.
     @SerializedName("after-game-launch")
     AFTER_GAME_LAUNCH("after-game-launch"),
 
