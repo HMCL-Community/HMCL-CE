@@ -45,7 +45,39 @@ public record ProtectorMessage(
         if (monotonicTimestampNanos < 0L) {
             throw new IllegalArgumentException("Protector monotonic timestamp cannot be negative");
         }
+        validateKindAndStage(kind, stage, activeProviderId, activePluginId);
         validateActiveIdentities(stage, activeProviderId, activePluginId);
+    }
+
+    /// Validates the control-flow stage matrix and confines active identities to state-bearing messages.
+    ///
+    /// @param kind control operation
+    /// @param stage current startup stage
+    /// @param activeProviderId active Runtime Provider ID, or `null`
+    /// @param activePluginId active ordinary plugin ID, or `null`
+    private static void validateKindAndStage(
+            Kind kind,
+            ProtectorStage stage,
+            @Nullable String activeProviderId,
+            @Nullable String activePluginId
+    ) {
+        boolean allowedStage = switch (kind) {
+            case HEARTBEAT, NORMAL_SHUTDOWN -> true;
+            case STAGE, CANCEL, DIAGNOSTICS_REQUEST, DIAGNOSTICS_RESPONSE,
+                    TERMINATION_REQUEST, TERMINATION_ACKNOWLEDGED -> stage != ProtectorStage.UI_READY;
+            case READY -> stage == ProtectorStage.UI_READY;
+            case LEASE_RENEWAL -> stage == ProtectorStage.CORE_READY
+                    || stage == ProtectorStage.RUNTIME_PROVIDERS_LOADING
+                    || stage == ProtectorStage.ORDINARY_PLUGINS_LOADING;
+        };
+        if (!allowedStage) {
+            throw new IllegalArgumentException("Control message kind is invalid for the startup stage");
+        }
+
+        boolean identityBearing = kind == Kind.HEARTBEAT || kind == Kind.STAGE || kind == Kind.LEASE_RENEWAL;
+        if (!identityBearing && (activeProviderId != null || activePluginId != null)) {
+            throw new IllegalArgumentException("Control message kind cannot carry an active plugin identity");
+        }
     }
 
     /// Validates canonical identities and confines them to the matching loading stage.

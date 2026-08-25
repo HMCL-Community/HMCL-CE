@@ -27,7 +27,7 @@ import java.util.regex.Pattern;
 ///
 /// @param failureTimestampEpochMillis wall-clock failure time in Unix epoch milliseconds
 /// @param failureCategory stable failure category
-/// @param failureReason bounded redacted failure summary
+/// @param failureReason controlled failure reason
 /// @param lastStage last authenticated startup stage
 /// @param lastHeartbeatMonotonicNanos last authenticated monotonic heartbeat timestamp
 /// @param activeProviderId active Runtime Provider at failure, or `null`
@@ -38,7 +38,7 @@ import java.util.regex.Pattern;
 public record PluginRecoveryRecord(
         long failureTimestampEpochMillis,
         FailureCategory failureCategory,
-        String failureReason,
+        FailureReason failureReason,
         ProtectorStage lastStage,
         long lastHeartbeatMonotonicNanos,
         @Nullable String activeProviderId,
@@ -46,21 +46,8 @@ public record PluginRecoveryRecord(
         @Nullable String launcherLogReference,
         @Nullable String diagnosticDumpReference
 ) {
-    /// Maximum retained failure-summary length after redaction.
-    public static final int MAX_FAILURE_REASON_LENGTH = 4_096;
-
     /// Maximum retained launcher-local reference length.
     public static final int MAX_REFERENCE_LENGTH = 512;
-
-    /// ASCII control characters that may forge recovery UI or log lines.
-    private static final Pattern CONTROL_CHARACTER_PATTERN = Pattern.compile("[\\x00-\\x1f\\x7f]");
-
-    /// Internal Protector arguments and common credential assignments removed as complete tokens.
-    private static final Pattern SECRET_PATTERN = Pattern.compile(
-            "(?i)(?:--hmcl-protector-(?:child|safe-mode)(?:=[^\\s,;]*)?"
-                    + "|--hmcl-protector-(?:nonce|endpoint|recovery-nonce)(?:=|\\s+)[^\\s,;]+"
-                    + "|(?:nonce|secret|token|password|authorization)\\s*[=:]\\s*[^\\s,;]+)"
-    );
 
     /// Portable relative-reference syntax independent of host path separators.
     private static final Pattern REFERENCE_PATTERN = Pattern.compile("[A-Za-z0-9._/-]+");
@@ -68,6 +55,7 @@ public record PluginRecoveryRecord(
     /// Validates, bounds, and redacts all persisted fields.
     public PluginRecoveryRecord {
         Objects.requireNonNull(failureCategory, "failureCategory");
+        Objects.requireNonNull(failureReason, "failureReason");
         Objects.requireNonNull(lastStage, "lastStage");
         if (failureTimestampEpochMillis <= 0L) {
             throw new IllegalArgumentException("Recovery failure timestamp must be positive");
@@ -75,28 +63,12 @@ public record PluginRecoveryRecord(
         if (lastHeartbeatMonotonicNanos < 0L) {
             throw new IllegalArgumentException("Recovery heartbeat timestamp cannot be negative");
         }
-        failureReason = redactFailureReason(failureReason);
+        if (failureReason.category() != failureCategory) {
+            throw new IllegalArgumentException("Recovery failure reason does not match its category");
+        }
         ProtectorMessage.validateActiveIdentities(lastStage, activeProviderId, activePluginId);
         launcherLogReference = validateReference(launcherLogReference);
         diagnosticDumpReference = validateReference(diagnosticDumpReference);
-    }
-
-    /// Redacts credentials and internal control arguments from one bounded, single-line failure reason.
-    ///
-    /// @param reason untrusted failure summary
-    /// @return bounded redacted summary
-    private static String redactFailureReason(String reason) {
-        Objects.requireNonNull(reason, "reason");
-        if (reason.isBlank()
-                || reason.length() > MAX_FAILURE_REASON_LENGTH
-                || CONTROL_CHARACTER_PATTERN.matcher(reason).find()) {
-            throw new IllegalArgumentException("Recovery failure reason is missing, unbounded, or contains controls");
-        }
-        String redacted = SECRET_PATTERN.matcher(reason).replaceAll("[redacted]");
-        if (redacted.isBlank()) {
-            throw new IllegalArgumentException("Recovery failure reason is empty after redaction");
-        }
-        return redacted;
     }
 
     /// Validates one optional portable launcher-local reference without resolving or opening it.
@@ -121,6 +93,76 @@ public record PluginRecoveryRecord(
             }
         }
         return reference;
+    }
+
+    /// Controlled startup failure reasons that cannot contain exception text, arguments, credentials, or IPC data.
+    @NotNullByDefault
+    public enum FailureReason {
+        /// The protected child exited unexpectedly before UI readiness.
+        UNEXPECTED_PROCESS_EXIT("unexpected-process-exit", FailureCategory.PROCESS_EXIT),
+
+        /// The protected child crashed before UI readiness.
+        CHILD_CRASH("child-crash", FailureCategory.CRASH),
+
+        /// Authenticated heartbeat traffic stopped before UI readiness.
+        HEARTBEAT_LOST("heartbeat-lost", FailureCategory.HEARTBEAT_LOSS),
+
+        /// Core initialization exceeded its deadline.
+        CORE_DEADLINE_EXCEEDED("core-deadline-exceeded", FailureCategory.STAGE_TIMEOUT),
+
+        /// One active Runtime Provider exceeded its startup deadline.
+        PROVIDER_DEADLINE_EXCEEDED("provider-deadline-exceeded", FailureCategory.STAGE_TIMEOUT),
+
+        /// One active ordinary plugin exceeded its startup deadline.
+        PLUGIN_DEADLINE_EXCEEDED("plugin-deadline-exceeded", FailureCategory.STAGE_TIMEOUT),
+
+        /// Overall startup exceeded the non-renewable hard deadline.
+        HARD_STARTUP_DEADLINE_EXCEEDED(
+                "hard-startup-deadline-exceeded",
+                FailureCategory.HARD_STARTUP_TIMEOUT
+        );
+
+        /// Stable recovery-document spelling.
+        private final String wireName;
+
+        /// Required broad classification for this reason.
+        private final FailureCategory category;
+
+        /// Creates one controlled reason with its stable wire spelling and classification.
+        ///
+        /// @param wireName stable wire spelling
+        /// @param category required broad classification
+        FailureReason(String wireName, FailureCategory category) {
+            this.wireName = wireName;
+            this.category = category;
+        }
+
+        /// Returns the stable recovery-document spelling.
+        ///
+        /// @return stable wire spelling
+        public String wireName() {
+            return wireName;
+        }
+
+        /// Returns the required broad classification.
+        ///
+        /// @return required failure category
+        public FailureCategory category() {
+            return category;
+        }
+
+        /// Resolves an exact wire spelling without retaining an unknown source value.
+        ///
+        /// @param wireName candidate wire spelling
+        /// @return matching reason, or `null` when unknown
+        static @Nullable FailureReason fromWireName(String wireName) {
+            for (FailureReason reason : values()) {
+                if (reason.wireName.equals(wireName)) {
+                    return reason;
+                }
+            }
+            return null;
+        }
     }
 
     /// Categories that distinguish startup failure behavior without retaining raw process output.

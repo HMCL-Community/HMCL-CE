@@ -19,11 +19,14 @@ package org.jackhuang.hmcl.plugin.protector;
 
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.Unmodifiable;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Map;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -38,6 +41,35 @@ public final class ProtectorProtocolTest {
 
     /// Different valid nonce used to verify authentication failure.
     private static final String OTHER_NONCE = "abcdef0123456789abcdef0123456789abcdef01234";
+
+    /// Exact kind-to-stage matrix accepted by the Task 10 control-flow contract.
+    private static final @Unmodifiable Map<ProtectorMessage.Kind, @Unmodifiable Set<ProtectorStage>> LEGAL_STAGES =
+            Map.of(
+                    ProtectorMessage.Kind.HEARTBEAT, Set.of(ProtectorStage.values()),
+                    ProtectorMessage.Kind.STAGE, Set.of(
+                            ProtectorStage.JVM_STARTED,
+                            ProtectorStage.CORE_READY,
+                            ProtectorStage.RUNTIME_PROVIDERS_LOADING,
+                            ProtectorStage.ORDINARY_PLUGINS_LOADING
+                    ),
+                    ProtectorMessage.Kind.READY, Set.of(ProtectorStage.UI_READY),
+                    ProtectorMessage.Kind.CANCEL, Set.of(
+                            ProtectorStage.JVM_STARTED,
+                            ProtectorStage.CORE_READY,
+                            ProtectorStage.RUNTIME_PROVIDERS_LOADING,
+                            ProtectorStage.ORDINARY_PLUGINS_LOADING
+                    ),
+                    ProtectorMessage.Kind.NORMAL_SHUTDOWN, Set.of(ProtectorStage.values()),
+                    ProtectorMessage.Kind.DIAGNOSTICS_REQUEST, preReadyStages(),
+                    ProtectorMessage.Kind.DIAGNOSTICS_RESPONSE, preReadyStages(),
+                    ProtectorMessage.Kind.LEASE_RENEWAL, Set.of(
+                            ProtectorStage.CORE_READY,
+                            ProtectorStage.RUNTIME_PROVIDERS_LOADING,
+                            ProtectorStage.ORDINARY_PLUGINS_LOADING
+                    ),
+                    ProtectorMessage.Kind.TERMINATION_REQUEST, preReadyStages(),
+                    ProtectorMessage.Kind.TERMINATION_ACKNOWLEDGED, preReadyStages()
+            );
 
     /// Asserts every startup supervision duration exactly matches the approved design.
     @Test
@@ -79,19 +111,49 @@ public final class ProtectorProtocolTest {
         assertEquals(heartbeat, protocol.decode(encoded));
     }
 
-    /// Round-trips all startup stages and all control kinds needed by later supervision work.
+    /// Round-trips every legal kind-stage pair needed by later supervision work.
     ///
     /// @throws Exception if a supported envelope cannot round-trip
     @Test
-    public void roundTripEveryStageAndControlKind() throws Exception {
+    public void roundTripEveryLegalKindAndStageCombination() throws Exception {
         ProtectorProtocol protocol = new ProtectorProtocol(NONCE);
         long timestamp = 1L;
-        for (ProtectorStage stage : ProtectorStage.values()) {
-            for (ProtectorMessage.Kind kind : ProtectorMessage.Kind.values()) {
-                ProtectorMessage message = message(kind, timestamp++, stage);
+        for (ProtectorMessage.Kind kind : ProtectorMessage.Kind.values()) {
+            for (ProtectorStage stage : LEGAL_STAGES.get(kind)) {
+                ProtectorMessage message = message(kind, timestamp++, stage, identityBearing(kind));
                 assertEquals(message, protocol.decode(protocol.encode(message)));
             }
         }
+    }
+
+    /// Rejects representative illegal stage combinations for every stage-restricted control kind.
+    @Test
+    public void rejectIllegalKindAndStageCombinations() {
+        assertInvalidCombination(ProtectorMessage.Kind.STAGE, ProtectorStage.UI_READY);
+        assertInvalidCombination(ProtectorMessage.Kind.READY, ProtectorStage.CORE_READY);
+        assertInvalidCombination(ProtectorMessage.Kind.CANCEL, ProtectorStage.UI_READY);
+        assertInvalidCombination(ProtectorMessage.Kind.DIAGNOSTICS_REQUEST, ProtectorStage.UI_READY);
+        assertInvalidCombination(ProtectorMessage.Kind.DIAGNOSTICS_RESPONSE, ProtectorStage.UI_READY);
+        assertInvalidCombination(ProtectorMessage.Kind.LEASE_RENEWAL, ProtectorStage.JVM_STARTED);
+        assertInvalidCombination(ProtectorMessage.Kind.LEASE_RENEWAL, ProtectorStage.UI_READY);
+        assertInvalidCombination(ProtectorMessage.Kind.TERMINATION_REQUEST, ProtectorStage.UI_READY);
+        assertInvalidCombination(ProtectorMessage.Kind.TERMINATION_ACKNOWLEDGED, ProtectorStage.UI_READY);
+    }
+
+    /// Rejects active identities on terminal and parent-control messages while retaining them on state reports.
+    @Test
+    public void rejectActiveIdentitiesOnNonStateBearingKinds() {
+        assertInvalidActiveIdentity(ProtectorMessage.Kind.READY, ProtectorStage.UI_READY);
+        assertInvalidActiveIdentity(ProtectorMessage.Kind.CANCEL, ProtectorStage.RUNTIME_PROVIDERS_LOADING);
+        assertInvalidActiveIdentity(ProtectorMessage.Kind.NORMAL_SHUTDOWN, ProtectorStage.RUNTIME_PROVIDERS_LOADING);
+        assertInvalidActiveIdentity(ProtectorMessage.Kind.DIAGNOSTICS_REQUEST,
+                ProtectorStage.RUNTIME_PROVIDERS_LOADING);
+        assertInvalidActiveIdentity(ProtectorMessage.Kind.DIAGNOSTICS_RESPONSE,
+                ProtectorStage.RUNTIME_PROVIDERS_LOADING);
+        assertInvalidActiveIdentity(ProtectorMessage.Kind.TERMINATION_REQUEST,
+                ProtectorStage.RUNTIME_PROVIDERS_LOADING);
+        assertInvalidActiveIdentity(ProtectorMessage.Kind.TERMINATION_ACKNOWLEDGED,
+                ProtectorStage.RUNTIME_PROVIDERS_LOADING);
     }
 
     /// Rejects a valid envelope authenticated with another nonce without exposing either nonce.
@@ -269,13 +331,75 @@ public final class ProtectorProtocolTest {
             long timestamp,
             ProtectorStage stage
     ) {
-        @Nullable String providerId = stage == ProtectorStage.RUNTIME_PROVIDERS_LOADING
+        return message(kind, timestamp, stage, true);
+    }
+
+    /// Creates one message with optional stage-appropriate active identity fields.
+    ///
+    /// @param kind control message kind
+    /// @param timestamp monotonic timestamp
+    /// @param stage startup stage
+    /// @param includeActiveIdentity whether to include a matching active identity
+    /// @return message candidate
+    private static ProtectorMessage message(
+            ProtectorMessage.Kind kind,
+            long timestamp,
+            ProtectorStage stage,
+            boolean includeActiveIdentity
+    ) {
+        @Nullable String providerId = includeActiveIdentity
+                && stage == ProtectorStage.RUNTIME_PROVIDERS_LOADING
                 ? "org.example.provider"
                 : null;
-        @Nullable String pluginId = stage == ProtectorStage.ORDINARY_PLUGINS_LOADING
+        @Nullable String pluginId = includeActiveIdentity
+                && stage == ProtectorStage.ORDINARY_PLUGINS_LOADING
                 ? "org.example.plugin"
                 : null;
         return new ProtectorMessage(kind, timestamp, stage, providerId, pluginId);
+    }
+
+    /// Returns every startup stage before UI readiness.
+    ///
+    /// @return immutable pre-ready stage set
+    private static @Unmodifiable Set<ProtectorStage> preReadyStages() {
+        return Set.of(
+                ProtectorStage.JVM_STARTED,
+                ProtectorStage.CORE_READY,
+                ProtectorStage.RUNTIME_PROVIDERS_LOADING,
+                ProtectorStage.ORDINARY_PLUGINS_LOADING
+        );
+    }
+
+    /// Returns whether a kind is allowed to carry a stage-appropriate active identity.
+    ///
+    /// @param kind control message kind
+    /// @return whether active identity fields carry state for this kind
+    private static boolean identityBearing(ProtectorMessage.Kind kind) {
+        return kind == ProtectorMessage.Kind.HEARTBEAT
+                || kind == ProtectorMessage.Kind.STAGE
+                || kind == ProtectorMessage.Kind.LEASE_RENEWAL;
+    }
+
+    /// Asserts one kind-stage pair is rejected at construction so it can never be encoded.
+    ///
+    /// @param kind control message kind
+    /// @param stage illegal stage
+    private static void assertInvalidCombination(ProtectorMessage.Kind kind, ProtectorStage stage) {
+        assertThrows(IllegalArgumentException.class, () -> message(kind, 1L, stage, false));
+    }
+
+    /// Asserts one non-state-bearing kind rejects a matching active Provider identity.
+    ///
+    /// @param kind control message kind
+    /// @param stage stage on which an active Provider would otherwise be structurally valid
+    private static void assertInvalidActiveIdentity(ProtectorMessage.Kind kind, ProtectorStage stage) {
+        assertThrows(IllegalArgumentException.class, () -> new ProtectorMessage(
+                kind,
+                1L,
+                stage,
+                "org.example.provider",
+                null
+        ));
     }
 
     /// Encodes one canonical heartbeat fixture.
@@ -286,7 +410,8 @@ public final class ProtectorProtocolTest {
         return new ProtectorProtocol(NONCE).encode(message(
                 ProtectorMessage.Kind.HEARTBEAT,
                 1L,
-                ProtectorStage.JVM_STARTED
+                ProtectorStage.JVM_STARTED,
+                true
         ));
     }
 
