@@ -53,6 +53,8 @@ public class LauncherSettingsPage extends DecoratorAnimatedPage implements Decor
     private final TabHeader.Tab<DownloadSettingsPage> downloadTab = new TabHeader.Tab<>("downloadSettingsPage");
     /// Built-in plugin management tab.
     private final TabHeader.Tab<PluginManagementPage> pluginTab = new TabHeader.Tab<>("pluginManagementPage");
+    /// Conditional plugin startup recovery tab.
+    private final TabHeader.Tab<PluginRecoveryPage> pluginRecoveryTab = new TabHeader.Tab<>("pluginRecoveryPage");
     /// Built-in plugin store tab.
     private final TabHeader.Tab<PluginStorePage> pluginStoreTab = new TabHeader.Tab<>("pluginStorePage");
     /// Built-in help tab.
@@ -67,20 +69,30 @@ public class LauncherSettingsPage extends DecoratorAnimatedPage implements Decor
     private final AdvancedListBox sideBar;
     /// Stable heading for the built-in help navigation section.
     private final ClassTitle helpCategory = new ClassTitle(i18n("help").toUpperCase(Locale.ROOT));
+    /// Sidebar item whose visibility follows actionable plugin recovery state.
+    private final AdvancedListItem pluginRecoveryNavigation = new AdvancedListItem();
 
     /// Creates the built-in settings tabs.
     public LauncherSettingsPage() {
+        this(PluginRecoveryPage.isRecoveryAvailable());
+    }
+
+    /// Creates built-in settings tabs with an explicit startup recovery navigation state.
+    ///
+    /// @param recoveryAvailable whether persisted quarantine recovery is actionable
+    LauncherSettingsPage(boolean recoveryAvailable) {
         gameTab.setNodeSupplier(() -> new GameSettingsPage<>(GameSettings.Preset.class));
         javaManagementTab.setNodeSupplier(JavaManagementPage::new);
         settingsTab.setNodeSupplier(SettingsPage::new);
         personalizationTab.setNodeSupplier(PersonalizationPage::new);
         downloadTab.setNodeSupplier(DownloadSettingsPage::new);
         pluginTab.setNodeSupplier(PluginManagementPage::new);
+        pluginRecoveryTab.setNodeSupplier(() -> new PluginRecoveryPage(this::refreshRecoveryNavigation));
         pluginStoreTab.setNodeSupplier(PluginStorePage::new);
         helpTab.setNodeSupplier(HelpPage::new);
         feedbackTab.setNodeSupplier(FeedbackPage::new);
         aboutTab.setNodeSupplier(AboutPage::new);
-        tab = new TabHeader(transitionPane, gameTab, javaManagementTab, settingsTab, personalizationTab, downloadTab, pluginTab, pluginStoreTab, helpTab, feedbackTab, aboutTab);
+        tab = new TabHeader(transitionPane, gameTab, javaManagementTab, settingsTab, personalizationTab, downloadTab, pluginTab, pluginRecoveryTab, pluginStoreTab, helpTab, feedbackTab, aboutTab);
 
         tab.select(gameTab);
         addEventHandler(Navigator.NavigationEvent.NAVIGATED, event -> gameTab.getNode().loadInstance(GameDirectoryManager.getSelectedRepository(), null));
@@ -93,14 +105,23 @@ public class LauncherSettingsPage extends DecoratorAnimatedPage implements Decor
                 .addNavigationDrawerTab(tab, personalizationTab, i18n("settings.launcher.appearance"), SVG.STYLE, SVG.STYLE_FILL)
                 .addNavigationDrawerTab(tab, downloadTab, i18n("download"), SVG.DOWNLOAD)
                 .addNavigationDrawerTab(tab, pluginTab, i18n("plugin.manage"), SVG.EXTENSION, SVG.EXTENSION)
-                .addNavigationDrawerTab(tab, pluginStoreTab, i18n("plugin.store"), SVG.LISTS, SVG.LISTS)
                 ;
+        pluginRecoveryNavigation.getStyleClass().add("navigation-drawer-item");
+        pluginRecoveryNavigation.setTitle(i18n("plugin.recovery.title"));
+        pluginRecoveryNavigation.setLeftIcon(SVG.RESTORE);
+        pluginRecoveryNavigation.activeProperty().bind(
+                tab.getSelectionModel().selectedItemProperty().isEqualTo(pluginRecoveryTab)
+        );
+        pluginRecoveryNavigation.setOnAction(event -> tab.select(pluginRecoveryTab));
+        sideBar.add(pluginRecoveryNavigation);
+        sideBar.addNavigationDrawerTab(tab, pluginStoreTab, i18n("plugin.store"), SVG.LISTS, SVG.LISTS);
         sideBar.add(helpCategory)
                 .addNavigationDrawerTab(tab, helpTab, i18n("help"), SVG.HELP, SVG.HELP_FILL)
                 .addNavigationDrawerTab(tab, feedbackTab, i18n("contact"), SVG.FEEDBACK, SVG.FEEDBACK_FILL)
                 .addNavigationDrawerTab(tab, aboutTab, i18n("about"), SVG.INFO, SVG.INFO_FILL);
         FXUtils.setLimitWidth(sideBar, 200);
         setLeft(sideBar);
+        updateRecoveryNavigation(recoveryAvailable);
 
         setCenter(transitionPane);
     }
@@ -108,6 +129,7 @@ public class LauncherSettingsPage extends DecoratorAnimatedPage implements Decor
     /// Propagates visibility to the selected native settings tab.
     @Override
     public void onPageShown() {
+        refreshRecoveryNavigation();
         tab.onPageShown();
     }
 
@@ -133,6 +155,22 @@ public class LauncherSettingsPage extends DecoratorAnimatedPage implements Decor
     /// Selects the built-in plugin management tab without transition animation.
     public void showPluginManagement() {
         tab.select(pluginTab, false);
+    }
+
+    /// Refreshes conditional recovery navigation from current process-wide plugin state.
+    private void refreshRecoveryNavigation() {
+        updateRecoveryNavigation(PluginRecoveryPage.isRecoveryAvailable());
+    }
+
+    /// Applies one recovery availability snapshot to the sidebar and current selection.
+    ///
+    /// @param recoveryAvailable whether recovery remains actionable
+    void updateRecoveryNavigation(boolean recoveryAvailable) {
+        pluginRecoveryNavigation.setManaged(recoveryAvailable);
+        pluginRecoveryNavigation.setVisible(recoveryAvailable);
+        if (!recoveryAvailable && tab.getSelectionModel().getSelectedItem() == pluginRecoveryTab) {
+            tab.select(pluginTab, false);
+        }
     }
 
     /// Selects the cached plugin-store tab without recreating its aggregate loader.

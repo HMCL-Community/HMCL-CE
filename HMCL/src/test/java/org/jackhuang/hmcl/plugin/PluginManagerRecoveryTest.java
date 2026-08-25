@@ -128,6 +128,7 @@ public final class PluginManagerRecoveryTest {
         assertEquals(recoveryRecord.failureTimestampEpochMillis(), report.failureTimestampEpochMillis());
         assertEquals(recoveryRecord.failureReason(), report.failureReason());
         assertEquals(recoveryRecord.lastStage(), report.lastStage());
+        assertEquals(recoveryRecord.lastHeartbeatMonotonicNanos(), report.lastHeartbeatMonotonicNanos());
         assertEquals(recoveryRecord.activeProviderId(), report.activeProviderId());
         assertEquals(recoveryRecord.activePluginId(), report.activePluginId());
         assertEquals(recoveryRecord.launcherLogReference(), report.launcherLogReference());

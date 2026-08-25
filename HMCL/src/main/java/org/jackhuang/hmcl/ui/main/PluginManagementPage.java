@@ -84,6 +84,9 @@ public class PluginManagementPage extends VBox implements DecoratorPage {
     /// Visual list containing installed plugin rows.
     private final ComponentList pluginList = new ComponentList();
 
+    /// Conditional navigation banner for persisted startup recovery state.
+    private final LineButton recoveryBanner = LineButton.createNavigationButton();
+
     /// Creates and populates the plugin management page.
     public PluginManagementPage() {
         getStyleClass().add("gray-background");
@@ -115,6 +118,11 @@ public class PluginManagementPage extends VBox implements DecoratorPage {
 
         pluginList.getStyleClass().add("no-padding");
 
+        recoveryBanner.setLeading(SVG.WARNING);
+        recoveryBanner.setTitle(i18n("plugin.recovery.banner"));
+        recoveryBanner.setSubtitle(i18n("plugin.recovery.banner.description"));
+        recoveryBanner.setOnAction(event -> Controllers.navigate(new PluginRecoveryPage(this::refresh)));
+
         VBox content = new VBox(8);
         content.getChildren().addAll(
                 ComponentList.createComponentListTitle(i18n("plugin.installed")),
@@ -128,7 +136,7 @@ public class PluginManagementPage extends VBox implements DecoratorPage {
         FXUtils.smoothScrolling(scrollPane);
         FXUtils.setOverflowHidden(scrollPane, 8);
 
-        getChildren().addAll(topBar, scrollPane);
+        getChildren().addAll(topBar, recoveryBanner, scrollPane);
 
         refresh();
     }
@@ -136,6 +144,9 @@ public class PluginManagementPage extends VBox implements DecoratorPage {
     /// Rebuilds the installed plugin list from the manager's observable state.
     @Override
     public void refresh() {
+        boolean recoveryAvailable = PluginRecoveryPage.isRecoveryAvailable(pluginManager);
+        recoveryBanner.setManaged(recoveryAvailable);
+        recoveryBanner.setVisible(recoveryAvailable);
         pluginList.getContent().clear();
 
         @Unmodifiable Map<String, PluginManifest> installedManifests;

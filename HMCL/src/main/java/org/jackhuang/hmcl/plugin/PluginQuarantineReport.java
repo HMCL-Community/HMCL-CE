@@ -34,6 +34,7 @@ import java.util.Set;
 /// @param failureCategory stable broad failure category
 /// @param failureReason controlled startup failure reason
 /// @param lastStage last authenticated startup stage
+/// @param lastHeartbeatMonotonicNanos last authenticated protector heartbeat from the failed startup
 /// @param activeProviderId active Runtime Provider at failure, or `null`
 /// @param activePluginId active ordinary plugin at failure, or `null`
 /// @param launcherLogReference safe launcher-local relative log reference, or `null`
@@ -48,6 +49,7 @@ public record PluginQuarantineReport(
         PluginRecoveryRecord.FailureCategory failureCategory,
         PluginRecoveryRecord.FailureReason failureReason,
         ProtectorStage lastStage,
+        long lastHeartbeatMonotonicNanos,
         @Nullable String activeProviderId,
         @Nullable String activePluginId,
         @Nullable String launcherLogReference,
@@ -64,7 +66,7 @@ public record PluginQuarantineReport(
                 failureCategory,
                 failureReason,
                 lastStage,
-                0L,
+                lastHeartbeatMonotonicNanos,
                 activeProviderId,
                 activePluginId,
                 launcherLogReference,
@@ -98,6 +100,7 @@ public record PluginQuarantineReport(
                 recoveryRecord.failureCategory(),
                 recoveryRecord.failureReason(),
                 recoveryRecord.lastStage(),
+                recoveryRecord.lastHeartbeatMonotonicNanos(),
                 recoveryRecord.activeProviderId(),
                 recoveryRecord.activePluginId(),
                 recoveryRecord.launcherLogReference(),
