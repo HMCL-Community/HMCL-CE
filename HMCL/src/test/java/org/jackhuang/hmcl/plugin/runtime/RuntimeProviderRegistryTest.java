@@ -18,6 +18,8 @@
 package org.jackhuang.hmcl.plugin.runtime;
 
 import org.jackhuang.hmcl.plugin.PluginArtifactIdentity;
+import org.jackhuang.hmcl.plugin.bridge.PluginCapabilityToken;
+import org.jackhuang.hmcl.plugin.bridge.PluginPermissionAuthority;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Unmodifiable;
 import org.junit.jupiter.api.Test;
@@ -368,7 +370,7 @@ public final class RuntimeProviderRegistryTest {
     public void exposeImmutableRuntimePayloadContext(@TempDir Path temporaryDirectory) {
         PluginArtifactIdentity identity = new PluginArtifactIdentity(
                 "dev.plugin.payload", "1.0.0", "a".repeat(64));
-        Object token = new Object();
+        PluginCapabilityToken token = capabilityToken(identity);
         RuntimePayloadContext context = new RuntimePayloadContext(
                 identity,
                 temporaryDirectory.resolve("package").resolve("..").resolve("package"),
@@ -418,8 +420,22 @@ public final class RuntimeProviderRegistryTest {
                 entrypoint,
                 PluginExecutionMode.EMBEDDED,
                 Path.of("data"),
-                Object::new
+                () -> capabilityToken(identity)
         ));
+    }
+
+    /// Issues one opaque token for a payload-context fixture.
+    ///
+    /// @param identity exact test artifact identity
+    /// @return opaque token
+    private static PluginCapabilityToken capabilityToken(PluginArtifactIdentity identity) {
+        return new PluginPermissionAuthority().issue(
+                identity,
+                PluginExecutionMode.EMBEDDED,
+                Set.of(),
+                "runtime.payload",
+                Duration.ofMinutes(1)
+        );
     }
 
     /// Keeps runtime payload handles opaque and rejects malformed owner identities.

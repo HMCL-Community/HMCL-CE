@@ -48,11 +48,14 @@ public enum PluginPermissionTier {
             case NETWORK:
             case PROCESS:
             case ACCOUNT:
+            case LAUNCHER_CORE:
                 return ADVANCED;
             case MIXIN:
             case NATIVE_CODE:
             case LAUNCHER_HOOK:
             case LAUNCHER_PATCH:
+            case JVM_RAW:
+            case SHELL:
             default:
                 return DANGEROUS;
         }

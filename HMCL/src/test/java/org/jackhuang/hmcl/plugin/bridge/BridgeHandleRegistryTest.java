@@ -355,7 +355,12 @@ class BridgeHandleRegistryTest {
 
     /// Creates a registry whose opaque test authority resolves directly to one canonical plugin owner.
     private static BridgeHandleRegistry<String> ownerRegistry() {
-        return new BridgeHandleRegistry<>(token -> token);
+        return new BridgeHandleRegistry<>((token, expectedOwner) -> {
+            if (!token.equals(expectedOwner)) {
+                throw BridgeError.of(BridgeError.Category.PERMISSION_DENIED);
+            }
+            return token;
+        });
     }
 
     /// Verifies one Bridge operation fails with the expected portable category.

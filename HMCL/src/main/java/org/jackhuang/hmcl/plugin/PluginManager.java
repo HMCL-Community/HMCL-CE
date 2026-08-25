@@ -24,6 +24,7 @@ import javafx.scene.image.Image;
 import org.jackhuang.hmcl.Metadata;
 import org.jackhuang.hmcl.plugin.internal.PluginPackageVersions;
 import org.jackhuang.hmcl.plugin.internal.VerifiedPluginPackage;
+import org.jackhuang.hmcl.plugin.bridge.PluginPermissionAuthority;
 import org.jackhuang.hmcl.plugin.loader.JavaPluginLoader;
 import org.jackhuang.hmcl.plugin.loader.PluginLoader;
 import org.jackhuang.hmcl.plugin.loader.RuntimePluginLoader;
@@ -52,6 +53,7 @@ import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.EnumSet;
@@ -105,6 +107,8 @@ public final class PluginManager {
     private final PluginMutationLock mutationLock;
     /// Artifact-bound user permission decisions.
     private final PluginPermissionService permissionService;
+    /// Process-local authority for external runtime Bridge capability tokens.
+    private final PluginPermissionAuthority permissionAuthority;
     /// Exact-artifact policy for plugin-store dependency reuse.
     private final PluginReusePolicy reusePolicy;
     /// Exact prior-state capture and final replacement revalidation.
@@ -229,6 +233,7 @@ public final class PluginManager {
                 artifactResolver::findCurrentPermissionArtifact,
                 mutationLock
         );
+        permissionAuthority = new PluginPermissionAuthority();
         reusePolicy = new PluginReusePolicy(
                 packageRepository,
                 permissionService,
@@ -896,7 +901,13 @@ public final class PluginManager {
             loader = new RuntimePluginLoader(
                     runtimeSupervisor,
                     ignored -> dataDirectory,
-                    ignored -> () -> permissionService.getGrantedPermissions(manifest, artifactSha256)
+                    ignored -> () -> permissionAuthority.issue(
+                            pluginPackage.getIdentity(),
+                            manifest.getExecutionMode(),
+                            permissionService.getGrantedPermissions(manifest, artifactSha256),
+                            "runtime.payload",
+                            Duration.ofSeconds(30)
+                    )
             );
         } else {
             loader = loaders.get(manifest.getType());
@@ -905,9 +916,17 @@ public final class PluginManager {
             throw new IOException("No loader found for plugin type: " + manifest.getType());
         }
 
-        Plugin plugin = administrativeGuard.callPluginLoadingCallback(
-                () -> loader.load(manifest, pluginPackage, nplFile)
-        );
+        Plugin plugin;
+        try {
+            plugin = administrativeGuard.callPluginLoadingCallback(
+                    () -> loader.load(manifest, pluginPackage, nplFile)
+            );
+        } catch (IOException | RuntimeException | Error exception) {
+            if (isExternalRuntimePayload(manifest)) {
+                permissionAuthority.revokeArtifact(pluginPackage.getIdentity());
+            }
+            throw exception;
+        }
         if (manifest.getPluginKind() == PluginKind.RUNTIME_PROVIDER) {
             runtimeSupervisor.bootstrapLoaded(pluginId);
         }
@@ -920,7 +939,8 @@ public final class PluginManager {
                 classLoader,
                 artifactSha256,
                 () -> permissionService.getGrantedPermissions(manifest, artifactSha256),
-                provider -> runtimeSupervisor.register(pluginId, provider)
+                provider -> runtimeSupervisor.register(pluginId, provider),
+                permissionAuthority
         );
         return new PreparedPlugin(
                 plugin,
@@ -1127,6 +1147,7 @@ public final class PluginManager {
         try {
             if (pluginMap.containsKey(pluginId)) {
                 IllegalStateException exception = new IllegalStateException("Plugin already loaded: " + pluginId);
+                prepared.context.revokeCapabilityTokens();
                 closeLoaderAfterFailure(prepared.plugin, prepared.context.getClassLoader());
                 throw exception;
             }
@@ -1169,6 +1190,7 @@ public final class PluginManager {
             } catch (RuntimeException | Error cleanupException) {
                 exception.addSuppressed(cleanupException);
             }
+            container.revokeCapabilityTokens();
             try {
                 runPluginCallback(prepared.context.getClassLoader(), prepared.plugin::onUnload);
             } catch (RuntimeException | Error unloadException) {
@@ -1601,6 +1623,7 @@ public final class PluginManager {
             disablePluginLocked(pluginId);
         }
 
+        container.revokeCapabilityTokens();
         if (container.getManifest().getPluginKind() == PluginKind.RUNTIME_PROVIDER) {
             container.closeRuntimeProviderRegistrations();
         }
@@ -1803,6 +1826,10 @@ public final class PluginManager {
                         loaded.getManifest(),
                         loaded.getArtifact().getSha256()
                 );
+        if (loaded != null && !loadedBefore.equals(loadedAfter)) {
+            permissionAuthority.revokeArtifact(PluginArtifactIdentity.of(
+                    loaded.getManifest(), loaded.getArtifact().getSha256()));
+        }
         @Unmodifiable Set<PluginPermission> publishedAfter = permissionService.getGrantedPermissions(
                 published.getManifest(),
                 published.getArtifact().getSha256()

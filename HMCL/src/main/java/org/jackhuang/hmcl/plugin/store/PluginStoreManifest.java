@@ -821,6 +821,10 @@ public final class PluginStoreManifest {
                         throw new IOException("Plugin version " + version + " has duplicate permission "
                                 + permission.getId());
                     }
+                    if (pluginApiVersion < 5 && permission.isSchemaFiveOnly()) {
+                        throw new IOException("Plugin version " + version
+                                + " cannot declare schema-v5 permission " + permission.getId());
+                    }
                 }
             }
 

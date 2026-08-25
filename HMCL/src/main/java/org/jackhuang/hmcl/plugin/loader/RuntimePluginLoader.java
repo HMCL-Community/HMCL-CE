@@ -20,6 +20,7 @@ package org.jackhuang.hmcl.plugin.loader;
 import org.jackhuang.hmcl.plugin.Plugin;
 import org.jackhuang.hmcl.plugin.PluginContext;
 import org.jackhuang.hmcl.plugin.PluginManifest;
+import org.jackhuang.hmcl.plugin.bridge.PluginCapabilityToken;
 import org.jackhuang.hmcl.plugin.internal.PluginPackageVersions;
 import org.jackhuang.hmcl.plugin.internal.VerifiedPluginPackage;
 import org.jackhuang.hmcl.plugin.runtime.PluginRuntimeTypes;
@@ -45,7 +46,7 @@ public final class RuntimePluginLoader implements PluginLoader {
     private final Function<String, Path> dataDirectoryResolver;
 
     /// Resolves the current opaque capability-token supplier for one dependent plugin ID.
-    private final Function<String, Supplier<?>> capabilityTokenResolver;
+    private final Function<String, Supplier<PluginCapabilityToken>> capabilityTokenResolver;
 
     /// Creates a Provider-backed external payload loader.
     ///
@@ -55,7 +56,7 @@ public final class RuntimePluginLoader implements PluginLoader {
     public RuntimePluginLoader(
             RuntimeSupervisor supervisor,
             Function<String, Path> dataDirectoryResolver,
-            Function<String, Supplier<?>> capabilityTokenResolver
+            Function<String, Supplier<PluginCapabilityToken>> capabilityTokenResolver
     ) {
         this.supervisor = Objects.requireNonNull(supervisor, "supervisor");
         this.dataDirectoryResolver = Objects.requireNonNull(dataDirectoryResolver, "dataDirectoryResolver");
@@ -92,7 +93,7 @@ public final class RuntimePluginLoader implements PluginLoader {
         }
         String pluginId = manifest.getId();
         Path dataDirectory = Objects.requireNonNull(dataDirectoryResolver.apply(pluginId), "dataDirectory");
-        Supplier<?> capabilityTokenSupplier = Objects.requireNonNull(
+        Supplier<PluginCapabilityToken> capabilityTokenSupplier = Objects.requireNonNull(
                 capabilityTokenResolver.apply(pluginId),
                 "capabilityTokenSupplier"
         );

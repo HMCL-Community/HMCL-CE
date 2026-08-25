@@ -18,6 +18,8 @@
 package org.jackhuang.hmcl.plugin.runtime;
 
 import org.jackhuang.hmcl.plugin.PluginArtifactIdentity;
+import org.jackhuang.hmcl.plugin.bridge.PluginCapabilityToken;
+import org.jackhuang.hmcl.plugin.bridge.PluginPermissionAuthority;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
@@ -31,6 +33,7 @@ import java.lang.management.LockInfo;
 import java.lang.management.ManagementFactory;
 import java.lang.management.ThreadInfo;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
@@ -513,13 +516,28 @@ public final class RuntimeSupervisorTest {
     /// @param temporaryDirectory isolated test root
     /// @return payload loading context
     private static RuntimePayloadContext payloadContext(String pluginId, Path temporaryDirectory) {
+        PluginArtifactIdentity identity = new PluginArtifactIdentity(pluginId, "1.0.0", "a".repeat(64));
         return new RuntimePayloadContext(
-                new PluginArtifactIdentity(pluginId, "1.0.0", "a".repeat(64)),
+                identity,
                 temporaryDirectory.resolve(pluginId).resolve("package"),
                 "payload/plugin.dll",
                 PluginExecutionMode.EMBEDDED,
                 temporaryDirectory.resolve(pluginId).resolve("data"),
-                Object::new
+                () -> capabilityToken(identity)
+        );
+    }
+
+    /// Issues one opaque token for a payload-context fixture.
+    ///
+    /// @param identity exact test artifact identity
+    /// @return opaque token
+    private static PluginCapabilityToken capabilityToken(PluginArtifactIdentity identity) {
+        return new PluginPermissionAuthority().issue(
+                identity,
+                PluginExecutionMode.EMBEDDED,
+                Set.of(),
+                "runtime.payload",
+                Duration.ofMinutes(1)
         );
     }
 

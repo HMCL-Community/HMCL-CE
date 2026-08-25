@@ -20,6 +20,8 @@ package org.jackhuang.hmcl.plugin.loader;
 import org.jackhuang.hmcl.plugin.Plugin;
 import org.jackhuang.hmcl.plugin.PluginArtifactIdentity;
 import org.jackhuang.hmcl.plugin.PluginManifest;
+import org.jackhuang.hmcl.plugin.bridge.PluginCapabilityToken;
+import org.jackhuang.hmcl.plugin.bridge.PluginPermissionAuthority;
 import org.jackhuang.hmcl.plugin.internal.PluginPackageVersions;
 import org.jackhuang.hmcl.plugin.internal.VerifiedPluginPackage;
 import org.jackhuang.hmcl.plugin.runtime.PluginAbi;
@@ -43,6 +45,7 @@ import java.io.StringReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -77,7 +80,13 @@ public final class RuntimePluginLoaderTest {
                 identity
         );
         Path dataDirectory = temporaryDirectory.resolve("storage").resolve(pluginId);
-        Object token = new Object();
+        PluginCapabilityToken token = new PluginPermissionAuthority().issue(
+                identity,
+                PluginExecutionMode.EMBEDDED,
+                Set.of(),
+                "runtime.payload",
+                Duration.ofMinutes(1)
+        );
 
         RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
         RuntimeSupervisor supervisor = new RuntimeSupervisor(registry);

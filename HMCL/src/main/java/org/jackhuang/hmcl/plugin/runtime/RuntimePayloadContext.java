@@ -18,6 +18,7 @@
 package org.jackhuang.hmcl.plugin.runtime;
 
 import org.jackhuang.hmcl.plugin.PluginArtifactIdentity;
+import org.jackhuang.hmcl.plugin.bridge.PluginCapabilityToken;
 import org.jackhuang.hmcl.plugin.internal.VerifiedPluginPackage;
 import org.jetbrains.annotations.NotNullByDefault;
 
@@ -45,7 +46,7 @@ public final class RuntimePayloadContext {
     private final Path dataDirectory;
 
     /// Supplies the current opaque plugin-scoped capability authority.
-    private final Supplier<?> capabilityTokenSupplier;
+    private final Supplier<PluginCapabilityToken> capabilityTokenSupplier;
 
     /// Creates one immutable payload-loading context.
     ///
@@ -63,7 +64,7 @@ public final class RuntimePayloadContext {
             String entrypoint,
             PluginExecutionMode executionMode,
             Path dataDirectory,
-            Supplier<?> capabilityTokenSupplier) {
+            Supplier<PluginCapabilityToken> capabilityTokenSupplier) {
         validateEntrypoint(entrypoint);
         this.artifactIdentity = Objects.requireNonNull(artifactIdentity, "artifactIdentity");
         this.packagePath = packagePath.toAbsolutePath().normalize();
@@ -99,7 +100,7 @@ public final class RuntimePayloadContext {
     }
 
     /// Returns the supplier of current plugin-scoped capability authority.
-    public Supplier<?> capabilityTokenSupplier() {
+    public Supplier<PluginCapabilityToken> capabilityTokenSupplier() {
         return capabilityTokenSupplier;
     }
 

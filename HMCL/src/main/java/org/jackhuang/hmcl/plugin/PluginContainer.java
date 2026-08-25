@@ -211,6 +211,11 @@ public final class PluginContainer {
         context.closeRuntimeProviderRegistrations();
     }
 
+    /// Revokes every capability token issued for this exact loaded artifact.
+    void revokeCapabilityTokens() {
+        context.revokeCapabilityTokens();
+    }
+
     /// Releases one callback lease and performs a pending close after the final callback exits.
     private void releaseHookLease() {
         @Nullable URLClassLoader classLoader = null;

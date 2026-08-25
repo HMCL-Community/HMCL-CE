@@ -653,6 +653,17 @@ public final class PluginStoreManifestTest {
                 """));
     }
 
+    /// Rejects schema-v5 runtime permissions in schema-v4 Store metadata.
+    @Test
+    public void rejectExternalRuntimePermissionsBeforeSchemaFive() {
+        assertManifestRejected(schemaFourVersionDeclarations("""
+                "permissions": ["launcher-core"],
+                "requiredPermissions": ["launcher-core"],
+                "launcherVersion": "*",
+                "dependencies": []
+                """));
+    }
+
     /// Rejects missing, malformed, or schema-incompatible launcher version metadata.
     @Test
     public void rejectInvalidLauncherVersionDeclarations() {

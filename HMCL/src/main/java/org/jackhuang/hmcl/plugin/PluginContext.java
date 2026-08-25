@@ -20,6 +20,8 @@ package org.jackhuang.hmcl.plugin;
 import javafx.scene.Node;
 import javafx.stage.Stage;
 import org.jackhuang.hmcl.Metadata;
+import org.jackhuang.hmcl.plugin.bridge.PluginCapabilityToken;
+import org.jackhuang.hmcl.plugin.bridge.PluginPermissionAuthority;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProvider;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderDescriptor;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderRegistration;
@@ -30,6 +32,7 @@ import org.jetbrains.annotations.Unmodifiable;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumSet;
@@ -62,6 +65,12 @@ public final class PluginContext {
     /// Host-bound callback which publishes one manifest-validated runtime Provider registration.
     private final Function<RuntimeProvider, RuntimeProviderRegistration> runtimeProviderRegistrar;
 
+    /// Optional launcher-owned authority used by manager-created contexts.
+    private final @Nullable PluginPermissionAuthority permissionAuthority;
+
+    /// Exact package identity bound to tokens issued by this context.
+    private final @Nullable PluginArtifactIdentity artifactIdentity;
+
     /// Runtime Provider registrations owned by this exact Host context in registration order.
     private final List<RuntimeProviderRegistration> runtimeProviderRegistrations = new ArrayList<>();
 
@@ -79,7 +88,7 @@ public final class PluginContext {
     ) {
         this(manifest, packageDirectory, dataDirectory, classLoader, "", Set::of, provider -> {
             throw new IllegalStateException("Runtime Provider registration requires a manager-owned plugin context");
-        });
+        }, null);
     }
 
     /// Creates a manager-owned context with dynamic artifact-bound permission decisions.
@@ -102,7 +111,7 @@ public final class PluginContext {
                 grantedPermissionProvider, provider -> {
                     throw new IllegalStateException(
                             "Runtime Provider registration requires a Supervisor-enabled plugin manager");
-                });
+                }, null);
     }
 
     /// Creates a manager-owned context with dynamic permissions and Host-bound Provider registration.
@@ -123,6 +132,38 @@ public final class PluginContext {
             Supplier<@Unmodifiable Set<PluginPermission>> grantedPermissionProvider,
             Function<RuntimeProvider, RuntimeProviderRegistration> runtimeProviderRegistrar
     ) {
+        this(
+                manifest,
+                packageDirectory,
+                dataDirectory,
+                classLoader,
+                artifactSha256,
+                grantedPermissionProvider,
+                runtimeProviderRegistrar,
+                null
+        );
+    }
+
+    /// Creates a manager-owned context with token issuance bound to this exact artifact.
+    ///
+    /// @param manifest package manifest
+    /// @param packageDirectory extracted package directory
+    /// @param dataDirectory persistent plugin data directory
+    /// @param classLoader plugin class loader
+    /// @param artifactSha256 exact `.npl` package digest
+    /// @param grantedPermissionProvider dynamic user-grant provider
+    /// @param runtimeProviderRegistrar Host-bound Provider registration callback
+    /// @param permissionAuthority launcher-owned capability authority
+    PluginContext(
+            PluginManifest manifest,
+            Path packageDirectory,
+            Path dataDirectory,
+            ClassLoader classLoader,
+            String artifactSha256,
+            Supplier<@Unmodifiable Set<PluginPermission>> grantedPermissionProvider,
+            Function<RuntimeProvider, RuntimeProviderRegistration> runtimeProviderRegistrar,
+            @Nullable PluginPermissionAuthority permissionAuthority
+    ) {
         this.manifest = manifest;
         this.packageDirectory = packageDirectory;
         this.dataDirectory = dataDirectory;
@@ -130,6 +171,41 @@ public final class PluginContext {
         this.artifactSha256 = artifactSha256;
         this.grantedPermissionProvider = grantedPermissionProvider;
         this.runtimeProviderRegistrar = runtimeProviderRegistrar;
+        this.permissionAuthority = permissionAuthority;
+        this.artifactIdentity = permissionAuthority == null
+                ? null
+                : new PluginArtifactIdentity(manifest.getId(), manifest.getVersion(), artifactSha256);
+    }
+
+    /// Issues a short-lived token from this exact artifact's current effective grants.
+    ///
+    /// Tokens issued through this context are all revoked together during lifecycle teardown.
+    ///
+    /// @param callbackDomain exact callback domain
+    /// @param lifetime positive token lifetime
+    /// @return opaque artifact-bound token
+    PluginCapabilityToken issueCapabilityToken(String callbackDomain, Duration lifetime) {
+        @Nullable PluginPermissionAuthority authority = permissionAuthority;
+        @Nullable PluginArtifactIdentity identity = artifactIdentity;
+        if (authority == null || identity == null) {
+            throw new IllegalStateException("Capability tokens require a manager-owned plugin context");
+        }
+        return authority.issue(
+                identity,
+                manifest.getExecutionMode(),
+                getGrantedPermissions(),
+                callbackDomain,
+                lifetime
+        );
+    }
+
+    /// Revokes every token issued for this context's exact package artifact.
+    void revokeCapabilityTokens() {
+        @Nullable PluginPermissionAuthority authority = permissionAuthority;
+        @Nullable PluginArtifactIdentity identity = artifactIdentity;
+        if (authority != null && identity != null) {
+            authority.revokeArtifact(identity);
+        }
     }
 
     /// Registers one external runtime Provider whose descriptor exactly matches this Host manifest.

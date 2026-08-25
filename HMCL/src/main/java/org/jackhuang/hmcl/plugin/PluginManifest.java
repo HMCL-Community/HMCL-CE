@@ -542,8 +542,8 @@ public final class PluginManifest {
 
     /// Derives the runtime-provider selection contract for this manifest's normalized schema-v5 declarations.
     ///
-    /// Runtime bridge requirements are derived from the public declaration rather than serialized separately. The
-    /// `raw-jvm` feature is deliberately absent until its permission is introduced by a later schema-v5 task.
+    /// Runtime bridge requirements are derived from the public declaration rather than serialized separately,
+    /// including unsafe JVM and native capabilities requested through schema-v5 permissions.
     ///
     /// @return immutable runtime requirement
     public RuntimeRequirement getRuntimeRequirement() {
@@ -553,6 +553,12 @@ public final class PluginManifest {
         }
         if (hasPatches()) {
             features.add(RuntimeFeature.PATCHES);
+        }
+        if (declaresPermission(PluginPermission.JVM_RAW)) {
+            features.add(RuntimeFeature.RAW_JVM);
+        }
+        if (declaresPermission(PluginPermission.NATIVE_CODE)) {
+            features.add(RuntimeFeature.NATIVE);
         }
         return new RuntimeRequirement(
                 getRuntime(),
@@ -779,9 +785,7 @@ public final class PluginManifest {
                 throw new IOException("Duplicate plugin permission: " + permission.getId());
             }
         }
-        if (schemaVersion < 5
-                && (declaredPermissions.contains(PluginPermission.LAUNCHER_HOOK)
-                || declaredPermissions.contains(PluginPermission.LAUNCHER_PATCH))) {
+        if (schemaVersion < 5 && declaredPermissions.stream().anyMatch(PluginPermission::isSchemaFiveOnly)) {
             throw new IOException("Plugin manifest schemaVersion " + schemaVersion
                     + " cannot declare schema-v5 launcher permissions");
         }

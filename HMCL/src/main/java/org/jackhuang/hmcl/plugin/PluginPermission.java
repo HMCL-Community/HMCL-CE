@@ -65,7 +65,19 @@ public enum PluginPermission {
 
     /// Applies declarative before, after, or replace patches to launcher core methods.
     @SerializedName("launcher-patch")
-    LAUNCHER_PATCH("launcher-patch");
+    LAUNCHER_PATCH("launcher-patch"),
+
+    /// Invokes privileged launcher Core services through the stable language-neutral Bridge.
+    @SerializedName("launcher-core")
+    LAUNCHER_CORE("launcher-core"),
+
+    /// Obtains controlled raw JVM, JNI, JVMTI, Instrumentation, or direct Java object access.
+    @SerializedName("jvm-raw")
+    JVM_RAW("jvm-raw"),
+
+    /// Executes commands through an operating-system shell.
+    @SerializedName("shell")
+    SHELL("shell");
 
     /// Stable kebab-case identifier used in `plugin.json`.
     private final String id;
@@ -82,6 +94,17 @@ public enum PluginPermission {
     /// @return stable JSON identifier
     public String getId() {
         return id;
+    }
+
+    /// Returns whether this capability belongs exclusively to the schema-v5 runtime platform.
+    ///
+    /// @return whether manifests and Store entries before schema v5 must reject this permission
+    public boolean isSchemaFiveOnly() {
+        return this == LAUNCHER_HOOK
+                || this == LAUNCHER_PATCH
+                || this == LAUNCHER_CORE
+                || this == JVM_RAW
+                || this == SHELL;
     }
 
     /// Returns the stable JSON identifier so HMCL's enum adapter preserves kebab-case values.

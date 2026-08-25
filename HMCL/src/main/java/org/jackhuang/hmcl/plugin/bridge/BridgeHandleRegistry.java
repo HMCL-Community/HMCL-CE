@@ -104,12 +104,12 @@ public final class BridgeHandleRegistry<T> {
     public Object resolve(T authority, BridgeHandle handle, String expectedType) throws BridgeError {
         Objects.requireNonNull(handle, "handle");
         Objects.requireNonNull(expectedType, "expectedType");
-        String authorityOwner = requireVerifiedOwner(authority);
         synchronized (this) {
             Entry entry = entries.get(handle.id());
             if (entry == null || entry.handle().generation() != handle.generation()) {
                 throw BridgeError.of(BridgeError.Category.STALE_HANDLE);
             }
+            String authorityOwner = requireVerifiedOwner(authority, entry.ownerPluginId());
             if (!entry.ownerPluginId().equals(authorityOwner)) {
                 throw BridgeError.of(BridgeError.Category.PERMISSION_DENIED);
             }
@@ -208,9 +208,12 @@ public final class BridgeHandleRegistry<T> {
     ///
     /// @param authority opaque authority
     /// @return canonical authority owner
-    private String requireVerifiedOwner(T authority) {
+    private String requireVerifiedOwner(T authority, String expectedOwnerPluginId) {
         try {
-            String owner = ownerVerifier.requireOwner(Objects.requireNonNull(authority, "authority"));
+            String owner = ownerVerifier.requireOwner(
+                    Objects.requireNonNull(authority, "authority"),
+                    expectedOwnerPluginId
+            );
             requireOwnerId(owner);
             return owner;
         } catch (BridgeError error) {
@@ -241,7 +244,7 @@ public final class BridgeHandleRegistry<T> {
         ///
         /// @param authority opaque authority
         /// @return canonical authenticated owner plugin ID
-        String requireOwner(T authority);
+        String requireOwner(T authority, String expectedOwnerPluginId);
     }
 
     /// Stores one JVM reference and its owner privately behind an owner-free handle.
