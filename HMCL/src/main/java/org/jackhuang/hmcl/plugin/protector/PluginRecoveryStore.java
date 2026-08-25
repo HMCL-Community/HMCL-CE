@@ -32,6 +32,8 @@ import java.io.IOException;
 import java.io.StringReader;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
@@ -77,7 +79,7 @@ public final class PluginRecoveryStore {
         /// Durability does not apply because the requested record was definitely not published.
         NOT_APPLICABLE,
 
-        /// Durability is unknown because target identity or repair state is indeterminate.
+        /// Durability is unknown because a published target could not be forced or state is indeterminate.
         UNKNOWN,
 
         /// Both file content and parent-directory metadata were forced to stable storage.
@@ -96,7 +98,8 @@ public final class PluginRecoveryStore {
         /// Validates one coherent publication classification.
         public PublicationResult {
             boolean valid = switch (outcome) {
-                case PUBLISHED -> durability == PublicationDurability.FILE_AND_DIRECTORY_FORCED
+                case PUBLISHED -> durability == PublicationDurability.UNKNOWN
+                        || durability == PublicationDurability.FILE_AND_DIRECTORY_FORCED
                         || durability == PublicationDurability.FILE_FORCED_ONLY;
                 case NOT_PUBLISHED -> durability == PublicationDurability.NOT_APPLICABLE;
                 case INDETERMINATE -> durability == PublicationDurability.UNKNOWN;
@@ -143,6 +146,9 @@ public final class PluginRecoveryStore {
     /// Reserved sibling prefix for uniquely owned crash-recoverable temporary files.
     static final String TEMP_FILE_PREFIX = FILE_NAME + ".tmp-";
 
+    /// Stable repository lock filename shared by every launcher process using the recovery store.
+    static final String LOCK_FILE_NAME = "plugin-startup-recovery.lock";
+
     /// Current strict recovery-document schema version.
     private static final int SCHEMA_VERSION = 1;
 
@@ -167,11 +173,20 @@ public final class PluginRecoveryStore {
             PublicationDurability.UNKNOWN
     );
 
+    /// Known publication whose reconciled target could not complete a verified file durability barrier.
+    private static final PublicationResult PUBLISHED_UNKNOWN = new PublicationResult(
+            PublicationOutcome.PUBLISHED,
+            PublicationDurability.UNKNOWN
+    );
+
     /// Normalized launcher-local directory containing the exact recovery targets.
     private final Path launcherHome;
 
     /// Exact recovery document path.
     private final Path recoveryFile;
+
+    /// Stable recovery operation lock-file path.
+    private final Path operationLockFile;
 
     /// Injectable filesystem operations used for path identity and durable publication.
     private final FileOperations fileOperations;
@@ -190,6 +205,7 @@ public final class PluginRecoveryStore {
     PluginRecoveryStore(Path launcherHome, FileOperations fileOperations) {
         this.launcherHome = launcherHome.toAbsolutePath().normalize();
         this.recoveryFile = this.launcherHome.resolve(FILE_NAME);
+        this.operationLockFile = this.launcherHome.resolve(LOCK_FILE_NAME);
         this.fileOperations = fileOperations;
     }
 
@@ -243,12 +259,12 @@ public final class PluginRecoveryStore {
                     new IOException()
             );
         }
-        ReentrantLock operationLock = operationLock(homeIdentity);
-        operationLock.lock();
-        try {
+        try (OperationLease ignored = acquireOperationLease(homeIdentity)) {
             return saveLocked(bytes, homeIdentity);
-        } finally {
-            operationLock.unlock();
+        } catch (PublicationException exception) {
+            throw exception;
+        } catch (IOException failure) {
+            throw publicationFailure(NOT_PUBLISHED, "Plugin recovery operation lock is unavailable", failure);
         }
     }
 
@@ -286,7 +302,7 @@ public final class PluginRecoveryStore {
                     "Plugin recovery publication failed before replacement",
                     failure
             );
-            cleanupOwnedTemporary(temporaryFile, createdTemporaryFile, exception);
+            cleanupOwnedTemporary(temporaryFile, createdTemporaryFile, homeIdentity, exception);
             throw exception;
         }
 
@@ -343,14 +359,15 @@ public final class PluginRecoveryStore {
                     moveFailure
             );
             exception.addSuppressed(inspectionFailure);
-            cleanupOwnedTemporary(temporaryFile, createdTemporaryFile, exception);
+            cleanupOwnedTemporary(temporaryFile, createdTemporaryFile, homeIdentity, exception);
             throw exception;
         }
 
         if (current.matches(requested)) {
-            PublicationResult result = publishedResult(forceParentDirectoryBestEffort(launcherHome));
+            PublicationResult result = forceReconciledPublication(homeIdentity);
             try {
                 if (createdTemporaryFile) {
+                    verifyHomeIdentity(homeIdentity);
                     fileOperations.deleteOwnedTemporary(temporaryFile);
                 }
             } catch (IOException cleanupFailure) {
@@ -371,7 +388,7 @@ public final class PluginRecoveryStore {
                     "Plugin recovery replacement did not publish the requested record",
                     moveFailure
             );
-            cleanupOwnedTemporary(temporaryFile, createdTemporaryFile, exception);
+            cleanupOwnedTemporary(temporaryFile, createdTemporaryFile, homeIdentity, exception);
             throw exception;
         }
 
@@ -384,7 +401,7 @@ public final class PluginRecoveryStore {
                     moveFailure
             );
             exception.addSuppressed(repairFailure);
-            cleanupOwnedTemporary(temporaryFile, createdTemporaryFile, exception);
+            cleanupOwnedTemporary(temporaryFile, createdTemporaryFile, homeIdentity, exception);
             throw exception;
         }
 
@@ -393,8 +410,26 @@ public final class PluginRecoveryStore {
                 "Plugin recovery target was restored after replacement failure",
                 moveFailure
         );
-        cleanupOwnedTemporary(temporaryFile, createdTemporaryFile, exception);
+        cleanupOwnedTemporary(temporaryFile, createdTemporaryFile, homeIdentity, exception);
         throw exception;
+    }
+
+    /// Forces a target recognized after an ambiguous move before advertising file durability.
+    ///
+    /// @param homeIdentity launcher-home identity held across reconciliation
+    /// @return completed durability barriers, or known publication with unknown durability when forcing fails
+    private PublicationResult forceReconciledPublication(HomeIdentity homeIdentity) {
+        try {
+            verifyHomeIdentity(homeIdentity);
+            if (!isRegularRecoveryTarget()) {
+                return PUBLISHED_UNKNOWN;
+            }
+            fileOperations.forcePublishedTarget(recoveryFile);
+            verifyHomeIdentity(homeIdentity);
+            return publishedResult(forceParentDirectoryBestEffort(launcherHome));
+        } catch (IOException ignored) {
+            return PUBLISHED_UNKNOWN;
+        }
     }
 
     /// Restores the exact bounded target snapshot using atomic replacement when prior bytes existed.
@@ -432,6 +467,7 @@ public final class PluginRecoveryStore {
             } finally {
                 if (createdRepairFile) {
                     try {
+                        verifyHomeIdentity(homeIdentity);
                         fileOperations.deleteOwnedTemporary(repairFile);
                     } catch (IOException cleanupFailure) {
                         if (failure != null) {
@@ -456,16 +492,19 @@ public final class PluginRecoveryStore {
     ///
     /// @param temporaryFile exact temporary path owned by this save
     /// @param createdTemporaryFile whether this save created its temporary path
+    /// @param homeIdentity launcher-home identity captured before creation
     /// @param exception classified primary failure
     private void cleanupOwnedTemporary(
             Path temporaryFile,
             boolean createdTemporaryFile,
+            HomeIdentity homeIdentity,
             PublicationException exception
     ) {
         if (!createdTemporaryFile) {
             return;
         }
         try {
+            verifyHomeIdentity(homeIdentity);
             fileOperations.deleteOwnedTemporary(temporaryFile);
         } catch (IOException cleanupFailure) {
             exception.addSuppressed(cleanupFailure);
@@ -483,15 +522,62 @@ public final class PluginRecoveryStore {
         if (homeIdentity == null) {
             return;
         }
-        ReentrantLock operationLock = operationLock(homeIdentity);
-        operationLock.lock();
-        try {
+        try (OperationLease ignored = acquireOperationLease(homeIdentity)) {
             verifyHomeIdentity(homeIdentity);
             deleteExactTarget(recoveryFile);
             verifyHomeIdentity(homeIdentity);
             forceParentDirectoryBestEffort(launcherHome);
-        } finally {
-            operationLock.unlock();
+        }
+    }
+
+    /// Acquires the shared JVM lock and stable OS file lock for one validated launcher home.
+    ///
+    /// The JVM lock prevents ordinary overlapping-lock exceptions between store instances in this process. A retry
+    /// handles an independently opened lock in this JVM using the same semantics as another process holding the file.
+    ///
+    /// @param homeIdentity validated launcher-home identity
+    /// @return held operation lease
+    /// @throws IOException if the lock file is unsafe, acquisition is interrupted, or opening fails
+    private OperationLease acquireOperationLease(HomeIdentity homeIdentity) throws IOException {
+        ReentrantLock processLock = operationLock(homeIdentity);
+        processLock.lock();
+        @Nullable FileChannel channel = null;
+        try {
+            try {
+                BasicFileAttributes attributes = fileOperations.readAttributes(operationLockFile);
+                if (!attributes.isRegularFile() || attributes.isSymbolicLink()) {
+                    throw new IOException("Plugin recovery operation lock has an unsafe file type");
+                }
+            } catch (NoSuchFileException ignored) {
+                // Exclusive JVM ownership below safely creates the stable lock file when absent.
+            }
+            channel = fileOperations.openOperationLock(operationLockFile);
+            while (true) {
+                try {
+                    @Nullable FileLock fileLock = channel.tryLock();
+                    if (fileLock != null) {
+                        return new OperationLease(processLock, channel, fileLock);
+                    }
+                } catch (OverlappingFileLockException ignored) {
+                    // A test harness or independent subsystem in this JVM owns the same OS lock.
+                }
+                try {
+                    Thread.sleep(10L);
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Plugin recovery operation lock acquisition was interrupted", exception);
+                }
+            }
+        } catch (IOException | RuntimeException failure) {
+            if (channel != null) {
+                try {
+                    channel.close();
+                } catch (IOException cleanupFailure) {
+                    failure.addSuppressed(cleanupFailure);
+                }
+            }
+            processLock.unlock();
+            throw failure;
         }
     }
 
@@ -598,11 +684,10 @@ public final class PluginRecoveryStore {
     /// @return decoded JSON, or `null` when absent at handle acquisition
     /// @throws IOException if the direct path cannot be safely read
     private @Nullable String readRecoveryFile() throws IOException {
-        try (FileChannel channel = FileChannel.open(
-                recoveryFile,
-                StandardOpenOption.READ,
-                LinkOption.NOFOLLOW_LINKS
-        )) {
+        if (!isRegularRecoveryTarget()) {
+            return null;
+        }
+        try (FileChannel channel = fileOperations.openReadable(recoveryFile)) {
             if (channel.size() > MAX_RECOVERY_BYTES) {
                 throw new IOException("Plugin recovery document is too large");
             }
@@ -629,11 +714,10 @@ public final class PluginRecoveryStore {
     /// @return present exact bytes or a definite absent snapshot
     /// @throws IOException if the direct target is unsafe, oversized, unstable, or unreadable
     private TargetSnapshot readTargetSnapshot() throws IOException {
-        try (FileChannel channel = FileChannel.open(
-                recoveryFile,
-                StandardOpenOption.READ,
-                LinkOption.NOFOLLOW_LINKS
-        )) {
+        if (!isRegularRecoveryTarget()) {
+            return TargetSnapshot.absent();
+        }
+        try (FileChannel channel = fileOperations.openReadable(recoveryFile)) {
             if (channel.size() > MAX_RECOVERY_BYTES) {
                 throw new IOException("Plugin recovery document is too large to snapshot");
             }
@@ -650,6 +734,22 @@ public final class PluginRecoveryStore {
             return new TargetSnapshot(true, bytes);
         } catch (NoSuchFileException ignored) {
             return TargetSnapshot.absent();
+        }
+    }
+
+    /// Classifies the direct recovery target before opening a potentially blocking read handle.
+    ///
+    /// @return `true` for an existing regular file, or `false` when definitely absent
+    /// @throws IOException if target attributes are uncertain or identify a non-regular entry
+    private boolean isRegularRecoveryTarget() throws IOException {
+        try {
+            BasicFileAttributes attributes = fileOperations.readAttributes(recoveryFile);
+            if (!attributes.isRegularFile()) {
+                throw new IOException("Plugin recovery target is not a regular file");
+            }
+            return true;
+        } catch (NoSuchFileException ignored) {
+            return false;
         }
     }
 
@@ -871,11 +971,14 @@ public final class PluginRecoveryStore {
     ///
     /// @param target exact managed path
     /// @throws IOException if another file type occupies the path or deletion fails
-    private static void deleteExactTarget(Path target) throws IOException {
-        if (!Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
+    private void deleteExactTarget(Path target) throws IOException {
+        BasicFileAttributes attributes;
+        try {
+            attributes = fileOperations.readAttributes(target);
+        } catch (NoSuchFileException ignored) {
             return;
         }
-        if (!Files.isRegularFile(target, LinkOption.NOFOLLOW_LINKS) && !Files.isSymbolicLink(target)) {
+        if (!attributes.isRegularFile() && !attributes.isSymbolicLink()) {
             throw new IOException("Plugin recovery target has an unsafe file type");
         }
         Files.delete(target);
@@ -948,6 +1051,19 @@ public final class PluginRecoveryStore {
             return Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
         }
 
+        /// Opens one existing regular recovery target without following its final link.
+        ///
+        /// @param path direct recovery target
+        /// @return open readable channel
+        /// @throws IOException if the target cannot be opened safely
+        FileChannel openReadable(Path path) throws IOException {
+            return FileChannel.open(
+                    path,
+                    StandardOpenOption.READ,
+                    LinkOption.NOFOLLOW_LINKS
+            );
+        }
+
         /// Resolves one real path with caller-selected link handling.
         ///
         /// @param path source path
@@ -972,12 +1088,40 @@ public final class PluginRecoveryStore {
             );
         }
 
+        /// Opens the stable no-follow operation lock file, creating it when absent.
+        ///
+        /// @param path stable repository lock path
+        /// @return open writable lock-file channel
+        /// @throws IOException if the direct lock file cannot be opened safely
+        FileChannel openOperationLock(Path path) throws IOException {
+            return FileChannel.open(
+                    path,
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.WRITE,
+                    LinkOption.NOFOLLOW_LINKS
+            );
+        }
+
         /// Forces all temporary file content and metadata before publication.
         ///
         /// @param channel open owned temporary-file channel
         /// @throws IOException if the provider cannot force the file
         void forceTemporary(FileChannel channel) throws IOException {
             channel.force(true);
+        }
+
+        /// Opens and forces a reconciled published target through its exact no-follow path.
+        ///
+        /// @param target verified regular recovery target
+        /// @throws IOException if the target cannot be opened or forced
+        void forcePublishedTarget(Path target) throws IOException {
+            try (FileChannel channel = FileChannel.open(
+                    target,
+                    StandardOpenOption.WRITE,
+                    LinkOption.NOFOLLOW_LINKS
+            )) {
+                channel.force(true);
+            }
         }
 
         /// Atomically replaces the recovery document when supported by the provider.
@@ -1086,6 +1230,50 @@ public final class PluginRecoveryStore {
         /// @return whether both target states are exact matches
         private boolean equalsContent(TargetSnapshot other) {
             return present == other.present && Arrays.equals(bytes, other.bytes);
+        }
+    }
+
+    /// Held JVM and OS lock resources spanning one complete recovery mutation.
+    @NotNullByDefault
+    private static final class OperationLease implements AutoCloseable {
+        /// Shared per-real-home JVM lock.
+        private final ReentrantLock processLock;
+
+        /// Open stable lock-file channel.
+        private final FileChannel channel;
+
+        /// Held exclusive OS file lock.
+        private final FileLock fileLock;
+
+        /// Creates one held operation lease.
+        ///
+        /// @param processLock held JVM lock
+        /// @param channel open lock-file channel
+        /// @param fileLock held OS file lock
+        private OperationLease(ReentrantLock processLock, FileChannel channel, FileLock fileLock) {
+            this.processLock = processLock;
+            this.channel = channel;
+            this.fileLock = fileLock;
+        }
+
+        /// Releases the OS resources before allowing another JVM-local operation to acquire them.
+        ///
+        /// Lock release is best effort after the mutation outcome is already known; closing the channel also releases
+        /// its lock on every supported provider.
+        @Override
+        public void close() {
+            try {
+                fileLock.release();
+            } catch (IOException ignored) {
+                // Closing the channel below provides the second release mechanism.
+            }
+            try {
+                channel.close();
+            } catch (IOException ignored) {
+                // The mutation result remains authoritative after release was attempted.
+            } finally {
+                processLock.unlock();
+            }
         }
     }
 }

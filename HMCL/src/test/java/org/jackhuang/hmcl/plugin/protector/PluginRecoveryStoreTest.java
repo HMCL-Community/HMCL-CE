@@ -24,6 +24,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.AccessDeniedException;
@@ -295,6 +296,34 @@ public final class PluginRecoveryStoreTest {
         );
     }
 
+    /// Fails closed when clear cannot establish the exact target's no-follow type.
+    ///
+    /// @param temporaryDirectory isolated filesystem root
+    /// @throws Exception if fixture setup or verification fails
+    @Test
+    public void rejectUncertainTargetAttributesDuringClear(@TempDir Path temporaryDirectory) throws Exception {
+        for (boolean denied : List.of(true, false)) {
+            Path home = temporaryDirectory.resolve(Boolean.toString(denied));
+            PluginRecoveryRecord retained = record(
+                    PluginRecoveryRecord.FailureReason.UNEXPECTED_PROCESS_EXIT,
+                    100L
+            );
+            new PluginRecoveryStore(home).save(retained);
+            Path recoveryFile = home.resolve(PluginRecoveryStore.FILE_NAME);
+            PluginRecoveryStore store = new PluginRecoveryStore(
+                    home,
+                    new TargetAttributeFailureOperations(recoveryFile, denied)
+            );
+
+            if (denied) {
+                assertThrows(AccessDeniedException.class, store::clear);
+            } else {
+                assertThrows(IOException.class, store::clear);
+            }
+            assertEquals(retained, new PluginRecoveryStore(home).load().orElseThrow());
+        }
+    }
+
     /// Rejects arbitrary exception text and secret-shaped reason values without echoing them through errors.
     ///
     /// @param temporaryDirectory isolated launcher-local home
@@ -375,6 +404,35 @@ public final class PluginRecoveryStoreTest {
         assertThrows(IOException.class, () -> new PluginRecoveryStore(temporaryDirectory).load());
         assertTrue(Files.isSymbolicLink(recoveryFile));
         assertEquals("{}", Files.readString(target, StandardCharsets.UTF_8));
+    }
+
+    /// Rejects a non-regular no-follow target before load or snapshot opens a potentially blocking handle.
+    ///
+    /// @param temporaryDirectory isolated launcher-local home
+    /// @throws Exception if fixture setup or verification fails
+    @Test
+    public void rejectSpecialRecoveryTargetBeforeOpeningIt(@TempDir Path temporaryDirectory) throws Exception {
+        PluginRecoveryRecord retained = record(
+                PluginRecoveryRecord.FailureReason.UNEXPECTED_PROCESS_EXIT,
+                100L
+        );
+        new PluginRecoveryStore(temporaryDirectory).save(retained);
+        Path recoveryFile = temporaryDirectory.resolve(PluginRecoveryStore.FILE_NAME);
+        SpecialTargetOperations operations = new SpecialTargetOperations(recoveryFile);
+        PluginRecoveryStore guarded = new PluginRecoveryStore(temporaryDirectory, operations);
+
+        assertThrows(IOException.class, guarded::load);
+        PluginRecoveryStore.PublicationException exception = assertThrows(
+                PluginRecoveryStore.PublicationException.class,
+                () -> guarded.save(record(
+                        PluginRecoveryRecord.FailureReason.UNEXPECTED_PROCESS_EXIT,
+                        200L
+                ))
+        );
+
+        assertEquals(PluginRecoveryStore.PublicationOutcome.NOT_PUBLISHED, exception.result().outcome());
+        assertEquals(0, operations.readOpens);
+        assertEquals(retained, new PluginRecoveryStore(temporaryDirectory).load().orElseThrow());
     }
 
     /// Rejects a launcher home that is itself a symbolic link for load, clear, and save.
@@ -466,15 +524,46 @@ public final class PluginRecoveryStoreTest {
             SwapOnSecondInspectionOperations operations = new SwapOnSecondInspectionOperations(
                     directHome,
                     movedDirectHome,
-                    retainedHome
+                    retainedHome,
+                    root.resolve("external-operation.lock")
             );
             PluginRecoveryStore guardedStore = new PluginRecoveryStore(directHome, operations);
 
             assertThrows(IOException.class, () -> runStoreOperation(operation, guardedStore));
 
+            assertTrue(Files.isDirectory(movedDirectHome), operation + " fixture did not complete directory swap");
             assertEquals(original, new PluginRecoveryStore(movedDirectHome).load().orElseThrow());
             assertEquals(retained, new PluginRecoveryStore(retainedHome).load().orElseThrow());
         }
+    }
+
+    /// Never deletes a same-UUID file through a replacement home after temp creation makes identity uncertain.
+    ///
+    /// @param temporaryDirectory isolated filesystem root
+    /// @throws Exception if fixture mutation or verification fails
+    @Test
+    public void retainReplacementHomeTemporaryWhenIdentityChangesAfterCreation(@TempDir Path temporaryDirectory)
+            throws Exception {
+        Path directHome = temporaryDirectory.resolve("direct-home");
+        Path movedHome = temporaryDirectory.resolve("moved-home");
+        Files.createDirectories(directHome);
+        SwapAfterTemporaryCreationOperations operations = new SwapAfterTemporaryCreationOperations(
+                directHome,
+                movedHome,
+                temporaryDirectory.resolve("external-operation.lock")
+        );
+
+        assertThrows(
+                PluginRecoveryStore.PublicationException.class,
+                () -> new PluginRecoveryStore(directHome, operations).save(record(
+                        PluginRecoveryRecord.FailureReason.UNEXPECTED_PROCESS_EXIT,
+                        100L
+                ))
+        );
+
+        Path createdPath = java.util.Objects.requireNonNull(operations.createdPath);
+        assertFalse(operations.cleanupAttempted);
+        assertTrue(Files.exists(directHome.resolve(createdPath.getFileName())));
     }
 
     /// Ignores an unrelated fixed-name temporary directory when publishing through a unique sibling.
@@ -613,6 +702,46 @@ public final class PluginRecoveryStoreTest {
         }
     }
 
+    /// Holds the repository lock as another process so its repair cannot overwrite a later publication.
+    ///
+    /// @param temporaryDirectory isolated launcher-local home
+    /// @throws Exception if lock acquisition, persistence, or verification fails
+    @Test
+    public void serializePublicationAndRepairAcrossIndependentFileLocks(@TempDir Path temporaryDirectory)
+            throws Exception {
+        PluginRecoveryRecord previous = record(
+                PluginRecoveryRecord.FailureReason.UNEXPECTED_PROCESS_EXIT,
+                100L
+        );
+        PluginRecoveryRecord replacement = record(
+                PluginRecoveryRecord.FailureReason.UNEXPECTED_PROCESS_EXIT,
+                200L
+        );
+        PluginRecoveryStore store = new PluginRecoveryStore(temporaryDirectory);
+        store.save(previous);
+        byte[] previousBytes = Files.readAllBytes(temporaryDirectory.resolve(PluginRecoveryStore.FILE_NAME));
+        Path lockFile = temporaryDirectory.resolve("plugin-startup-recovery.lock");
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try (FileChannel lockChannel = FileChannel.open(
+                lockFile,
+                java.nio.file.StandardOpenOption.CREATE,
+                java.nio.file.StandardOpenOption.WRITE
+        ); FileLock ignored = lockChannel.lock()) {
+            Future<?> publication = executor.submit(() -> saveUnchecked(
+                    new PluginRecoveryStore(temporaryDirectory),
+                    replacement
+            ));
+
+            assertThrows(TimeoutException.class, () -> publication.get(250L, TimeUnit.MILLISECONDS));
+            Files.write(temporaryDirectory.resolve(PluginRecoveryStore.FILE_NAME), previousBytes);
+        } finally {
+            executor.shutdown();
+        }
+
+        assertTrue(executor.awaitTermination(10L, TimeUnit.SECONDS));
+        assertEquals(replacement, store.load().orElseThrow());
+    }
+
     /// Falls back to non-atomic replacement only when atomic movement is explicitly unsupported.
     ///
     /// @param temporaryDirectory isolated launcher-local home
@@ -748,17 +877,47 @@ public final class PluginRecoveryStoreTest {
             );
             new PluginRecoveryStore(home).save(previous);
 
-            PluginRecoveryStore.PublicationResult result = new PluginRecoveryStore(
-                    home,
-                    new AmbiguousMoveOperations(home, mode)
-            ).save(replacement);
+            AmbiguousMoveOperations operations = new AmbiguousMoveOperations(home, mode);
+            PluginRecoveryStore.PublicationResult result = new PluginRecoveryStore(home, operations).save(replacement);
 
             assertEquals(PluginRecoveryStore.PublicationOutcome.PUBLISHED, result.outcome());
             assertTrue(result.durability() == PluginRecoveryStore.PublicationDurability.FILE_FORCED_ONLY
                     || result.durability() == PluginRecoveryStore.PublicationDurability.FILE_AND_DIRECTORY_FORCED);
+            assertEquals(1, operations.publishedTargetForces);
             assertEquals(replacement, new PluginRecoveryStore(home).load().orElseThrow());
             assertNoControlledTemporaryFiles(home);
         }
+    }
+
+    /// Reports known reconciled publication with unknown durability when the requested target cannot be forced.
+    ///
+    /// @param temporaryDirectory isolated launcher-local home
+    /// @throws Exception if fixture setup or reconciliation fails
+    @Test
+    public void reportUnknownDurabilityWhenReconciledTargetForceFails(@TempDir Path temporaryDirectory)
+            throws Exception {
+        PluginRecoveryRecord replacement = record(
+                PluginRecoveryRecord.FailureReason.UNEXPECTED_PROCESS_EXIT,
+                200L
+        );
+        new PluginRecoveryStore(temporaryDirectory).save(record(
+                PluginRecoveryRecord.FailureReason.UNEXPECTED_PROCESS_EXIT,
+                100L
+        ));
+        AmbiguousMoveOperations operations = new AmbiguousMoveOperations(
+                temporaryDirectory,
+                AmbiguousMoveMode.ATOMIC_MOVE_THEN_THROW
+        );
+        operations.failPublishedTargetForce = true;
+
+        PluginRecoveryStore.PublicationResult result =
+                new PluginRecoveryStore(temporaryDirectory, operations).save(replacement);
+
+        assertEquals(PluginRecoveryStore.PublicationOutcome.PUBLISHED, result.outcome());
+        assertEquals(PluginRecoveryStore.PublicationDurability.UNKNOWN, result.durability());
+        assertEquals(1, operations.publishedTargetForces);
+        assertEquals(replacement, new PluginRecoveryStore(temporaryDirectory).load().orElseThrow());
+        assertNoControlledTemporaryFiles(temporaryDirectory);
     }
 
     /// Repairs partial, missing, and corrupt fallback targets to the exact previous bounded snapshot.
@@ -1173,6 +1332,9 @@ public final class PluginRecoveryStoreTest {
         /// Existing directory targeted by the replacement symlink.
         private final Path redirectedHome;
 
+        /// Lock file outside launcher home so Windows permits the deterministic directory move.
+        private final Path externalLockFile;
+
         /// Number of completed direct-home attribute inspections.
         private int inspections;
 
@@ -1181,14 +1343,31 @@ public final class PluginRecoveryStoreTest {
         /// @param directHome direct launcher home
         /// @param movedDirectHome destination retaining the direct home
         /// @param redirectedHome replacement symlink target
+        /// @param externalLockFile external injected operation lock file
         private SwapOnSecondInspectionOperations(
                 Path directHome,
                 Path movedDirectHome,
-                Path redirectedHome
+                Path redirectedHome,
+                Path externalLockFile
         ) {
             this.directHome = directHome;
             this.movedDirectHome = movedDirectHome;
             this.redirectedHome = redirectedHome;
+            this.externalLockFile = externalLockFile;
+        }
+
+        /// Opens the operation lock outside launcher home for this directory-swap fixture.
+        ///
+        /// @param ignored normal repository lock path
+        /// @return open external lock-file channel
+        /// @throws IOException if opening fails
+        @Override
+        FileChannel openOperationLock(Path ignored) throws IOException {
+            return FileChannel.open(
+                    externalLockFile,
+                    java.nio.file.StandardOpenOption.CREATE,
+                    java.nio.file.StandardOpenOption.WRITE
+            );
         }
 
         /// Swaps the exact launcher home after its second no-follow attribute read.
@@ -1204,6 +1383,111 @@ public final class PluginRecoveryStoreTest {
                 Files.createSymbolicLink(directHome, redirectedHome);
             }
             return attributes;
+        }
+    }
+
+    /// File operations that replace launcher home immediately after creating an owned temporary file.
+    @NotNullByDefault
+    private static final class SwapAfterTemporaryCreationOperations extends PluginRecoveryStore.FileOperations {
+        /// Direct launcher home replaced during the save.
+        private final Path directHome;
+
+        /// Destination retaining the original home and owned temporary file.
+        private final Path movedHome;
+
+        /// Lock file outside launcher home so Windows permits the deterministic directory move.
+        private final Path externalLockFile;
+
+        /// Exact created temporary path, or `null` before creation.
+        private volatile @org.jetbrains.annotations.Nullable Path createdPath;
+
+        /// Whether launcher home has been physically replaced.
+        private boolean swapped;
+
+        /// Whether production attempted pathname cleanup after identity became uncertain.
+        private boolean cleanupAttempted;
+
+        /// Creates deterministic post-creation swap operations.
+        ///
+        /// @param directHome direct launcher home
+        /// @param movedHome destination retaining the original home
+        /// @param externalLockFile external injected operation lock file
+        private SwapAfterTemporaryCreationOperations(Path directHome, Path movedHome, Path externalLockFile) {
+            this.directHome = directHome;
+            this.movedHome = movedHome;
+            this.externalLockFile = externalLockFile;
+        }
+
+        /// Opens the operation lock outside launcher home for this directory-swap fixture.
+        ///
+        /// @param ignored normal repository lock path
+        /// @return open external lock-file channel
+        /// @throws IOException if opening fails
+        @Override
+        FileChannel openOperationLock(Path ignored) throws IOException {
+            return FileChannel.open(
+                    externalLockFile,
+                    java.nio.file.StandardOpenOption.CREATE,
+                    java.nio.file.StandardOpenOption.WRITE
+            );
+        }
+
+        /// Creates the owned temp and replaces launcher home before returning its original-home channel.
+        ///
+        /// @param path unique temporary path
+        /// @return channel bound to the moved original-home file
+        /// @throws IOException if creation or fixture mutation fails
+        @Override
+        FileChannel createNewWritable(Path path) throws IOException {
+            FileChannel channel = super.createNewWritable(path);
+            createdPath = path;
+            try {
+                Files.move(directHome, movedHome, StandardCopyOption.ATOMIC_MOVE);
+                Files.createDirectories(directHome);
+                return channel;
+            } catch (IOException failure) {
+                channel.close();
+                throw failure;
+            }
+        }
+
+        /// Forces the original-home temp before planting a same-UUID replacement-home sentinel.
+        ///
+        /// @param channel open original-home temporary channel
+        /// @throws IOException if forcing or sentinel creation fails
+        @Override
+        void forceTemporary(FileChannel channel) throws IOException {
+            super.forceTemporary(channel);
+            Path originalPath = java.util.Objects.requireNonNull(createdPath);
+            Files.writeString(
+                    directHome.resolve(originalPath.getFileName()),
+                    "replacement-sentinel",
+                    StandardCharsets.UTF_8
+            );
+            swapped = true;
+        }
+
+        /// Makes post-swap home identity explicitly indeterminate on every filesystem provider.
+        ///
+        /// @param path inspected path
+        /// @return no-follow attributes before the swap
+        /// @throws IOException after the exact launcher home is replaced or when normal inspection fails
+        @Override
+        BasicFileAttributes readAttributes(Path path) throws IOException {
+            if (swapped && path.equals(directHome)) {
+                throw new IOException("injected post-creation identity uncertainty");
+            }
+            return super.readAttributes(path);
+        }
+
+        /// Records any unsafe pathname cleanup attempt before delegating.
+        ///
+        /// @param temporaryFile exact temporary path requested for deletion
+        /// @throws IOException if delegated deletion fails
+        @Override
+        void deleteOwnedTemporary(Path temporaryFile) throws IOException {
+            cleanupAttempted = true;
+            super.deleteOwnedTemporary(temporaryFile);
         }
     }
 
@@ -1429,6 +1713,79 @@ public final class PluginRecoveryStoreTest {
         }
     }
 
+    /// File operations that make exact recovery-target attribute inspection denied or indeterminate.
+    @NotNullByDefault
+    private static final class TargetAttributeFailureOperations extends PluginRecoveryStore.FileOperations {
+        /// Exact recovery target whose attributes cannot be established.
+        private final Path target;
+
+        /// Whether inspection reports access denial.
+        private final boolean denied;
+
+        /// Creates one fail-closed target attribute boundary.
+        ///
+        /// @param target exact recovery target
+        /// @param denied whether inspection reports access denial
+        private TargetAttributeFailureOperations(Path target, boolean denied) {
+            this.target = target;
+            this.denied = denied;
+        }
+
+        /// Rejects exact target inspection while delegating every home and lock-file component.
+        ///
+        /// @param path inspected path
+        /// @return delegated no-follow attributes
+        /// @throws IOException for the controlled target outcome or delegated failure
+        @Override
+        BasicFileAttributes readAttributes(Path path) throws IOException {
+            if (!path.equals(target)) {
+                return super.readAttributes(path);
+            }
+            if (denied) {
+                throw new AccessDeniedException(path.toString());
+            }
+            throw new IOException("injected indeterminate target attributes");
+        }
+    }
+
+    /// File operations that report the recovery target as a special file and count direct read opens.
+    @NotNullByDefault
+    private static final class SpecialTargetOperations extends PluginRecoveryStore.FileOperations {
+        /// Exact recovery target reported with non-regular attributes.
+        private final Path target;
+
+        /// Number of attempted direct read-handle opens.
+        private int readOpens;
+
+        /// Creates one deterministic special-target boundary.
+        ///
+        /// @param target exact recovery target
+        private SpecialTargetOperations(Path target) {
+            this.target = target;
+        }
+
+        /// Reports directory attributes for the exact target and normal attributes for every other path.
+        ///
+        /// @param path inspected path
+        /// @return no-follow attributes
+        /// @throws IOException if delegated inspection fails
+        @Override
+        BasicFileAttributes readAttributes(Path path) throws IOException {
+            return path.equals(target) ? super.readAttributes(target.getParent()) : super.readAttributes(path);
+        }
+
+        /// Counts any unsafe read open before delegating.
+        ///
+        /// @param path direct read target
+        /// @return open read channel
+        /// @throws IOException if opening fails
+        @Override
+        FileChannel openReadable(Path path) throws IOException {
+            readOpens++;
+            return super.openReadable(path);
+        }
+    }
+
     /// Real filesystem move wrappers that create deterministic ambiguous publication outcomes.
     @NotNullByDefault
     private static final class AmbiguousMoveOperations extends PluginRecoveryStore.FileOperations {
@@ -1443,6 +1800,12 @@ public final class PluginRecoveryStoreTest {
 
         /// Whether a real move completed.
         private boolean moveCompleted;
+
+        /// Number of attempts to force a reconciled published target.
+        private int publishedTargetForces;
+
+        /// Whether forcing a reconciled published target fails.
+        private boolean failPublishedTargetForce;
 
         /// Creates one deterministic ambiguous move wrapper.
         ///
@@ -1510,6 +1873,19 @@ public final class PluginRecoveryStoreTest {
             }
             Files.deleteIfExists(source);
             throw new IOException("injected ambiguous fallback failure");
+        }
+
+        /// Counts and optionally rejects the durability barrier for a reconciled published target.
+        ///
+        /// @param target verified recovery target
+        /// @throws IOException when failure is injected or forcing fails
+        @Override
+        void forcePublishedTarget(Path target) throws IOException {
+            publishedTargetForces++;
+            if (failPublishedTargetForce) {
+                throw new IOException("injected reconciled target force failure");
+            }
+            super.forcePublishedTarget(target);
         }
 
         /// Fails launcher-home inspection only after one real move completed.
