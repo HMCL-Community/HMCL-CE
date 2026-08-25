@@ -26,6 +26,7 @@ import org.junit.jupiter.api.Test;
 import java.lang.reflect.Modifier;
 import java.security.SecureRandom;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
@@ -33,6 +34,7 @@ import java.util.Map;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -54,6 +56,20 @@ public final class PluginPermissionAuthorityTest {
     public void exposeNoPublicCapabilityTokenConstructor() {
         assertFalse(Set.of(PluginCapabilityToken.class.getDeclaredConstructors()).stream()
                 .anyMatch(constructor -> Modifier.isPublic(constructor.getModifiers())));
+    }
+
+    /// Redacts every token string to one fixed value without exposing identity-derived material.
+    @Test
+    public void redactCapabilityTokenStringRepresentations() {
+        PluginPermissionAuthority authority = authority(new MutableClock(NOW));
+        PluginCapabilityToken first = issueCoreToken(authority, PLUGIN_A);
+        PluginCapabilityToken second = issueCoreToken(authority, PLUGIN_B);
+
+        assertEquals("PluginCapabilityToken[redacted]", first.toString());
+        assertEquals(first.toString(), second.toString());
+        assertFalse(first.toString().contains(Integer.toString(first.hashCode())));
+        assertFalse(first.toString().contains(Integer.toHexString(first.hashCode())));
+        assertFalse(first.toString().contains("@"));
     }
 
     /// Binds authorization to plugin ID, exact bytes, version, execution mode, grant, and callback domain.
@@ -151,8 +167,13 @@ public final class PluginPermissionAuthorityTest {
         PluginCapabilityToken child = authority.narrow(
                 parent, PLUGIN_A.getPluginId(), PLUGIN_A, PluginExecutionMode.EMBEDDED,
                 "bridge.core.profile", NOW.plusSeconds(20));
+        PluginCapabilityToken grandchild = authority.narrow(
+                child, PLUGIN_A.getPluginId(), PLUGIN_A, PluginExecutionMode.EMBEDDED,
+                "bridge.core.profile.name", NOW.plusSeconds(10));
 
         authority.revoke(parent);
+
+        assertEquals(0, authority.activeGrantCount());
 
         assertThrows(SecurityException.class, () -> authority.requirePermission(
                 parent, PLUGIN_A.getPluginId(), PLUGIN_A, PluginExecutionMode.EMBEDDED,
@@ -160,12 +181,124 @@ public final class PluginPermissionAuthorityTest {
         assertThrows(SecurityException.class, () -> authority.requirePermission(
                 child, PLUGIN_A.getPluginId(), PLUGIN_A, PluginExecutionMode.EMBEDDED,
                 PluginPermission.LAUNCHER_CORE, "bridge.core.profile"));
+        assertThrows(SecurityException.class, () -> authority.requirePermission(
+                grandchild, PLUGIN_A.getPluginId(), PLUGIN_A, PluginExecutionMode.EMBEDDED,
+                PluginPermission.LAUNCHER_CORE, "bridge.core.profile.name"));
 
         PluginCapabilityToken expiring = issueCoreToken(authority, PLUGIN_A);
         clock.setInstant(NOW.plusSeconds(61));
         assertThrows(SecurityException.class, () -> authority.requirePermission(
                 expiring, PLUGIN_A.getPluginId(), PLUGIN_A, PluginExecutionMode.EMBEDDED,
                 PluginPermission.LAUNCHER_CORE, "bridge.core"));
+        assertEquals(0, authority.activeGrantCount());
+    }
+
+    /// Reclaims a large expired session window on the next issue without retaining its session or artifact grants.
+    @Test
+    public void reclaimExpiredGrantsOnNextIssue() {
+        MutableClock clock = new MutableClock(NOW);
+        PluginPermissionAuthority authority = authority(clock);
+        PluginCapabilitySession session = authority.openSession(
+                PLUGIN_A,
+                PluginExecutionMode.EMBEDDED,
+                () -> Set.of(PluginPermission.LAUNCHER_CORE),
+                "bridge.core",
+                Duration.ofSeconds(30)
+        );
+        for (int index = 0; index < 512; index++) {
+            session.issue();
+        }
+        assertEquals(512, authority.activeGrantCount());
+
+        clock.setInstant(NOW.plusSeconds(31));
+        PluginCapabilityToken live = authority.issue(
+                PLUGIN_B,
+                PluginExecutionMode.EMBEDDED,
+                Set.of(PluginPermission.LAUNCHER_CORE),
+                "bridge.core",
+                NOW.plusSeconds(90)
+        );
+
+        assertEquals(1, authority.activeGrantCount());
+        assertDoesNotThrow(() -> authority.requirePermission(
+                live, PLUGIN_B.getPluginId(), PLUGIN_B, PluginExecutionMode.EMBEDDED,
+                PluginPermission.LAUNCHER_CORE, "bridge.core"));
+        session.close();
+    }
+
+    /// Reclaims expired grants through verification and revocation entry points even without subsequent issuance.
+    @Test
+    public void reclaimExpiredGrantsOnVerifyAndRevoke() {
+        MutableClock clock = new MutableClock(NOW);
+        PluginPermissionAuthority authority = authority(clock);
+        PluginCapabilityToken expired = authority.issue(
+                PLUGIN_A, PluginExecutionMode.EMBEDDED, Set.of(PluginPermission.LAUNCHER_CORE),
+                "bridge.core", NOW.plusSeconds(10));
+        PluginCapabilityToken live = authority.issue(
+                PLUGIN_B, PluginExecutionMode.EMBEDDED, Set.of(PluginPermission.LAUNCHER_CORE),
+                "bridge.core", NOW.plusSeconds(60));
+
+        clock.setInstant(NOW.plusSeconds(11));
+        assertDoesNotThrow(() -> authority.requirePermission(
+                live, PLUGIN_B.getPluginId(), PLUGIN_B, PluginExecutionMode.EMBEDDED,
+                PluginPermission.LAUNCHER_CORE, "bridge.core"));
+        assertEquals(1, authority.activeGrantCount());
+        assertThrows(SecurityException.class, () -> authority.requirePermission(
+                expired, PLUGIN_A.getPluginId(), PLUGIN_A, PluginExecutionMode.EMBEDDED,
+                PluginPermission.LAUNCHER_CORE, "bridge.core"));
+
+        PluginCapabilityToken nextExpired = authority.issue(
+                PLUGIN_A, PluginExecutionMode.EMBEDDED, Set.of(PluginPermission.LAUNCHER_CORE),
+                "bridge.core", NOW.plusSeconds(20));
+        clock.setInstant(NOW.plusSeconds(21));
+        authority.revoke(nextExpired);
+
+        assertEquals(1, authority.activeGrantCount());
+    }
+
+    /// Removes exact session and artifact families while preserving unrelated active authority.
+    @Test
+    public void removeSessionAndArtifactFamilies() {
+        PluginPermissionAuthority authority = authority(new MutableClock(NOW));
+        PluginCapabilitySession firstSession = authority.openSession(
+                PLUGIN_A, PluginExecutionMode.EMBEDDED,
+                () -> Set.of(PluginPermission.LAUNCHER_CORE), "bridge.core", Duration.ofMinutes(1));
+        PluginCapabilitySession secondSession = authority.openSession(
+                PLUGIN_A, PluginExecutionMode.EMBEDDED,
+                () -> Set.of(PluginPermission.LAUNCHER_CORE), "bridge.core", Duration.ofMinutes(1));
+        PluginCapabilityToken first = firstSession.issue();
+        PluginCapabilityToken child = authority.narrow(
+                first, PLUGIN_A.getPluginId(), PLUGIN_A, PluginExecutionMode.EMBEDDED,
+                "bridge.core.profile", NOW.plusSeconds(30));
+        PluginCapabilityToken second = secondSession.issue();
+        PluginCapabilityToken secondChild = authority.narrow(
+                second, PLUGIN_A.getPluginId(), PLUGIN_A, PluginExecutionMode.EMBEDDED,
+                "bridge.core.settings", NOW.plusSeconds(30));
+
+        firstSession.close();
+
+        assertEquals(2, authority.activeGrantCount());
+        assertThrows(SecurityException.class, () -> authority.requirePermission(
+                child, PLUGIN_A.getPluginId(), PLUGIN_A, PluginExecutionMode.EMBEDDED,
+                PluginPermission.LAUNCHER_CORE, "bridge.core.profile"));
+        assertDoesNotThrow(() -> authority.requirePermission(
+                second, PLUGIN_A.getPluginId(), PLUGIN_A, PluginExecutionMode.EMBEDDED,
+                PluginPermission.LAUNCHER_CORE, "bridge.core"));
+
+        PluginCapabilityToken unrelated = issueCoreToken(authority, PLUGIN_B);
+        authority.revokeArtifact(PLUGIN_A);
+
+        assertEquals(1, authority.activeGrantCount());
+        assertThrows(SecurityException.class, () -> authority.requirePermission(
+                second, PLUGIN_A.getPluginId(), PLUGIN_A, PluginExecutionMode.EMBEDDED,
+                PluginPermission.LAUNCHER_CORE, "bridge.core"));
+        assertThrows(SecurityException.class, () -> authority.requirePermission(
+                secondChild, PLUGIN_A.getPluginId(), PLUGIN_A, PluginExecutionMode.EMBEDDED,
+                PluginPermission.LAUNCHER_CORE, "bridge.core.settings"));
+        assertDoesNotThrow(() -> authority.requirePermission(
+                unrelated, PLUGIN_B.getPluginId(), PLUGIN_B, PluginExecutionMode.EMBEDDED,
+                PluginPermission.LAUNCHER_CORE, "bridge.core"));
+        secondSession.close();
     }
 
     /// Allows raw JVM authority only for payloads executing in the launcher JVM.

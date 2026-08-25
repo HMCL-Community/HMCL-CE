@@ -50,6 +50,8 @@ public final class PluginCapabilityToken {
 
     /// Compares opaque token identity without exposing its bytes.
     ///
+    /// Callers must not log the token or its identity-derived hash code.
+    ///
     /// @param other candidate token
     /// @return whether both objects contain the same random identifier
     @Override
@@ -61,9 +63,19 @@ public final class PluginCapabilityToken {
 
     /// Returns a hash suitable only for launcher-private authority maps.
     ///
+    /// Callers must not log, persist, or expose this identity-derived value.
+    ///
     /// @return opaque identifier hash
     @Override
     public int hashCode() {
         return Arrays.hashCode(identifier);
+    }
+
+    /// Returns one fixed redacted representation shared by every capability token.
+    ///
+    /// @return constant non-identifying display text
+    @Override
+    public String toString() {
+        return "PluginCapabilityToken[redacted]";
     }
 }

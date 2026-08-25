@@ -32,9 +32,12 @@ import java.time.Instant;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.NavigableMap;
 import java.util.Objects;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
@@ -53,8 +56,11 @@ public final class PluginPermissionAuthority {
     /// Cryptographically strong identifier generator.
     private final SecureRandom secureRandom;
 
-    /// Active and revoked authorization records indexed by opaque random token.
+    /// Active authorization records indexed by opaque random token.
     private final Map<PluginCapabilityToken, Grant> grants = new HashMap<>();
+
+    /// Active token identifiers indexed by exclusive expiry for incremental time-based cleanup.
+    private final NavigableMap<Instant, Set<PluginCapabilityToken>> grantsByExpiry = new TreeMap<>();
 
     /// Creates a production authority using UTC wall-clock time and the platform secure random source.
     public PluginPermissionAuthority() {
@@ -132,12 +138,14 @@ public final class PluginPermissionAuthority {
             String callbackDomain,
             Instant expiresAt
     ) {
+        Instant now = clock.instant();
+        cleanupExpiredGrants(now);
         PluginArtifactIdentity identity = Objects.requireNonNull(artifactIdentity, "artifactIdentity");
         PluginExecutionMode mode = Objects.requireNonNull(executionMode, "executionMode");
         @Unmodifiable Set<PluginPermission> permissions = immutablePermissions(grantedPermissions);
         String domain = requireCallbackDomain(callbackDomain);
         Instant expiry = Objects.requireNonNull(expiresAt, "expiresAt");
-        if (!expiry.isAfter(clock.instant())) {
+        if (!expiry.isAfter(now)) {
             throw new IllegalArgumentException("Capability token expiry must be in the future");
         }
         if (mode != PluginExecutionMode.EMBEDDED && permissions.contains(PluginPermission.JVM_RAW)) {
@@ -168,11 +176,13 @@ public final class PluginPermissionAuthority {
             String callbackDomain,
             Duration lifetime
     ) {
+        Instant now = clock.instant();
+        cleanupExpiredGrants(now);
         PluginArtifactIdentity identity = Objects.requireNonNull(artifactIdentity, "artifactIdentity");
         PluginExecutionMode mode = Objects.requireNonNull(executionMode, "executionMode");
         @Unmodifiable Set<PluginPermission> permissions = immutablePermissions(grantedPermissions);
         String domain = requireCallbackDomain(callbackDomain);
-        Instant expiry = clock.instant().plus(requirePositiveLifetime(lifetime));
+        Instant expiry = now.plus(requirePositiveLifetime(lifetime));
         if (mode != PluginExecutionMode.EMBEDDED && permissions.contains(PluginPermission.JVM_RAW)) {
             throw new IllegalArgumentException("jvm-raw capability requires embedded execution");
         }
@@ -322,11 +332,14 @@ public final class PluginPermissionAuthority {
     /// @param token token family root to revoke
     public synchronized void revoke(PluginCapabilityToken token) {
         Objects.requireNonNull(token, "token");
+        cleanupExpiredGrants(clock.instant());
+        Set<PluginCapabilityToken> revokedFamily = new HashSet<>();
         grants.forEach((candidate, grant) -> {
             if (candidate.equals(token) || descendsFrom(grant, token)) {
-                grant.revoked = true;
+                revokedFamily.add(candidate);
             }
         });
+        removeGrants(revokedFamily);
     }
 
     /// Revokes every token issued for one exact package artifact.
@@ -334,9 +347,14 @@ public final class PluginPermissionAuthority {
     /// @param artifactIdentity artifact whose authority must end
     public synchronized void revokeArtifact(PluginArtifactIdentity artifactIdentity) {
         Objects.requireNonNull(artifactIdentity, "artifactIdentity");
-        grants.values().stream()
-                .filter(grant -> grant.artifactIdentity.equals(artifactIdentity))
-                .forEach(grant -> grant.revoked = true);
+        cleanupExpiredGrants(clock.instant());
+        Set<PluginCapabilityToken> revokedArtifact = new HashSet<>();
+        grants.forEach((token, grant) -> {
+            if (grant.artifactIdentity.equals(artifactIdentity)) {
+                revokedArtifact.add(token);
+            }
+        });
+        removeGrants(revokedArtifact);
     }
 
     /// Revokes every root and narrowed token owned by one exact session generation.
@@ -345,9 +363,23 @@ public final class PluginPermissionAuthority {
     /// @param generation owning session generation
     synchronized void revokeFamily(PluginCapabilitySession session, long generation) {
         Objects.requireNonNull(session, "session");
-        grants.values().stream()
-                .filter(grant -> grant.session == session && grant.generation == generation)
-                .forEach(grant -> grant.revoked = true);
+        cleanupExpiredGrants(clock.instant());
+        Set<PluginCapabilityToken> revokedFamily = new HashSet<>();
+        grants.forEach((token, grant) -> {
+            if (grant.session == session && grant.generation == generation) {
+                revokedFamily.add(token);
+            }
+        });
+        removeGrants(revokedFamily);
+    }
+
+    /// Returns the number of grant records currently retained by this authority without triggering cleanup.
+    ///
+    /// Package visibility confines this lifecycle-retention diagnostic to Bridge tests.
+    ///
+    /// @return retained grant record count
+    synchronized int activeGrantCount() {
+        return grants.size();
     }
 
     /// Inserts one validated grant using a fresh opaque random identifier.
@@ -387,7 +419,41 @@ public final class PluginPermissionAuthority {
                 generation,
                 parent
         ));
+        grantsByExpiry.computeIfAbsent(expiresAt, ignored -> new HashSet<>()).add(token);
         return token;
+    }
+
+    /// Removes every grant whose exclusive expiry is at or before the supplied authority time.
+    ///
+    /// Each expiry bucket is processed once, keeping ordinary issuance independent of the active grant count.
+    ///
+    /// @param now current authority time
+    private void cleanupExpiredGrants(Instant now) {
+        while (!grantsByExpiry.isEmpty() && !grantsByExpiry.firstKey().isAfter(now)) {
+            Map.Entry<Instant, Set<PluginCapabilityToken>> expired = grantsByExpiry.pollFirstEntry();
+            for (PluginCapabilityToken token : expired.getValue()) {
+                grants.remove(token);
+            }
+        }
+    }
+
+    /// Removes exact grant records and their expiry-index entries after the full removal set is collected.
+    ///
+    /// @param tokens complete token set to remove
+    private void removeGrants(Set<PluginCapabilityToken> tokens) {
+        for (PluginCapabilityToken token : tokens) {
+            @Nullable Grant removed = grants.remove(token);
+            if (removed == null) {
+                continue;
+            }
+            @Nullable Set<PluginCapabilityToken> expiryBucket = grantsByExpiry.get(removed.expiresAt);
+            if (expiryBucket != null) {
+                expiryBucket.remove(token);
+                if (expiryBucket.isEmpty()) {
+                    grantsByExpiry.remove(removed.expiresAt);
+                }
+            }
+        }
     }
 
     /// Returns a valid token record after plugin, artifact, mode, expiry, and revocation checks.
@@ -403,13 +469,14 @@ public final class PluginPermissionAuthority {
             PluginArtifactIdentity expectedArtifactIdentity,
             PluginExecutionMode expectedExecutionMode
     ) {
+        Instant now = clock.instant();
+        cleanupExpiredGrants(now);
         if (!PluginManifest.isCanonicalExecutableId(expectedPluginId)) {
             throw denied();
         }
         Grant grant = grants.get(Objects.requireNonNull(token, "token"));
         if (grant == null
-                || grant.revoked
-                || !clock.instant().isBefore(grant.expiresAt)
+                || !now.isBefore(grant.expiresAt)
                 || !grant.artifactIdentity.getPluginId().equals(expectedPluginId)
                 || !grant.artifactIdentity.equals(Objects.requireNonNull(
                         expectedArtifactIdentity, "expectedArtifactIdentity"))
@@ -482,7 +549,7 @@ public final class PluginPermissionAuthority {
         return new SecurityException("Plugin capability denied");
     }
 
-    /// Private mutable revocation record for one opaque token.
+    /// Private authorization record for one active opaque token.
     @NotNullByDefault
     private static final class Grant {
         /// Exact approved package identity.
@@ -508,9 +575,6 @@ public final class PluginPermissionAuthority {
 
         /// Optional parent token when this scope was narrowed.
         private final @Nullable PluginCapabilityToken parent;
-
-        /// Whether lifecycle cleanup or explicit revocation ended this authority.
-        private boolean revoked;
 
         /// Creates one private authorization record.
         ///
