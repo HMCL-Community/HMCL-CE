@@ -23,9 +23,14 @@ import org.jackhuang.hmcl.util.SelfDependencyPatcher;
 import org.jackhuang.hmcl.util.SwingUtils;
 import org.jackhuang.hmcl.java.JavaRuntime;
 import org.jackhuang.hmcl.plugin.mixin.bootstrap.HmclMixinBootstrap;
+import org.jackhuang.hmcl.plugin.protector.ProtectorBootstrap;
+import org.jackhuang.hmcl.plugin.protector.StartupReporter;
 import org.jackhuang.hmcl.util.io.FileUtils;
 import org.jackhuang.hmcl.util.io.JarUtils;
 import org.jackhuang.hmcl.util.platform.OperatingSystem;
+import org.jetbrains.annotations.NotNullByDefault;
+import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.Unmodifiable;
 
 import javax.swing.JOptionPane;
 import java.io.IOException;
@@ -35,24 +40,69 @@ import java.lang.invoke.MethodType;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.CancellationException;
+import java.util.function.Consumer;
+import java.util.function.Predicate;
 
 import static org.jackhuang.hmcl.util.logging.Logger.LOG;
 import static org.jackhuang.hmcl.util.i18n.I18n.i18n;
 
+/// Prepares launcher process prerequisites and selects Mixin, Protector parent, or protected-child execution roles.
+@NotNullByDefault
 public final class EntryPoint {
 
+    /// Prevents construction of the launcher entry point.
     private EntryPoint() {
     }
 
-    public static void main(String[] args) {
+    /// Starts launcher process preparation and delegates only the protected child to normal launcher initialization.
+    ///
+    /// @param args process arguments
+    public static void main(String @Unmodifiable [] args) {
         String[] launcherArgs = RestartBarrier.awaitParentsAndStrip(args);
 
         // Mixin premain may load plugin classes that reference JavaFX, so repair JavaFX before relaunching the Agent JVM.
         checkJavaFX();
         verifyJavaFX();
-        if (HmclMixinBootstrap.relaunchIfNeeded(launcherArgs)) {
+        try {
+            runProtectedLauncher(
+                    launcherArgs,
+                    HmclMixinBootstrap::relaunchIfNeeded,
+                    ProtectorBootstrap::enter,
+                    EntryPoint::launchProtectedChild
+            );
+        } catch (IOException exception) {
+            LOG.error("Failed to initialize launcher startup protection", exception);
+            exit(1);
+        }
+    }
+
+    /// Executes ordered Mixin and Protector role selection before starting normal launcher runtime.
+    ///
+    /// @param launcherArgs restart-barrier-stripped launcher arguments
+    /// @param mixinRelaunch Mixin relaunch selector
+    /// @param protectorEntry Protector parent-or-child selector
+    /// @param launcherRuntime normal protected-child runtime entry
+    /// @throws IOException if Protector role selection fails
+    static void runProtectedLauncher(
+            String @Unmodifiable [] launcherArgs,
+            Predicate<String @Unmodifiable []> mixinRelaunch,
+            ProtectorEntry protectorEntry,
+            Consumer<String @Unmodifiable []> launcherRuntime
+    ) throws IOException {
+        if (mixinRelaunch.test(launcherArgs)) {
             return;
         }
+        String @Nullable @Unmodifiable [] childArgs = protectorEntry.enter(launcherArgs);
+        if (childArgs == null) {
+            return;
+        }
+        launcherRuntime.accept(childArgs);
+    }
+
+    /// Initializes process-wide launcher services only inside the authenticated protected child.
+    ///
+    /// @param launcherArgs Protector-stripped launcher arguments
+    private static void launchProtectedChild(String @Unmodifiable [] launcherArgs) {
 
         System.getProperties().putIfAbsent("java.net.useSystemProxies", "true");
         System.getProperties().putIfAbsent("javafx.autoproxy.disable", "true");
@@ -75,7 +125,24 @@ public final class EntryPoint {
         Launcher.main(launcherArgs);
     }
 
+    /// Checked Protector entry operation used by the ordered role-selection seam.
+    @FunctionalInterface
+    interface ProtectorEntry {
+        /// Selects the Protector parent or connects an authenticated protected child.
+        ///
+        /// @param launcherArgs restart-barrier-stripped launcher arguments
+        /// @return child launcher arguments, or `null` after parent supervision
+        /// @throws IOException if local startup protection fails closed
+        String @Nullable @Unmodifiable [] enter(String @Unmodifiable [] launcherArgs) throws IOException;
+    }
+
+    /// Terminates the launcher, reporting an explicit zero-status startup cancellation before process cleanup.
+    ///
+    /// @param exitCode process exit status
     public static void exit(int exitCode) {
+        if (exitCode == 0) {
+            StartupReporter.reportCancel();
+        }
         FileSaver.shutdown();
         LOG.shutdown();
         System.exit(exitCode);

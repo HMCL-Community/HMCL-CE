@@ -50,6 +50,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.BiConsumer;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
@@ -74,6 +75,75 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
 
     /// Canonical Java dependent plugin ID used by live graph replacement tests.
     private static final String JAVA_DEPENDENT_ID = "dev.hmclce.test.runtime-dependent";
+
+    /// Independent ordinary plugin whose package filename sorts before the Runtime Provider Host.
+    private static final String EARLY_ORDINARY_ID = "dev.hmclce.test.aaa-ordinary";
+
+    /// Secondary Provider Host used as a concrete dependency of the primary Host.
+    private static final String DEPENDENCY_PROVIDER_ID = "dev.hmclce.test.runtime-host-dependency";
+
+    /// Restores the dependent Provider ID and lease after recursively loading its Provider dependency.
+    ///
+    /// @param temporaryDirectory isolated launcher home
+    /// @throws Exception if package creation, reflective construction, discovery, or cleanup fails
+    @Test
+    public void reportDependentProviderAfterItsProviderDependency(@TempDir Path temporaryDirectory) throws Exception {
+        Path localHome = temporaryDirectory.resolve("home");
+        RuntimeProviderRegistry registry = RuntimeProviderRegistry.processWide();
+        clearFixture(registry);
+        List<String> reports = new java.util.ArrayList<>();
+        try {
+            var constructor = PluginManager.class.getDeclaredConstructor(Path.class, BiConsumer.class);
+            constructor.setAccessible(true);
+            @SuppressWarnings("unchecked")
+            BiConsumer<PluginKind, String> reporter = (kind, pluginId) -> reports.add(kind + ":" + pluginId);
+            PluginManager manager = constructor.newInstance(localHome, reporter);
+            writeHostPackageWithDependency(
+                    manager.getPluginsDirectory().resolve("00-dependent-host.npl"),
+                    DEPENDENCY_PROVIDER_ID
+            );
+            writeSecondaryHostPackage(manager.getPluginsDirectory().resolve("99-dependency-host.npl"));
+            manager.enablePlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID);
+            manager.enablePlugin(DEPENDENCY_PROVIDER_ID);
+
+            FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
+
+            assertEquals(List.of(
+                    PluginKind.RUNTIME_PROVIDER + ":" + DEPENDENCY_PROVIDER_ID,
+                    PluginKind.RUNTIME_PROVIDER + ":" + PackagedRuntimeProviderPlugin.PROVIDER_ID
+            ), reports);
+        } finally {
+            registry.unregister(DEPENDENCY_PROVIDER_ID);
+            clearFixture(registry);
+        }
+    }
+
+    /// Loads every enabled Runtime Provider Host before independent ordinary plugins regardless of filename order.
+    ///
+    /// @param temporaryDirectory isolated launcher home
+    /// @throws Exception if package creation, discovery, or cleanup fails
+    @Test
+    public void loadAllProviderHostsBeforeIndependentOrdinaryPlugins(@TempDir Path temporaryDirectory) throws Exception {
+        Path localHome = temporaryDirectory.resolve("home");
+        RuntimeProviderRegistry registry = RuntimeProviderRegistry.processWide();
+        clearFixture(registry);
+        try {
+            PluginManager manager = new PluginManager(localHome);
+            writeIndependentOrdinaryPackage(manager.getPluginsDirectory().resolve("00-ordinary.npl"));
+            writeHostPackage(manager.getPluginsDirectory().resolve("99-host.npl"));
+            manager.enablePlugin(EARLY_ORDINARY_ID);
+            manager.enablePlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID);
+
+            FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
+
+            assertEquals(
+                    List.of(PackagedRuntimeProviderPlugin.PROVIDER_ID, EARLY_ORDINARY_ID),
+                    manager.getPlugins().stream().map(container -> container.getManifest().getId()).toList()
+            );
+        } finally {
+            clearFixture(registry);
+        }
+    }
 
     /// Orders a runtime payload after its selected Host even without a concrete manifest dependency.
     ///
@@ -1018,6 +1088,37 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
         writePackage(target, manifest, PackagedRuntimeProviderPlugin.class, false);
     }
 
+    /// Writes the secondary Runtime Provider Host dependency package.
+    ///
+    /// @param target Host package path
+    /// @throws IOException if package creation fails
+    private static void writeSecondaryHostPackage(Path target) throws IOException {
+        String manifest = """
+                {
+                  "schemaVersion": 5,
+                  "id": "%s",
+                  "name": "Runtime Dependency Host",
+                  "version": "1.0.0",
+                  "type": "java",
+                  "entrypoint": "%s",
+                  "permissions": [],
+                  "requiredPermissions": [],
+                  "launcherVersion": "*",
+                  "runtime": "java",
+                  "abi": 2,
+                  "pluginKind": "runtime-provider",
+                  "providesRuntimes": [{
+                    "runtime": "rust-dependency",
+                    "abis": [2],
+                    "bridgeAbi": 1,
+                    "executionModes": ["embedded"],
+                    "features": ["bridge"]
+                  }]
+                }
+                """.formatted(DEPENDENCY_PROVIDER_ID, PackagedRuntimeProviderPlugin.class.getName());
+        writePackage(target, manifest, PackagedRuntimeProviderPlugin.class, false);
+    }
+
     /// Writes a Java plugin package which depends directly on the runtime Host package.
     ///
     /// @param target dependent package path
@@ -1041,6 +1142,29 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
                 }
                 """.formatted(JAVA_DEPENDENT_ID, version, PackagedTestPlugin.class.getName(),
                 PackagedRuntimeProviderPlugin.PROVIDER_ID);
+        writePackage(target, manifest, PackagedTestPlugin.class, false);
+    }
+
+    /// Writes one independent ordinary Java plugin package.
+    ///
+    /// @param target ordinary package path
+    /// @throws IOException if package creation fails
+    private static void writeIndependentOrdinaryPackage(Path target) throws IOException {
+        String manifest = """
+                {
+                  "schemaVersion": 5,
+                  "id": "%s",
+                  "name": "Early Ordinary Plugin",
+                  "version": "1.0.0",
+                  "type": "java",
+                  "entrypoint": "%s",
+                  "permissions": [],
+                  "requiredPermissions": [],
+                  "launcherVersion": "*",
+                  "runtime": "java",
+                  "abi": 2
+                }
+                """.formatted(EARLY_ORDINARY_ID, PackagedTestPlugin.class.getName());
         writePackage(target, manifest, PackagedTestPlugin.class, false);
     }
 

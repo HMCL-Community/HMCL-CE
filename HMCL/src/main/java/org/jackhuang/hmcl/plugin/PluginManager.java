@@ -41,6 +41,7 @@ import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderDeclaration;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderRegistry;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeRequirement;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeSupervisor;
+import org.jackhuang.hmcl.plugin.protector.StartupReporter;
 import org.jackhuang.hmcl.plugin.trust.PluginCertificationReceipt;
 import org.jackhuang.hmcl.plugin.trust.PluginCertificationReceiptStore;
 import org.jackhuang.hmcl.plugin.trust.PluginRuntimeTrustGuard;
@@ -73,6 +74,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.BiConsumer;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -139,6 +141,8 @@ public final class PluginManager {
     private final Set<String> enabledStates = new HashSet<>();
     /// Plugin IDs whose files and data should be removed at the next startup.
     private final Set<String> pendingUninstall = new HashSet<>();
+    /// Reports exact provider and ordinary-plugin startup stages to the process Protector.
+    private final BiConsumer<PluginKind, String> startupStageReporter;
     /// Creates the singleton manager and its storage directories.
     PluginManager() {
         this(Metadata.HMCL_LOCAL_HOME, false, null);
@@ -185,6 +189,14 @@ public final class PluginManager {
         this(localHome, true, null, compatibilityEvaluator);
     }
 
+    /// Creates an isolated manager with an injected startup-stage reporter for ordering tests.
+    ///
+    /// @param localHome isolated HMCL home
+    /// @param startupStageReporter exact plugin-kind and ID reporter
+    PluginManager(Path localHome, BiConsumer<PluginKind, String> startupStageReporter) {
+        this(localHome, true, null, PluginCompatibilityEvaluator.processWide(), startupStageReporter);
+    }
+
     /// Creates one manager with explicit construction, trust, and compatibility policies.
     ///
     /// @param localHome launcher-local home
@@ -197,7 +209,31 @@ public final class PluginManager {
             @Nullable PluginRuntimeTrustGuard explicitRuntimeTrustGuard,
             PluginCompatibilityEvaluator compatibilityEvaluator
     ) {
+        this(
+                localHome,
+                trustConstructionStack,
+                explicitRuntimeTrustGuard,
+                compatibilityEvaluator,
+                PluginManager::reportStartupStage
+        );
+    }
+
+    /// Creates one manager with explicit construction, trust, compatibility, and startup-reporting policies.
+    ///
+    /// @param localHome launcher-local home
+    /// @param trustConstructionStack whether to trust exact test-framework loaders on the construction stack
+    /// @param explicitRuntimeTrustGuard explicit proof-backed runtime gate, or `null` for the inactive gate
+    /// @param compatibilityEvaluator shared launcher-host compatibility policy
+    /// @param startupStageReporter exact plugin-kind and ID reporter
+    private PluginManager(
+            Path localHome,
+            boolean trustConstructionStack,
+            @Nullable PluginRuntimeTrustGuard explicitRuntimeTrustGuard,
+            PluginCompatibilityEvaluator compatibilityEvaluator,
+            BiConsumer<PluginKind, String> startupStageReporter
+    ) {
         this.compatibilityEvaluator = compatibilityEvaluator;
+        this.startupStageReporter = startupStageReporter;
         runtimeProviders = compatibilityEvaluator.getRuntimeProviders();
         runtimeSupervisor = new RuntimeSupervisor(runtimeProviders);
         administrativeGuard = new PluginAdministrativeGuard(trustConstructionStack);
@@ -252,6 +288,18 @@ public final class PluginManager {
     /// @return plugin manager singleton
     public static PluginManager getInstance() {
         return PluginManagerHolder.INSTANCE;
+    }
+
+    /// Reports one exact production startup stage without fabricating plugin identities.
+    ///
+    /// @param kind validated manifest plugin kind
+    /// @param pluginId validated canonical manifest ID
+    private static void reportStartupStage(PluginKind kind, String pluginId) {
+        if (kind == PluginKind.RUNTIME_PROVIDER) {
+            StartupReporter.reportRuntimeProvider(pluginId);
+        } else {
+            StartupReporter.reportOrdinaryPlugin(pluginId);
+        }
     }
 
     /// Persists plugin state through the dedicated shared-lock state store.
@@ -317,29 +365,40 @@ public final class PluginManager {
         Map<String, PluginVisitState> visitStates = new HashMap<>();
         Set<String> failed = new HashSet<>();
         @Unmodifiable Map<String, RuntimeProviderBinding> startupRuntimeBindings = runtimeBindingStore.readStrict();
-        for (PluginPackageCandidate candidate : candidates.values()) {
-            boolean enabled = enabledStates.contains(candidate.manifest.getId());
-            boolean deferExternalRuntimeCompatibility = enabled
-                    && isExternalRuntimePayload(candidate.manifest)
-                    && startupRuntimeBindings.containsKey(candidate.manifest.getId());
-            if (!deferExternalRuntimeCompatibility) {
-                PluginCompatibilityResult compatibility = evaluateCompatibility(candidate.manifest);
-                if (!compatibility.isCompatible()) {
-                    if (compatibility.status() == PluginCompatibilityStatus.UNSUPPORTED_SCHEMA) {
-                        enabledStates.remove(candidate.manifest.getId());
-                    }
-                    setRuntimeStatus(
-                            candidate.identity,
-                            runtimeStatusFor(compatibility),
-                            compatibility.detail()
-                    );
+        for (PluginKind startupKind : List.of(PluginKind.RUNTIME_PROVIDER, PluginKind.NORMAL)) {
+            for (PluginPackageCandidate candidate : candidates.values()) {
+                if (candidate.manifest.getPluginKind() != startupKind) {
                     continue;
                 }
-            }
-            if (enabled) {
-                loadCandidate(candidate, candidates, visitStates, failed);
-            } else {
-                setRuntimeStatus(candidate.identity, PluginRuntimeStatus.INSTALLED_DISABLED, null);
+                boolean enabled = enabledStates.contains(candidate.manifest.getId());
+                boolean deferExternalRuntimeCompatibility = enabled
+                        && isExternalRuntimePayload(candidate.manifest)
+                        && startupRuntimeBindings.containsKey(candidate.manifest.getId());
+                if (!deferExternalRuntimeCompatibility) {
+                    PluginCompatibilityResult compatibility = evaluateCompatibility(candidate.manifest);
+                    if (!compatibility.isCompatible()) {
+                        if (compatibility.status() == PluginCompatibilityStatus.UNSUPPORTED_SCHEMA) {
+                            enabledStates.remove(candidate.manifest.getId());
+                        }
+                        setRuntimeStatus(
+                                candidate.identity,
+                                runtimeStatusFor(compatibility),
+                                compatibility.detail()
+                        );
+                        continue;
+                    }
+                }
+                if (enabled) {
+                    loadCandidate(
+                            candidate,
+                            candidates,
+                            visitStates,
+                            failed,
+                            startupKind == PluginKind.RUNTIME_PROVIDER
+                    );
+                } else {
+                    setRuntimeStatus(candidate.identity, PluginRuntimeStatus.INSTALLED_DISABLED, null);
+                }
             }
         }
         saveStates();
@@ -508,14 +567,16 @@ public final class PluginManager {
     /// @param candidates available candidates
     /// @param visitStates dependency traversal states
     /// @param failed plugin IDs that cannot be loaded
+    /// @param providerStartupPhase whether this traversal is rooted at a Runtime Provider Host
     /// @return whether the candidate loaded and enabled successfully
     private boolean loadCandidate(
             PluginPackageCandidate candidate,
             Map<String, PluginPackageCandidate> candidates,
             Map<String, PluginVisitState> visitStates,
-            Set<String> failed
+            Set<String> failed,
+            boolean providerStartupPhase
     ) {
-        return loadCandidate(candidate, candidates, visitStates, failed, null);
+        return loadCandidate(candidate, candidates, visitStates, failed, null, providerStartupPhase);
     }
 
     /// Loads one candidate while optionally retaining the original lifecycle exception for transaction diagnostics.
@@ -532,6 +593,26 @@ public final class PluginManager {
             Map<String, PluginVisitState> visitStates,
             Set<String> failed,
             @Nullable Map<String, Throwable> failuresByPluginId
+    ) {
+        return loadCandidate(candidate, candidates, visitStates, failed, failuresByPluginId, false);
+    }
+
+    /// Loads one candidate within the current provider-first or ordinary startup traversal.
+    ///
+    /// @param candidate candidate to load
+    /// @param candidates available candidates
+    /// @param visitStates dependency traversal states
+    /// @param failed plugin IDs that cannot be loaded
+    /// @param failuresByPluginId optional mutable original failures indexed by plugin ID
+    /// @param providerStartupPhase whether this traversal is rooted at a Runtime Provider Host
+    /// @return whether the candidate loaded and enabled successfully
+    private boolean loadCandidate(
+            PluginPackageCandidate candidate,
+            Map<String, PluginPackageCandidate> candidates,
+            Map<String, PluginVisitState> visitStates,
+            Set<String> failed,
+            @Nullable Map<String, Throwable> failuresByPluginId,
+            boolean providerStartupPhase
     ) {
         String pluginId = candidate.manifest.getId();
         if (failed.contains(pluginId)) {
@@ -614,7 +695,7 @@ public final class PluginManager {
                 return false;
             }
             if (providerCandidate != null && !loadCandidate(
-                    providerCandidate, candidates, visitStates, failed, failuresByPluginId)) {
+                    providerCandidate, candidates, visitStates, failed, failuresByPluginId, providerStartupPhase)) {
                 String message = "Plugin " + pluginId + " cannot load because runtime Provider "
                         + providerId + " failed";
                 setRuntimeStatus(candidate.identity, PluginRuntimeStatus.LOAD_FAILED, message);
@@ -662,7 +743,8 @@ public final class PluginManager {
                 return false;
             }
             if (dependency != null
-                    && !loadCandidate(dependency, candidates, visitStates, failed, failuresByPluginId)) {
+                    && !loadCandidate(
+                            dependency, candidates, visitStates, failed, failuresByPluginId, providerStartupPhase)) {
                 String message = "Plugin " + pluginId + " cannot load because dependency "
                         + dependencyId + " failed";
                 LOG.error(message);
@@ -686,8 +768,11 @@ public final class PluginManager {
         }
 
         if (runtimeProviderHost) {
+            startupStageReporter.accept(PluginKind.RUNTIME_PROVIDER, pluginId);
             runtimeSupervisor.discover(pluginId);
             runtimeSupervisor.resolve(pluginId);
+        } else if (!providerStartupPhase) {
+            startupStageReporter.accept(PluginKind.NORMAL, pluginId);
         }
 
         try {

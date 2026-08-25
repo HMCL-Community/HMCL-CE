@@ -163,7 +163,7 @@ public final class PackagedRuntimeProviderPlugin
     @Override
     public RuntimeProviderDescriptor descriptor() {
         return new RuntimeProviderDescriptor(
-                PROVIDER_ID,
+                getManifest().getId(),
                 getManifest().getVersion(),
                 getManifest().getProvidesRuntimes(),
                 true,

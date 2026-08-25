@@ -35,6 +35,7 @@ import javafx.stage.Screen;
 import javafx.stage.Stage;
 import javafx.util.Duration;
 import org.jackhuang.hmcl.game.HMCLCacheRepository;
+import org.jackhuang.hmcl.plugin.protector.StartupReporter;
 import org.jackhuang.hmcl.setting.*;
 import org.jackhuang.hmcl.task.AsyncTaskExecutor;
 import org.jackhuang.hmcl.task.Schedulers;
@@ -86,6 +87,12 @@ public final class Launcher extends Application {
     private static final ApplicationShutdownCoordinator SHUTDOWN_COORDINATOR =
             new ApplicationShutdownCoordinator(Launcher::performApplicationShutdown, Launcher::hideForDeferredShutdown);
 
+    /// Cross-thread JavaFX startup outcome used to suppress false normal-shutdown reports.
+    private static final StartupOutcome STARTUP_OUTCOME = new StartupOutcome();
+
+    /// Starts JavaFX initialization and schedules the remaining startup work after the logo's first paint.
+    ///
+    /// @param primaryStage primary launcher window supplied by JavaFX
     @Override
     public void start(Stage primaryStage) {
         Thread.currentThread().setUncaughtExceptionHandler(CRASH_REPORTER);
@@ -116,15 +123,19 @@ public final class Launcher extends Application {
             if (OperatingSystem.CURRENT_OS == OperatingSystem.MACOS
                     && SettingsManager.isNewlyCreated()
                     && System.getProperty("user.dir").startsWith("/private/var/folders/")) {
-                if (!confirmWithCountdown(AlertType.WARNING, i18n("fatal.mac_app_translocation"), 5))
+                if (!confirmWithCountdown(AlertType.WARNING, i18n("fatal.mac_app_translocation"), 5)) {
+                    StartupReporter.reportCancel();
                     return;
+                }
             } else {
                 checkConfigInTempDir();
             }
 
             if (SettingsManager.isOwnerChanged()) {
-                if (showAlert(AlertType.WARNING, i18n("fatal.config_change_owner_root"), ButtonType.YES, ButtonType.NO) == ButtonType.NO)
+                if (showAlert(AlertType.WARNING, i18n("fatal.config_change_owner_root"), ButtonType.YES, ButtonType.NO) == ButtonType.NO) {
+                    StartupReporter.reportCancel();
                     return;
+                }
             }
 
             if (SettingsManager.hasReadOnlyCoreSettings()) {
@@ -137,7 +148,7 @@ public final class Launcher extends Application {
 
             // Show the logo before initialization so the first frame is visible immediately.
             StartupLogo.show();
-            StartupLogo.runAfterFirstPaint(() -> {
+            StartupLogo.runAfterFirstPaint(STARTUP_OUTCOME.guardStartupCallback(() -> {
                 // When launcher visibility is set to "hide and reopen" without Platform.implicitExit = false,
                 // Stage.show() cannot work again because JavaFX Toolkit have already shut down.
                 Platform.setImplicitExit(false);
@@ -151,11 +162,13 @@ public final class Launcher extends Application {
 
                     WindowsNativeUtils.installWindowsAppUserModelRelaunchProperties(primaryStage);
                     primaryStage.show();
+                    StartupReporter.reportUiReady();
                 } finally {
                     StartupLogo.dismiss();
                 }
-            });
+            }, CRASH_REPORTER));
         } catch (Throwable e) {
+            STARTUP_OUTCOME.recordFailure();
             CRASH_REPORTER.uncaughtException(Thread.currentThread(), e);
         }
     }
@@ -295,8 +308,12 @@ public final class Launcher extends Application {
         LOG.shutdown();
     }
 
+    /// Initializes the launcher process and reports normal shutdown only when JavaFX startup did not fail.
+    ///
+    /// @param args launcher command-line arguments
     public static void main(String[] args) {
         if (UpdateHandler.processArguments(args)) {
+            StartupReporter.reportNormalShutdown();
             LOG.shutdown();
             return;
         }
@@ -359,12 +376,58 @@ public final class Launcher extends Application {
                 EntryPoint.exit(1);
             }
 
+            StartupReporter.reportCoreReady();
             setupJavaFXVMOptions();
             setupWindowsAppUserModelID();
 
             launch(Launcher.class, args);
+            STARTUP_OUTCOME.reportNormal(StartupReporter::reportNormalShutdown);
         } catch (Throwable e) { // Fucking JavaFX will suppress the exception and will break our crash reporter.
             CRASH_REPORTER.uncaughtException(Thread.currentThread(), e);
+        }
+    }
+
+    /// Cross-thread startup result shared between JavaFX `start` and the blocking launcher main thread.
+    @org.jetbrains.annotations.NotNullByDefault
+    private static final class StartupOutcome {
+        /// Whether JavaFX startup reported a fatal failure on either the immediate or deferred path.
+        private volatile boolean failed;
+
+        /// Creates one initially successful startup outcome.
+        private StartupOutcome() {
+        }
+
+        /// Records that JavaFX startup encountered a fatal failure before readiness.
+        private void recordFailure() {
+            failed = true;
+        }
+
+        /// Wraps deferred startup work so failures are recorded before the existing crash reporter handles them.
+        ///
+        /// @param callback deferred startup work
+        /// @param crashReporter existing uncaught-exception handler that displays the startup failure
+        /// @return guarded callback for the first-paint scheduler
+        private Runnable guardStartupCallback(
+                Runnable callback,
+                Thread.UncaughtExceptionHandler crashReporter
+        ) {
+            return () -> {
+                try {
+                    callback.run();
+                } catch (Throwable failure) {
+                    recordFailure();
+                    crashReporter.uncaughtException(Thread.currentThread(), failure);
+                }
+            };
+        }
+
+        /// Runs normal-shutdown reporting only when JavaFX startup did not fail.
+        ///
+        /// @param reporter normal-shutdown reporting action
+        private void reportNormal(Runnable reporter) {
+            if (!failed) {
+                reporter.run();
+            }
         }
     }
 
