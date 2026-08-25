@@ -80,7 +80,8 @@ public final class RuntimePluginLoaderTest {
                 identity
         );
         Path dataDirectory = temporaryDirectory.resolve("storage").resolve(pluginId);
-        PluginCapabilityToken token = new PluginPermissionAuthority().issue(
+        PluginPermissionAuthority authority = new PluginPermissionAuthority();
+        PluginCapabilityToken token = authority.issue(
                 identity,
                 PluginExecutionMode.EMBEDDED,
                 Set.of(),
@@ -100,7 +101,8 @@ public final class RuntimePluginLoaderTest {
         RuntimePluginLoader loader = new RuntimePluginLoader(
                 supervisor,
                 ignored -> dataDirectory,
-                ignored -> () -> token
+                ignored -> () -> token,
+                authority
         );
 
         Plugin plugin = loader.load(manifest, pluginPackage, nplFile);

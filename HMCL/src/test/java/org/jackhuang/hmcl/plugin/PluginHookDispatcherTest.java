@@ -17,30 +17,28 @@
  */
 package org.jackhuang.hmcl.plugin;
 
-import org.jackhuang.hmcl.FXThreadTestSupport;
 import org.jackhuang.hmcl.plugin.bridge.PluginCapabilitySession;
 import org.jackhuang.hmcl.plugin.bridge.PluginPermissionAuthority;
-import org.jackhuang.hmcl.plugin.runtime.PluginAbi;
-import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityEvaluator;
 import org.jackhuang.hmcl.plugin.runtime.PluginExecutionMode;
-import org.jackhuang.hmcl.plugin.runtime.PluginPlatformTarget;
+import org.jackhuang.hmcl.plugin.runtime.PluginAbi;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeFeature;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeHookEndpoint;
+import org.jackhuang.hmcl.plugin.runtime.RuntimePayloadContext;
+import org.jackhuang.hmcl.plugin.runtime.RuntimePayloadHandle;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProvider;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderDeclaration;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderDescriptor;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderRegistration;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderRegistry;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeRequirement;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeSupervisor;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.condition.EnabledIf;
 import org.junit.jupiter.api.io.TempDir;
 
-import java.io.IOException;
-import java.io.StringReader;
-import java.lang.reflect.Field;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.file.Path;
@@ -238,97 +236,86 @@ public final class PluginHookDispatcherTest {
         assertEquals(1, released.get());
     }
 
-    /// Routes an external subscriber through its bound Provider and leases both payload and shared Host containers.
+    /// Interrupts a timed-out supervised Provider callback, discards its late result, and retains its lease.
     ///
-    /// @param temporaryDirectory isolated manager and package paths
-    /// @throws Exception if manifest parsing, registration, callback invocation, or loader close fails
+    /// @throws Exception if lifecycle setup or callback coordination fails
     @Test
-    @EnabledIf("org.jackhuang.hmcl.JavaFXLauncher#isStarted")
-    public void snapshotExternalSubscriberThroughBoundProviderWithDualLease(
-            @TempDir Path temporaryDirectory
-    ) throws Exception {
-        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
-        ManagerRuntimeProvider provider = new ManagerRuntimeProvider();
-        registry.register(provider);
-        PluginManager manager = new PluginManager(
-                temporaryDirectory.resolve("home"),
-                new PluginCompatibilityEvaluator(registry, PluginPlatformTarget.current())
-        );
-        PluginManifest hostManifest = managerManifest(
-                ManagerRuntimeProvider.PROVIDER_ID,
-                "java",
-                List.of(PluginHookPoint.BEFORE_GAME_LAUNCH),
-                List.of()
-        );
-        PluginManifest payloadManifest = managerManifest(
-                ManagerRuntimeProvider.PAYLOAD_ID,
-                "rust",
-                List.of(PluginHookPoint.BEFORE_GAME_LAUNCH),
-                List.of(ManagerRuntimeProvider.PROVIDER_ID)
-        );
-        registry.bind(payloadManifest.getId(), payloadManifest.getRuntimeRequirement());
-        TrackingClassLoader hostLoader = new TrackingClassLoader();
-        TrackingClassLoader payloadLoader = new TrackingClassLoader();
-        PluginContainer hostContainer = registerManagerFixture(
-                manager,
-                temporaryDirectory,
-                new ManagerFixturePlugin(hostManifest),
-                hostManifest,
-                "d".repeat(64),
-                hostLoader,
-                null
-        );
-        PluginPermissionAuthority authority = managerPermissionAuthority(manager);
-        PluginArtifactIdentity payloadIdentity = PluginArtifactIdentity.of(
-                payloadManifest, "e".repeat(64));
-        PluginCapabilitySession payloadSession = authority.openSession(
-                payloadIdentity,
-                PluginExecutionMode.EMBEDDED,
-                () -> Set.of(PluginPermission.LAUNCHER_HOOK),
-                "runtime.payload",
-                Duration.ofSeconds(30)
-        );
-        PluginContainer payloadContainer = registerManagerFixture(
-                manager,
-                temporaryDirectory,
-                new ManagerFixturePlugin(payloadManifest),
-                payloadManifest,
-                payloadIdentity.getSha256(),
-                payloadLoader,
-                payloadSession
-        );
+    public void timeoutSupervisedProviderAndDiscardLateResult() throws Exception {
+        CountDownLatch callbackStarted = new CountDownLatch(1);
+        CountDownLatch callbackInterrupted = new CountDownLatch(1);
+        CountDownLatch allowCallbackExit = new CountDownLatch(1);
+        CountDownLatch callbackFinished = new CountDownLatch(1);
+        AtomicInteger released = new AtomicInteger();
+        try (SupervisedRuntimeFixture fixture = new SupervisedRuntimeFixture(
+                "dev.test.supervised-timeout",
+                (handle, token, event, timeout) -> {
+                    callbackStarted.countDown();
+                    boolean waiting = true;
+                    while (waiting) {
+                        try {
+                            waiting = !allowCallbackExit.await(20, TimeUnit.MILLISECONDS);
+                        } catch (InterruptedException exception) {
+                            callbackInterrupted.countDown();
+                        }
+                    }
+                    callbackFinished.countDown();
+                    return replaceName("late-runtime-result");
+                }
+        )) {
+            NamePolicy policy = new NamePolicy(true);
+            PluginHookDispatcher dispatcher = dispatcher(Duration.ofMillis(80), () -> List.of(
+                    subscriber(fixture.pluginId(), fixture.endpoint(), released)
+            ));
 
-        @Unmodifiable List<PluginHookSubscriber> subscribers =
-                manager.snapshotHookSubscribers(PluginHookPoint.BEFORE_GAME_LAUNCH);
-        try {
-            assertEquals(List.of(hostManifest.getId(), payloadManifest.getId()),
-                    subscribers.stream().map(PluginHookSubscriber::pluginId).toList());
-            PluginHookEvent event = new PluginHookEvent(
-                    PluginHookEvent.CURRENT_CONTRACT_VERSION,
-                    "manager-runtime-hook",
-                    PluginHookPoint.BEFORE_GAME_LAUNCH,
-                    CALLBACK_TIME,
-                    dataWithName("external"),
-                    PluginSecretAccess.denied(payloadManifest.getId())
-            );
+            PluginHookDispatchException failure = assertThrows(PluginHookDispatchException.class,
+                    () -> dispatcher.dispatchBefore(
+                            PluginHookPoint.BEFORE_GAME_LAUNCH,
+                            dataWithName("initial"),
+                            policy
+                    ));
 
-            assertEquals(PluginHookResult.Action.UNCHANGED,
-                    subscribers.get(0).endpoint().invoke(event, Duration.ofMillis(225)).action());
-            assertEquals(PluginHookResult.Action.UNCHANGED,
-                    subscribers.get(1).endpoint().invoke(event, Duration.ofMillis(225)).action());
-            assertTrue(provider.invoked());
-            assertSame(hostLoader, provider.callbackClassLoader());
-
-            hostContainer.closeClassLoader();
-            payloadContainer.closeClassLoader();
-            assertEquals(0, hostLoader.physicalCloseCount());
-            assertEquals(0, payloadLoader.physicalCloseCount());
+            assertTrue(callbackStarted.await(1, TimeUnit.SECONDS));
+            assertTrue(callbackInterrupted.await(1, TimeUnit.SECONDS));
+            assertEquals(PluginHookDispatchException.Category.TIMEOUT, failure.category());
+            assertEquals(0, released.get());
+            assertTrue(policy.committedNames().isEmpty());
+            allowCallbackExit.countDown();
+            assertTrue(callbackFinished.await(1, TimeUnit.SECONDS));
+            awaitValue(released, 1);
+            assertTrue(policy.committedNames().isEmpty());
         } finally {
-            subscribers.forEach(PluginHookSubscriber::close);
-            payloadSession.close();
+            allowCallbackExit.countDown();
         }
-        assertEquals(1, hostLoader.physicalCloseCount());
-        assertEquals(1, payloadLoader.physicalCloseCount());
+    }
+
+    /// Converts a supervised Provider exception into a redacted dispatcher `EXCEPTION` category.
+    ///
+    /// @throws Exception if lifecycle setup or cleanup fails
+    @Test
+    public void redactSupervisedProviderException() throws Exception {
+        AtomicInteger released = new AtomicInteger();
+        try (SupervisedRuntimeFixture fixture = new SupervisedRuntimeFixture(
+                "dev.test.supervised-exception",
+                (handle, token, event, timeout) -> {
+                    throw new IllegalStateException("provider-credential-value");
+                }
+        )) {
+            PluginHookDispatcher dispatcher = dispatcher(Duration.ofSeconds(1), () -> List.of(
+                    subscriber(fixture.pluginId(), fixture.endpoint(), released)
+            ));
+
+            PluginHookDispatchException failure = assertThrows(PluginHookDispatchException.class,
+                    () -> dispatcher.dispatchBefore(
+                            PluginHookPoint.BEFORE_GAME_LAUNCH,
+                            dataWithName("initial"),
+                            new NamePolicy(true)
+                    ));
+
+            assertEquals(PluginHookDispatchException.Category.EXCEPTION, failure.category());
+            assertNull(failure.getCause());
+            assertFalse(failure.getMessage().contains("provider-credential-value"));
+            assertEquals(1, released.get());
+        }
     }
 
     /// Rejects construction of an unvalidated cancelled category without cancellation fields.
@@ -673,113 +660,6 @@ public final class PluginHookDispatcherTest {
         return PluginHookResult.replace(dataWithName(name));
     }
 
-    /// Registers one synthetic manager container with an optional external capability session.
-    ///
-    /// @param manager target manager
-    /// @param temporaryDirectory isolated package paths
-    /// @param plugin fixture lifecycle implementation
-    /// @param manifest authoritative fixture manifest
-    /// @param artifactSha256 exact fixture artifact digest
-    /// @param classLoader fixture callback class loader
-    /// @param capabilitySession optional external payload capability session
-    /// @throws Exception if JavaFX registration fails
-    private static PluginContainer registerManagerFixture(
-            PluginManager manager,
-            Path temporaryDirectory,
-            Plugin plugin,
-            PluginManifest manifest,
-            String artifactSha256,
-            ClassLoader classLoader,
-            @Nullable PluginCapabilitySession capabilitySession
-    ) throws Exception {
-        PluginContext context = new PluginContext(
-                manifest,
-                temporaryDirectory.resolve("package-" + manifest.getId()),
-                temporaryDirectory.resolve("data-" + manifest.getId()),
-                classLoader,
-                artifactSha256,
-                () -> manifest.getHooks().isEmpty()
-                        ? Set.of()
-                        : Set.of(PluginPermission.LAUNCHER_HOOK),
-                provider -> {
-                    throw new IllegalStateException("Synthetic fixture does not register Providers through context");
-                },
-                null,
-                capabilitySession
-        );
-        PreparedPlugin prepared = new PreparedPlugin(
-                plugin,
-                context,
-                manifest,
-                temporaryDirectory.resolve(manifest.getId() + ".npl")
-        );
-        AtomicReference<PluginContainer> registered = new AtomicReference<>();
-        FXThreadTestSupport.runOnFxThread(() -> registered.set(manager.registerPreparedPlugin(prepared)));
-        PluginContainer container = java.util.Objects.requireNonNull(registered.get());
-        container.setEnabled(true);
-        return container;
-    }
-
-    /// Reads the isolated manager's launcher-owned authority for an exact external payload context fixture.
-    ///
-    /// @param manager target isolated manager
-    /// @return launcher-owned permission authority
-    /// @throws ReflectiveOperationException if the authority field cannot be read
-    private static PluginPermissionAuthority managerPermissionAuthority(PluginManager manager)
-            throws ReflectiveOperationException {
-        Field field = PluginManager.class.getDeclaredField("permissionAuthority");
-        field.setAccessible(true);
-        return (PluginPermissionAuthority) field.get(manager);
-    }
-
-    /// Parses one minimal schema-v5 manager fixture manifest.
-    ///
-    /// @param pluginId canonical plugin ID
-    /// @param runtime canonical runtime ID
-    /// @param hooks declared Hook points
-    /// @param dependencies declared dependency plugin IDs
-    /// @return validated fixture manifest
-    /// @throws IOException if the fixture JSON is invalid
-    private static PluginManifest managerManifest(
-            String pluginId,
-            String runtime,
-            @Unmodifiable List<PluginHookPoint> hooks,
-            @Unmodifiable List<String> dependencies
-    ) throws IOException {
-        String hookJson = hooks.stream()
-                .map(point -> "\"" + point.getId() + "\"")
-                .collect(java.util.stream.Collectors.joining(", ", "[", "]"));
-        String permissions = hooks.isEmpty() ? "[]" : "[\"launcher-hook\"]";
-        String dependencyJson = dependencies.stream()
-                .map(dependency -> "\"" + dependency + "\"")
-                .collect(java.util.stream.Collectors.joining(", ", "[", "]"));
-        return PluginManifest.fromJson(new StringReader("""
-                {
-                  "schemaVersion": 5,
-                  "id": "%s",
-                  "name": "Runtime Hook Manager Fixture",
-                  "version": "1.0.0-next",
-                  "type": "java",
-                  "entrypoint": "%s",
-                  "permissions": %s,
-                  "requiredPermissions": %s,
-                  "launcherVersion": "*",
-                  "runtime": "%s",
-                  "abi": 2,
-                  "hooks": %s,
-                  "dependencies": %s
-                }
-                """.formatted(
-                pluginId,
-                ManagerFixturePlugin.class.getName(),
-                permissions,
-                permissions,
-                runtime,
-                hookJson,
-                dependencyJson
-        )));
-    }
-
     /// Waits briefly for an asynchronous counter to reach an expected value.
     ///
     /// @param value observed counter
@@ -927,68 +807,140 @@ public final class PluginHookDispatcherTest {
         }
     }
 
-    /// Minimal lifecycle fixture whose Java Hook callback intentionally remains unchanged.
+    /// One real Supervisor lifecycle fixture exposing a dispatcher-ready external Hook endpoint.
     @NotNullByDefault
-    private static final class ManagerFixturePlugin implements Plugin {
-        /// Authoritative fixture manifest.
-        private final PluginManifest manifest;
+    private static final class SupervisedRuntimeFixture implements AutoCloseable {
+        /// Canonical fixture Runtime Provider Host ID.
+        private static final String PROVIDER_ID = "dev.test.supervised-runtime-host";
 
-        /// Creates one fixture plugin.
+        /// Exact external payload identity.
+        private final PluginArtifactIdentity identity;
+
+        /// Launcher-owned lifecycle owner.
+        private final RuntimeSupervisor supervisor;
+
+        /// Host-owned active registration.
+        private final RuntimeProviderRegistration registration;
+
+        /// Exact loaded and enabled payload handle.
+        private final RuntimePayloadHandle handle;
+
+        /// Capability-authorized endpoint routed through the Supervisor.
+        private final RuntimeHookEndpoint endpoint;
+
+        /// Creates and enables one exact external payload through a ready Provider.
         ///
-        /// @param manifest authoritative manifest
-        private ManagerFixturePlugin(PluginManifest manifest) {
-            this.manifest = manifest;
+        /// @param pluginId canonical external payload ID
+        /// @param callback Provider Hook behavior
+        /// @throws Exception if Provider lifecycle setup fails
+        private SupervisedRuntimeFixture(String pluginId, ProviderHookCallback callback) throws Exception {
+            identity = new PluginArtifactIdentity(pluginId, "1.0.0-next", "f".repeat(64));
+            RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+            supervisor = new RuntimeSupervisor(registry);
+            DispatcherRuntimeProvider provider = new DispatcherRuntimeProvider(callback);
+            supervisor.discover(PROVIDER_ID);
+            supervisor.resolve(PROVIDER_ID);
+            supervisor.bootstrapLoaded(PROVIDER_ID);
+            registration = supervisor.register(PROVIDER_ID, provider);
+            supervisor.activate(registration);
+            registry.bind(pluginId, new RuntimeRequirement(
+                    "rust",
+                    PluginAbi.ABI_2,
+                    1,
+                    PluginExecutionMode.EMBEDDED,
+                    Set.of(RuntimeFeature.BRIDGE, RuntimeFeature.HOOKS),
+                    null
+            ));
+            PluginPermissionAuthority authority = new PluginPermissionAuthority();
+            RuntimePayloadContext context = new RuntimePayloadContext(
+                    identity,
+                    Path.of("build", "supervised-runtime", pluginId, "package"),
+                    "payload/plugin.dll",
+                    PluginExecutionMode.EMBEDDED,
+                    Path.of("build", "supervised-runtime", pluginId, "data"),
+                    () -> authority.issue(
+                            identity,
+                            PluginExecutionMode.EMBEDDED,
+                            Set.of(PluginPermission.LAUNCHER_HOOK),
+                            "runtime.payload",
+                            Duration.ofMinutes(1)
+                    )
+            );
+            handle = supervisor.loadPayload(pluginId, context);
+            supervisor.enablePayload(handle);
+            endpoint = new RuntimeHookEndpoint(
+                    identity,
+                    PluginExecutionMode.EMBEDDED,
+                    authority,
+                    context.capabilityTokenSupplier(),
+                    supervisor.hookInvoker(pluginId)
+            );
         }
 
-        /// Accepts the synthetic context without side effects.
+        /// Returns the external payload ID.
         ///
-        /// @param context synthetic plugin context
-        @Override
-        public void onLoad(PluginContext context) {
+        /// @return canonical payload ID
+        private String pluginId() {
+            return identity.getPluginId();
         }
 
-        /// Enables without side effects.
-        @Override
-        public void onEnable() {
-        }
-
-        /// Disables without side effects.
-        @Override
-        public void onDisable() {
-        }
-
-        /// Returns the authoritative fixture manifest.
+        /// Returns the supervised endpoint.
         ///
-        /// @return fixture manifest
+        /// @return Hook endpoint
+        private RuntimeHookEndpoint endpoint() {
+            return endpoint;
+        }
+
+        /// Disables and unloads the payload before closing its Provider registration.
+        ///
+        /// @throws Exception if lifecycle cleanup fails
         @Override
-        public PluginManifest getManifest() {
-            return manifest;
+        public void close() throws Exception {
+            supervisor.unloadPayload(handle);
+            registration.close();
         }
     }
 
-    /// Selected Runtime Provider fixture that records external Hook callback scope.
+    /// Provider Hook behavior used by one supervised dispatcher fixture.
+    @FunctionalInterface
     @NotNullByDefault
-    private static final class ManagerRuntimeProvider
-            implements RuntimeProvider, RuntimeHookEndpoint.ProviderInvoker {
-        /// Canonical Provider Host ID.
-        private static final String PROVIDER_ID = "dev.test.runtime-host";
+    private interface ProviderHookCallback {
+        /// Invokes one exact external payload Hook.
+        ///
+        /// @param handle exact payload handle
+        /// @param token short-lived capability token
+        /// @param event immutable Hook event
+        /// @param timeout dispatcher deadline
+        /// @return Hook result, or `null` for malformed output
+        /// @throws Exception if the callback fails
+        @Nullable PluginHookResult invoke(
+                RuntimePayloadHandle handle,
+                org.jackhuang.hmcl.plugin.bridge.PluginCapabilityToken token,
+                PluginHookEvent event,
+                Duration timeout
+        ) throws Exception;
+    }
 
-        /// Canonical external payload ID.
-        private static final String PAYLOAD_ID = "dev.test.runtime-payload";
+    /// Minimal ready Runtime Provider which delegates Hook behavior to one test callback.
+    @NotNullByDefault
+    private static final class DispatcherRuntimeProvider implements RuntimeProvider, RuntimeProvider.HookInvoker {
+        /// Configured Hook behavior.
+        private final ProviderHookCallback callback;
 
-        /// Whether the Provider Hook callback ran.
-        private final AtomicBoolean invoked = new AtomicBoolean();
+        /// Creates one Provider fixture.
+        ///
+        /// @param callback Hook behavior
+        private DispatcherRuntimeProvider(ProviderHookCallback callback) {
+            this.callback = callback;
+        }
 
-        /// TCCL observed by the Provider callback.
-        private final AtomicReference<@Nullable ClassLoader> callbackClassLoader = new AtomicReference<>();
-
-        /// Returns a compatible installed Rust Provider descriptor.
+        /// Returns one installed embedded Rust Provider descriptor with Hook support.
         ///
         /// @return Provider descriptor
         @Override
         public RuntimeProviderDescriptor descriptor() {
             return new RuntimeProviderDescriptor(
-                    PROVIDER_ID,
+                    SupervisedRuntimeFixture.PROVIDER_ID,
                     "1.0.0-next",
                     List.of(new RuntimeProviderDeclaration(
                             "rust",
@@ -1004,67 +956,57 @@ public final class PluginHookDispatcherTest {
             );
         }
 
-        /// Records one Provider-backed Hook invocation.
+        /// Loads one exact payload handle.
         ///
-        /// @param ownerPluginId exact payload owner
-        /// @param token plugin-scoped token
-        /// @param event immutable event
-        /// @param timeout dispatcher deadline
-        /// @return unchanged result
+        /// @param context immutable payload context
+        /// @return exact opaque handle
         @Override
-        public PluginHookResult invokeHook(
-                String ownerPluginId,
+        public RuntimePayloadHandle loadPayload(RuntimePayloadContext context) {
+            return new RuntimePayloadHandle(
+                    context.artifactIdentity().getPluginId(),
+                    SupervisedRuntimeFixture.PROVIDER_ID,
+                    "dispatcher-payload"
+            );
+        }
+
+        /// Enables the loaded payload without additional behavior.
+        ///
+        /// @param handle exact payload handle
+        @Override
+        public void enablePayload(RuntimePayloadHandle handle) {
+        }
+
+        /// Disables the loaded payload without additional behavior.
+        ///
+        /// @param handle exact payload handle
+        @Override
+        public void disablePayload(RuntimePayloadHandle handle) {
+        }
+
+        /// Unloads the payload without additional behavior.
+        ///
+        /// @param handle exact payload handle
+        @Override
+        public void unloadPayload(RuntimePayloadHandle handle) {
+        }
+
+        /// Delegates one handle-aware Hook callback.
+        ///
+        /// @param handle exact payload handle
+        /// @param token short-lived capability token
+        /// @param event immutable Hook event
+        /// @param timeout dispatcher deadline
+        /// @return callback result, or `null`
+        /// @throws Exception if callback behavior fails
+        @Override
+        public @Nullable PluginHookResult invokeHook(
+                RuntimePayloadHandle handle,
                 org.jackhuang.hmcl.plugin.bridge.PluginCapabilityToken token,
                 PluginHookEvent event,
                 Duration timeout
-        ) {
-            assertEquals(PAYLOAD_ID, ownerPluginId);
-            assertEquals(Duration.ofMillis(225), timeout);
-            invoked.set(true);
-            callbackClassLoader.set(Thread.currentThread().getContextClassLoader());
-            return PluginHookResult.unchanged();
-        }
-
-        /// Returns whether the Provider callback ran.
-        ///
-        /// @return callback state
-        private boolean invoked() {
-            return invoked.get();
-        }
-
-        /// Returns the callback TCCL.
-        ///
-        /// @return observed class loader or `null`
-        private @Nullable ClassLoader callbackClassLoader() {
-            return callbackClassLoader.get();
+        ) throws Exception {
+            return callback.invoke(handle, token, event, timeout);
         }
     }
 
-    /// URL class loader that delays its physical close while manager callback leases remain active.
-    @NotNullByDefault
-    private static final class TrackingClassLoader extends URLClassLoader {
-        /// Number of physical URL class-loader closes.
-        private final AtomicInteger physicalCloseCount = new AtomicInteger();
-
-        /// Creates an empty child loader.
-        private TrackingClassLoader() {
-            super(new URL[0], PluginManager.class.getClassLoader());
-        }
-
-        /// Records and performs one physical close.
-        ///
-        /// @throws IOException if the base loader cannot close
-        @Override
-        public void close() throws IOException {
-            physicalCloseCount.incrementAndGet();
-            super.close();
-        }
-
-        /// Returns the number of physical close calls.
-        ///
-        /// @return physical close count
-        private int physicalCloseCount() {
-            return physicalCloseCount.get();
-        }
-    }
 }

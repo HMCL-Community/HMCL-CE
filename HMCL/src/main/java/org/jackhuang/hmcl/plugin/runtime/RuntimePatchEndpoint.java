@@ -48,6 +48,9 @@ public final class RuntimePatchEndpoint {
     /// Issues a token from the payload's current lifecycle-session generation.
     private final Supplier<PluginCapabilityToken> capabilityTokenSupplier;
 
+    /// Launcher-owned exact payload lifecycle validator.
+    private final RegistrationGate registrationGate;
+
     /// Immutable authoritative manifest declarations accepted from this payload.
     private final @Unmodifiable List<PluginPatchDeclaration> declarations;
 
@@ -65,12 +68,40 @@ public final class RuntimePatchEndpoint {
             Supplier<PluginCapabilityToken> capabilityTokenSupplier,
             Collection<PluginPatchDeclaration> declarations
     ) {
+        this(
+                artifactIdentity,
+                executionMode,
+                permissionAuthority,
+                capabilityTokenSupplier,
+                declarations,
+                () -> {
+                }
+        );
+    }
+
+    /// Creates one reserved Patch endpoint with an exact launcher-owned payload lifecycle gate.
+    ///
+    /// @param artifactIdentity exact external payload identity
+    /// @param executionMode payload execution boundary
+    /// @param permissionAuthority launcher-owned token verifier
+    /// @param capabilityTokenSupplier current payload-session token source
+    /// @param declarations authoritative manifest Patch declarations
+    /// @param registrationGate exact payload lifecycle validator
+    public RuntimePatchEndpoint(
+            PluginArtifactIdentity artifactIdentity,
+            PluginExecutionMode executionMode,
+            PluginPermissionAuthority permissionAuthority,
+            Supplier<PluginCapabilityToken> capabilityTokenSupplier,
+            Collection<PluginPatchDeclaration> declarations,
+            RegistrationGate registrationGate
+    ) {
         this.artifactIdentity = Objects.requireNonNull(artifactIdentity, "artifactIdentity");
         this.executionMode = Objects.requireNonNull(executionMode, "executionMode");
         this.permissionAuthority = Objects.requireNonNull(permissionAuthority, "permissionAuthority");
         this.capabilityTokenSupplier = Objects.requireNonNull(
                 capabilityTokenSupplier, "capabilityTokenSupplier");
         this.declarations = copyDeclarations(declarations);
+        this.registrationGate = Objects.requireNonNull(registrationGate, "registrationGate");
     }
 
     /// Validates one exact declared Patch and returns the Stage-1 fail-closed engine status.
@@ -97,6 +128,7 @@ public final class RuntimePatchEndpoint {
                 RuntimeHookEndpoint.CALLBACK_DOMAIN
         );
         try {
+            registrationGate.requireActive();
             return RegistrationStatus.PATCH_ENGINE_UNAVAILABLE;
         } finally {
             permissionAuthority.revoke(token);
@@ -128,5 +160,13 @@ public final class RuntimePatchEndpoint {
     public enum RegistrationStatus {
         /// Declaration and authority are valid, but no JVM Patch engine is installed in Stage 1.
         PATCH_ENGINE_UNAVAILABLE
+    }
+
+    /// Launcher-owned validator for one exact retained payload registration generation.
+    @FunctionalInterface
+    @NotNullByDefault
+    public interface RegistrationGate {
+        /// Requires that the exact payload registration remains active and enabled.
+        void requireActive();
     }
 }

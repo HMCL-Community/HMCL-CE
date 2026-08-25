@@ -17,10 +17,15 @@
  */
 package org.jackhuang.hmcl.plugin.runtime;
 
+import org.jackhuang.hmcl.plugin.PluginHookEvent;
+import org.jackhuang.hmcl.plugin.PluginHookResult;
+import org.jackhuang.hmcl.plugin.bridge.PluginCapabilityToken;
 import org.jetbrains.annotations.NotNullByDefault;
+import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.List;
 import java.util.Set;
 
@@ -152,5 +157,25 @@ public interface RuntimeProvider extends AutoCloseable {
     /// @throws IOException if provider shutdown fails
     @Override
     default void close() throws IOException {
+    }
+
+    /// Optional Provider transport for Hook callbacks against one exact Supervisor-owned payload handle.
+    @FunctionalInterface
+    @NotNullByDefault
+    interface HookInvoker {
+        /// Invokes one external payload Hook without applying launcher Hook policy inside the Provider.
+        ///
+        /// @param handle exact current payload handle
+        /// @param token short-lived plugin-scoped capability token
+        /// @param event immutable Hook event
+        /// @param timeout positive dispatcher callback deadline
+        /// @return external callback result, or `null` for malformed Provider output
+        /// @throws Exception if Provider transport or external callback fails
+        @Nullable PluginHookResult invokeHook(
+                RuntimePayloadHandle handle,
+                PluginCapabilityToken token,
+                PluginHookEvent event,
+                Duration timeout
+        ) throws Exception;
     }
 }

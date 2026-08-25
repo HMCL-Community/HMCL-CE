@@ -24,13 +24,16 @@ import org.jackhuang.hmcl.plugin.bridge.PluginPermissionAuthority;
 import org.jackhuang.hmcl.plugin.runtime.PluginAbi;
 import org.jackhuang.hmcl.plugin.runtime.PluginExecutionMode;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeFeature;
+import org.jackhuang.hmcl.plugin.runtime.RuntimePatchEndpoint;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProvider;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderBinding;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderDeclaration;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderDescriptor;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderRegistry;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeSupervisor;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.Unmodifiable;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIf;
 import org.junit.jupiter.api.io.TempDir;
@@ -63,11 +66,100 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @EnabledIf("org.jackhuang.hmcl.JavaFXLauncher#isStarted")
 @NotNullByDefault
 public final class PluginManagerRuntimeProviderLifecycleTest {
+    /// External payload ID which sorts before its virtual Runtime Provider Host.
+    private static final String EARLY_PAYLOAD_ID = "dev.hmclce.test.aaa-runtime-payload";
+
     /// Canonical external payload plugin ID used by generated packages and bindings.
     private static final String PAYLOAD_ID = "dev.hmclce.test.runtime-payload";
 
     /// Canonical Java dependent plugin ID used by live graph replacement tests.
     private static final String JAVA_DEPENDENT_ID = "dev.hmclce.test.runtime-dependent";
+
+    /// Orders a runtime payload after its selected Host even without a concrete manifest dependency.
+    ///
+    /// @param temporaryDirectory isolated launcher home
+    /// @throws Exception if package creation, discovery, snapshotting, or cleanup fails
+    @Test
+    public void orderRuntimeHookAfterVirtualProviderDependency(@TempDir Path temporaryDirectory) throws Exception {
+        Path localHome = temporaryDirectory.resolve("home");
+        RuntimeProviderRegistry registry = RuntimeProviderRegistry.processWide();
+        clearFixture(registry);
+        try {
+            PluginManager manager = new PluginManager(localHome);
+            writeHookPayloadPackage(
+                    manager.getPluginsDirectory().resolve("00-early-payload.npl"), EARLY_PAYLOAD_ID);
+            writeHookHostPackage(manager.getPluginsDirectory().resolve("99-hook-host.npl"));
+            writeBinding(localHome, EARLY_PAYLOAD_ID);
+            manager.setGrantedPermissions(
+                    PackagedRuntimeProviderPlugin.PROVIDER_ID,
+                    Set.of(PluginPermission.LAUNCHER_HOOK)
+            );
+            manager.setGrantedPermissions(
+                    EARLY_PAYLOAD_ID,
+                    Set.of(PluginPermission.LAUNCHER_HOOK, PluginPermission.LAUNCHER_PATCH)
+            );
+            manager.enablePlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID);
+            manager.enablePlugin(EARLY_PAYLOAD_ID);
+            FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
+            PluginContainer hostContainer = Objects.requireNonNull(
+                    manager.getPlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID));
+            PluginContainer payloadContainer = Objects.requireNonNull(manager.getPlugin(EARLY_PAYLOAD_ID));
+
+            @Unmodifiable List<PluginHookSubscriber> subscribers =
+                    manager.snapshotHookSubscribers(PluginHookPoint.BEFORE_GAME_LAUNCH);
+            try {
+                assertEquals(
+                        List.of(PackagedRuntimeProviderPlugin.PROVIDER_ID, EARLY_PAYLOAD_ID),
+                        subscribers.stream().map(PluginHookSubscriber::pluginId).toList()
+                );
+                PluginHookEvent event = new PluginHookEvent(
+                        PluginHookEvent.CURRENT_CONTRACT_VERSION,
+                        "real-runtime-manager-hook",
+                        PluginHookPoint.BEFORE_GAME_LAUNCH,
+                        java.time.Instant.EPOCH,
+                        PluginDataObject.empty(),
+                        PluginSecretAccess.denied(EARLY_PAYLOAD_ID)
+                );
+                assertEquals(PluginHookResult.Action.UNCHANGED,
+                        subscribers.get(0).endpoint().invoke(event, Duration.ofMillis(225)).action());
+                assertEquals(PluginHookResult.Action.UNCHANGED,
+                        subscribers.get(1).endpoint().invoke(event, Duration.ofMillis(225)).action());
+                assertEquals(
+                        List.of("host.hook", "payload.hook:" + EARLY_PAYLOAD_ID),
+                        events().subList(events().size() - 2, events().size())
+                );
+                RuntimeProvider provider = registry.findById(PackagedRuntimeProviderPlugin.PROVIDER_ID)
+                        .orElseThrow();
+                ClassLoader providerClassLoader = provider.getClass().getClassLoader();
+                assertEquals(
+                        Integer.toString(System.identityHashCode(providerClassLoader)),
+                        System.getProperty(PackagedRuntimeProviderPlugin.HOOK_TCCL_PROPERTY)
+                );
+                RuntimePatchEndpoint patchEndpoint = runtimeSupervisor(manager)
+                        .patchEndpoint(EARLY_PAYLOAD_ID)
+                        .orElseThrow();
+                assertEquals(1, patchEndpoint.declarations().size());
+                assertEquals(
+                        RuntimePatchEndpoint.RegistrationStatus.PATCH_ENGINE_UNAVAILABLE,
+                        patchEndpoint.register(patchEndpoint.declarations().get(0))
+                );
+                FXThreadTestSupport.runOnFxThread(() -> manager.unloadPlugin(EARLY_PAYLOAD_ID));
+                FXThreadTestSupport.runOnFxThread(() ->
+                        manager.unloadPlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID));
+                assertHookLeaseState(payloadContainer, 1, true, false);
+                assertHookLeaseState(hostContainer, 2, true, false);
+                assertThrows(IllegalStateException.class,
+                        () -> subscribers.get(1).endpoint().invoke(event, Duration.ofMillis(225)));
+                subscribers.forEach(PluginHookSubscriber::close);
+                assertHookLeaseState(payloadContainer, 0, true, true);
+                assertHookLeaseState(hostContainer, 0, true, true);
+            } finally {
+                subscribers.forEach(PluginHookSubscriber::close);
+            }
+        } finally {
+            clearFixture(registry);
+        }
+    }
 
     /// Rejects an external payload without an exact binding even when a compatible Provider is registered.
     ///
@@ -678,10 +770,19 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
     /// @param localHome launcher-local home
     /// @throws IOException if binding publication fails
     private static void writeBinding(Path localHome) throws IOException {
+        writeBinding(localHome, PAYLOAD_ID);
+    }
+
+    /// Persists one virtual Provider binding for a caller-selected external payload.
+    ///
+    /// @param localHome launcher-local home
+    /// @param payloadId canonical external payload ID
+    /// @throws IOException if binding publication fails
+    private static void writeBinding(Path localHome, String payloadId) throws IOException {
         PluginMutationLock mutationLock = new PluginMutationLock(localHome);
         new PluginRuntimeBindingStore(localHome, mutationLock).mergeStrict(Map.of(
-                PAYLOAD_ID,
-                new RuntimeProviderBinding(PAYLOAD_ID, PackagedRuntimeProviderPlugin.PROVIDER_ID, "rust")
+                payloadId,
+                new RuntimeProviderBinding(payloadId, PackagedRuntimeProviderPlugin.PROVIDER_ID, "rust")
         ));
     }
 
@@ -726,6 +827,41 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
         var field = PluginManager.class.getDeclaredField("permissionAuthority");
         field.setAccessible(true);
         return (PluginPermissionAuthority) field.get(manager);
+    }
+
+    /// Returns the Manager's launcher-owned Runtime Supervisor for lifecycle retention verification.
+    ///
+    /// @param manager manager under test
+    /// @return manager-owned Runtime Supervisor
+    /// @throws ReflectiveOperationException if the private implementation field cannot be accessed
+    private static RuntimeSupervisor runtimeSupervisor(PluginManager manager) throws ReflectiveOperationException {
+        var field = PluginManager.class.getDeclaredField("runtimeSupervisor");
+        field.setAccessible(true);
+        return (RuntimeSupervisor) field.get(manager);
+    }
+
+    /// Verifies one real Manager container's callback lease and deferred class-loader close state.
+    ///
+    /// @param container exact loaded container retained across unload
+    /// @param expectedLeases expected active Hook lease count
+    /// @param expectedCloseRequested expected close-request state
+    /// @param expectedClosed expected physical-close selection state
+    /// @throws ReflectiveOperationException if lifecycle state cannot be read
+    private static void assertHookLeaseState(
+            PluginContainer container,
+            int expectedLeases,
+            boolean expectedCloseRequested,
+            boolean expectedClosed
+    ) throws ReflectiveOperationException {
+        var leases = PluginContainer.class.getDeclaredField("activeHookLeases");
+        var closeRequested = PluginContainer.class.getDeclaredField("classLoaderCloseRequested");
+        var closed = PluginContainer.class.getDeclaredField("classLoaderClosed");
+        leases.setAccessible(true);
+        closeRequested.setAccessible(true);
+        closed.setAccessible(true);
+        assertEquals(expectedLeases, leases.getInt(container));
+        assertEquals(expectedCloseRequested, closeRequested.getBoolean(container));
+        assertEquals(expectedClosed, closed.getBoolean(container));
     }
 
     /// Probes the Provider's retained payload supplier through its process-global health callback.
@@ -789,6 +925,41 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
                 """.formatted(PackagedRuntimeProviderPlugin.PROVIDER_ID, version,
                 PackagedRuntimeProviderPlugin.class.getName(),
                 permissions);
+        writePackage(target, manifest, PackagedRuntimeProviderPlugin.class, false);
+    }
+
+    /// Writes a Runtime Provider Host which also subscribes to the launch Hook it transports.
+    ///
+    /// @param target Host package path
+    /// @throws IOException if package creation fails
+    private static void writeHookHostPackage(Path target) throws IOException {
+        String manifest = """
+                {
+                  "schemaVersion": 5,
+                  "id": "%s",
+                  "name": "Runtime Hook Host",
+                  "version": "1.0.0",
+                  "type": "java",
+                  "entrypoint": "%s",
+                  "permissions": ["launcher-hook"],
+                  "requiredPermissions": ["launcher-hook"],
+                  "launcherVersion": "*",
+                  "runtime": "java",
+                  "abi": 2,
+                  "hooks": ["before-game-launch"],
+                  "pluginKind": "runtime-provider",
+                  "providesRuntimes": [{
+                    "runtime": "rust",
+                    "abis": [2],
+                    "bridgeAbi": 1,
+                    "executionModes": ["embedded"],
+                    "features": ["bridge", "hooks", "patches"]
+                  }]
+                }
+                """.formatted(
+                PackagedRuntimeProviderPlugin.PROVIDER_ID,
+                PackagedRuntimeProviderPlugin.class.getName()
+        );
         writePackage(target, manifest, PackagedRuntimeProviderPlugin.class, false);
     }
 
@@ -882,6 +1053,38 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
                   "executionMode": "embedded"
                 }
                 """.formatted(PAYLOAD_ID, permissionsJson);
+        writePackage(target, manifest, null, true);
+    }
+
+    /// Writes a Hook-declaring external payload without a concrete Host dependency.
+    ///
+    /// @param target payload package path
+    /// @param payloadId canonical payload ID
+    /// @throws IOException if package creation fails
+    private static void writeHookPayloadPackage(Path target, String payloadId) throws IOException {
+        String manifest = """
+                {
+                  "schemaVersion": 5,
+                  "id": "%s",
+                  "name": "Runtime Hook Payload",
+                  "version": "1.0.0",
+                  "type": "java",
+                  "entrypoint": "payload/plugin.dll",
+                  "permissions": ["launcher-hook", "launcher-patch"],
+                  "requiredPermissions": ["launcher-hook", "launcher-patch"],
+                  "launcherVersion": "*",
+                  "runtime": "rust",
+                  "abi": 2,
+                  "executionMode": "embedded",
+                  "hooks": ["before-game-launch"],
+                  "patches": [{
+                    "target": "org.jackhuang.hmcl.test.PatchTarget",
+                    "method": "launch",
+                    "type": "before",
+                    "parameters": ["java.lang.String"]
+                  }]
+                }
+                """.formatted(payloadId);
         writePackage(target, manifest, null, true);
     }
 
@@ -1034,6 +1237,7 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
     /// @param registry process-wide runtime registry
     private static void clearFixture(RuntimeProviderRegistry registry) {
         registry.unbind(PAYLOAD_ID);
+        registry.unbind(EARLY_PAYLOAD_ID);
         registry.unbind(JAVA_DEPENDENT_ID);
         registry.unregister(PackagedRuntimeProviderPlugin.PROVIDER_ID);
         System.clearProperty(PackagedRuntimeProviderPlugin.EVENTS_PROPERTY);
@@ -1049,6 +1253,7 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
         System.clearProperty(PackagedRuntimeProviderPlugin.CHECK_PAYLOAD_CAPABILITY_PROPERTY);
         System.clearProperty(PackagedRuntimeProviderPlugin.PAYLOAD_CAPABILITY_AVAILABLE_PROPERTY);
         System.clearProperty(PackagedRuntimeProviderPlugin.UNLOAD_CAPABILITY_CLOSED_PROPERTY);
+        System.clearProperty(PackagedRuntimeProviderPlugin.HOOK_TCCL_PROPERTY);
         FXThreadTestSupport.runOnFxThread(
                 () -> PluginUIRegistry.unregisterAll(PackagedRuntimeProviderPlugin.PROVIDER_ID));
     }

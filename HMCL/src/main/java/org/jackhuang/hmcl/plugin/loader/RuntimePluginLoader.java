@@ -21,6 +21,7 @@ import org.jackhuang.hmcl.plugin.Plugin;
 import org.jackhuang.hmcl.plugin.PluginContext;
 import org.jackhuang.hmcl.plugin.PluginManifest;
 import org.jackhuang.hmcl.plugin.bridge.PluginCapabilityToken;
+import org.jackhuang.hmcl.plugin.bridge.PluginPermissionAuthority;
 import org.jackhuang.hmcl.plugin.internal.PluginPackageVersions;
 import org.jackhuang.hmcl.plugin.internal.VerifiedPluginPackage;
 import org.jackhuang.hmcl.plugin.runtime.PluginRuntimeTypes;
@@ -48,19 +49,25 @@ public final class RuntimePluginLoader implements PluginLoader {
     /// Resolves the current opaque capability-token supplier for one dependent plugin ID.
     private final Function<String, Supplier<PluginCapabilityToken>> capabilityTokenResolver;
 
+    /// Launcher-owned authority used to retain manifest Patch declarations at the payload boundary.
+    private final PluginPermissionAuthority permissionAuthority;
+
     /// Creates a Provider-backed external payload loader.
     ///
     /// @param supervisor Provider lifecycle owner
     /// @param dataDirectoryResolver dependent data-directory resolver
     /// @param capabilityTokenResolver dependent capability-authority resolver
+    /// @param permissionAuthority launcher-owned capability verifier
     public RuntimePluginLoader(
             RuntimeSupervisor supervisor,
             Function<String, Path> dataDirectoryResolver,
-            Function<String, Supplier<PluginCapabilityToken>> capabilityTokenResolver
+            Function<String, Supplier<PluginCapabilityToken>> capabilityTokenResolver,
+            PluginPermissionAuthority permissionAuthority
     ) {
         this.supervisor = Objects.requireNonNull(supervisor, "supervisor");
         this.dataDirectoryResolver = Objects.requireNonNull(dataDirectoryResolver, "dataDirectoryResolver");
         this.capabilityTokenResolver = Objects.requireNonNull(capabilityTokenResolver, "capabilityTokenResolver");
+        this.permissionAuthority = Objects.requireNonNull(permissionAuthority, "permissionAuthority");
     }
 
     /// Verifies one exact external payload and delegates loading through its selected ready Provider.
@@ -106,6 +113,25 @@ public final class RuntimePluginLoader implements PluginLoader {
                 capabilityTokenSupplier
         );
         RuntimePayloadHandle handle = supervisor.loadPayload(pluginId, payloadContext);
+        try {
+            if (!manifest.getPatches().isEmpty()) {
+                supervisor.retainPatchEndpoint(
+                        handle,
+                        pluginPackage.getIdentity(),
+                        manifest.getExecutionMode(),
+                        permissionAuthority,
+                        capabilityTokenSupplier,
+                        manifest.getPatches()
+                );
+            }
+        } catch (IOException | RuntimeException | Error exception) {
+            try {
+                supervisor.unloadPayload(handle);
+            } catch (IOException | RuntimeException | Error cleanupFailure) {
+                exception.addSuppressed(cleanupFailure);
+            }
+            throw exception;
+        }
         return new ProviderPayloadPlugin(manifest, supervisor, handle);
     }
 

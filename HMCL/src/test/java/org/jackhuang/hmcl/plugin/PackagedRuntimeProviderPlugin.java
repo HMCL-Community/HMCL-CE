@@ -18,13 +18,9 @@
 package org.jackhuang.hmcl.plugin;
 
 import org.jackhuang.hmcl.plugin.bridge.PluginCapabilityToken;
-import org.jackhuang.hmcl.plugin.runtime.PluginAbi;
-import org.jackhuang.hmcl.plugin.runtime.PluginExecutionMode;
-import org.jackhuang.hmcl.plugin.runtime.RuntimeFeature;
 import org.jackhuang.hmcl.plugin.runtime.RuntimePayloadContext;
 import org.jackhuang.hmcl.plugin.runtime.RuntimePayloadHandle;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProvider;
-import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderDeclaration;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderDescriptor;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
@@ -32,14 +28,14 @@ import org.jetbrains.annotations.Nullable;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.List;
+import java.time.Duration;
 import java.util.Objects;
-import java.util.Set;
 import java.util.function.Supplier;
 
 /// Package-owned runtime Provider Host fixture whose callbacks are recorded through process properties.
 @NotNullByDefault
-public final class PackagedRuntimeProviderPlugin implements Plugin, RuntimeProvider {
+public final class PackagedRuntimeProviderPlugin
+        implements Plugin, RuntimeProvider, RuntimeProvider.HookInvoker {
     /// Canonical Host plugin ID shared with generated test manifests.
     public static final String PROVIDER_ID = "dev.hmclce.test.runtime-host";
 
@@ -89,6 +85,9 @@ public final class PackagedRuntimeProviderPlugin implements Plugin, RuntimeProvi
     public static final String UNLOAD_CAPABILITY_CLOSED_PROPERTY =
             "hmcl.test.runtime-provider.unload-capability-closed";
 
+    /// Process property containing the identity hash of the TCCL observed by the latest Hook callback.
+    public static final String HOOK_TCCL_PROPERTY = "hmcl.test.runtime-provider.hook-tccl";
+
     /// Manifest received during Host loading, or `null` before registration.
     private @Nullable PluginManifest manifest;
 
@@ -131,6 +130,16 @@ public final class PackagedRuntimeProviderPlugin implements Plugin, RuntimeProvi
         append("host.onDisable");
     }
 
+    /// Records the Host plugin's own Java Hook callback.
+    ///
+    /// @param event immutable Hook event
+    /// @return unchanged Hook result
+    @Override
+    public PluginHookResult onHook(PluginHookEvent event) {
+        append("host.hook");
+        return PluginHookResult.unchanged();
+    }
+
     /// Records Host bootstrap unloading.
     @Override
     public void onUnload() {
@@ -152,13 +161,7 @@ public final class PackagedRuntimeProviderPlugin implements Plugin, RuntimeProvi
         return new RuntimeProviderDescriptor(
                 PROVIDER_ID,
                 getManifest().getVersion(),
-                List.of(new RuntimeProviderDeclaration(
-                        "rust",
-                        Set.of(PluginAbi.ABI_2),
-                        1,
-                        Set.of(PluginExecutionMode.EMBEDDED),
-                        Set.of(RuntimeFeature.BRIDGE)
-                )),
+                getManifest().getProvidesRuntimes(),
                 true,
                 true,
                 0,
@@ -237,6 +240,28 @@ public final class PackagedRuntimeProviderPlugin implements Plugin, RuntimeProvi
             System.clearProperty(FAIL_UNLOAD_ONCE_PROPERTY);
             throw new IOException("Configured one-shot payload unload failure");
         }
+    }
+
+    /// Records one external payload Hook callback.
+    ///
+    /// @param handle exact current payload handle
+    /// @param token short-lived payload capability token
+    /// @param event immutable Hook event
+    /// @param timeout dispatcher callback deadline
+    /// @return unchanged Hook result
+    @Override
+    public PluginHookResult invokeHook(
+            RuntimePayloadHandle handle,
+            PluginCapabilityToken token,
+            PluginHookEvent event,
+            Duration timeout
+    ) {
+        System.setProperty(
+                HOOK_TCCL_PROPERTY,
+                Integer.toString(System.identityHashCode(Thread.currentThread().getContextClassLoader()))
+        );
+        append("payload.hook:" + handle.ownerPluginId());
+        return PluginHookResult.unchanged();
     }
 
     /// Records Provider-wide resource shutdown.

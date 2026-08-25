@@ -18,6 +18,14 @@
 package org.jackhuang.hmcl.plugin.runtime;
 
 import org.jackhuang.hmcl.plugin.PluginArtifactIdentity;
+import org.jackhuang.hmcl.plugin.PluginDataObject;
+import org.jackhuang.hmcl.plugin.PluginHookDispatchException;
+import org.jackhuang.hmcl.plugin.PluginHookEvent;
+import org.jackhuang.hmcl.plugin.PluginHookPoint;
+import org.jackhuang.hmcl.plugin.PluginHookResult;
+import org.jackhuang.hmcl.plugin.PluginPermission;
+import org.jackhuang.hmcl.plugin.PluginPatchDeclaration;
+import org.jackhuang.hmcl.plugin.PluginSecretAccess;
 import org.jackhuang.hmcl.plugin.bridge.PluginCapabilityToken;
 import org.jackhuang.hmcl.plugin.bridge.PluginPermissionAuthority;
 import org.jetbrains.annotations.NotNullByDefault;
@@ -34,6 +42,7 @@ import java.lang.management.ManagementFactory;
 import java.lang.management.ThreadInfo;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
@@ -102,6 +111,221 @@ public final class RuntimeSupervisorTest {
         assertEquals(List.of("initialize", "health", "load:dev.plugin.rust",
                 "unload:dev.plugin.rust", "close"), provider.events);
         assertTrue(registry.findById("dev.host.rust").isEmpty());
+    }
+
+    /// Routes Hook work only through the exact current enabled payload record and rejects a stale equal handle.
+    ///
+    /// @param temporaryDirectory isolated payload paths
+    /// @throws Exception if lifecycle or Hook callbacks fail unexpectedly
+    @Test
+    public void routeHookThroughExactEnabledPayloadRecord(@TempDir Path temporaryDirectory) throws Exception {
+        String payloadId = "dev.plugin.hook";
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        RuntimeSupervisor supervisor = new RuntimeSupervisor(registry);
+        RecordingProvider provider = new RecordingProvider("dev.host.rust", true);
+        advanceToBootstrap(supervisor, "dev.host.rust");
+        RuntimeProviderRegistration registration = supervisor.register("dev.host.rust", provider);
+        supervisor.activate(registration);
+        registry.bind(payloadId, requirement("rust"));
+        RuntimePayloadHandle handle = supervisor.loadPayload(
+                payloadId, payloadContext(payloadId, temporaryDirectory));
+        supervisor.enablePayload(handle);
+        PluginArtifactIdentity identity = new PluginArtifactIdentity(payloadId, "1.0.0", "a".repeat(64));
+        PluginPermissionAuthority authority = new PluginPermissionAuthority();
+        RuntimeHookEndpoint endpoint = hookEndpoint(supervisor, identity, authority);
+
+        assertEquals(PluginHookResult.Action.UNCHANGED,
+                endpoint.invoke(hookEvent(payloadId), Duration.ofMillis(240)).action());
+        assertTrue(provider.events.contains("hook:" + payloadId));
+
+        supervisor.disablePayload(handle);
+        assertThrows(IOException.class,
+                () -> endpoint.invoke(hookEvent(payloadId), Duration.ofMillis(240)));
+        supervisor.enablePayload(handle);
+        supervisor.unloadPayload(handle);
+        registry.bind(payloadId, requirement("rust"));
+        RuntimePayloadHandle replacement = supervisor.loadPayload(
+                payloadId, payloadContext(payloadId, temporaryDirectory));
+        assertEquals(handle, replacement);
+        supervisor.enablePayload(replacement);
+
+        IllegalStateException stale = assertThrows(IllegalStateException.class,
+                () -> endpoint.invoke(hookEvent(payloadId), Duration.ofMillis(240)));
+        assertTrue(stale.getMessage().contains("stale runtime payload"));
+
+        supervisor.unloadPayload(replacement);
+        registration.close();
+    }
+
+    /// Reports a missing endpoint when the exact enabled payload Provider has no Hook transport.
+    ///
+    /// @param temporaryDirectory isolated payload paths
+    /// @throws Exception if fixture lifecycle or cleanup fails
+    @Test
+    public void rejectHookWhenSupervisedProviderHasNoInvoker(@TempDir Path temporaryDirectory) throws Exception {
+        String payloadId = "dev.plugin.hook-missing";
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        RuntimeSupervisor supervisor = new RuntimeSupervisor(registry);
+        LifecycleOnlyProvider provider = new LifecycleOnlyProvider("dev.host.rust");
+        advanceToBootstrap(supervisor, "dev.host.rust");
+        RuntimeProviderRegistration registration = supervisor.register("dev.host.rust", provider);
+        supervisor.activate(registration);
+        registry.bind(payloadId, requirement("rust"));
+        RuntimePayloadHandle handle = supervisor.loadPayload(
+                payloadId, payloadContext(payloadId, temporaryDirectory));
+        supervisor.enablePayload(handle);
+        PluginArtifactIdentity identity = new PluginArtifactIdentity(payloadId, "1.0.0", "a".repeat(64));
+        RuntimeHookEndpoint endpoint = hookEndpoint(
+                supervisor, identity, new PluginPermissionAuthority());
+
+        PluginHookDispatchException failure = assertThrows(
+                PluginHookDispatchException.class,
+                () -> endpoint.invoke(hookEvent(payloadId), Duration.ofMillis(240))
+        );
+        assertEquals(PluginHookDispatchException.Category.MISSING_ENDPOINT, failure.category());
+
+        supervisor.unloadPayload(handle);
+        registration.close();
+    }
+
+    /// Waits for an admitted Hook callback to exit before payload disablement reaches Provider code.
+    ///
+    /// @param temporaryDirectory isolated payload paths
+    /// @throws Exception if callback coordination or lifecycle cleanup fails
+    @Test
+    public void drainRunningHookBeforePayloadDisable(@TempDir Path temporaryDirectory) throws Exception {
+        String payloadId = "dev.plugin.hook-drain";
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        RuntimeSupervisor supervisor = new RuntimeSupervisor(registry);
+        RecordingProvider provider = new RecordingProvider("dev.host.rust", true);
+        advanceToBootstrap(supervisor, "dev.host.rust");
+        RuntimeProviderRegistration registration = supervisor.register("dev.host.rust", provider);
+        supervisor.activate(registration);
+        registry.bind(payloadId, requirement("rust"));
+        RuntimePayloadHandle handle = supervisor.loadPayload(
+                payloadId, payloadContext(payloadId, temporaryDirectory));
+        supervisor.enablePayload(handle);
+        CountDownLatch hookEntered = new CountDownLatch(1);
+        CountDownLatch releaseHook = new CountDownLatch(1);
+        provider.blockHook(hookEntered, releaseHook);
+        PluginArtifactIdentity identity = new PluginArtifactIdentity(payloadId, "1.0.0", "a".repeat(64));
+        RuntimeHookEndpoint endpoint = hookEndpoint(
+                supervisor, identity, new PluginPermissionAuthority());
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<PluginHookResult> hook = executor.submit(() ->
+                    endpoint.invoke(hookEvent(payloadId), Duration.ofSeconds(1)));
+            assertTrue(hookEntered.await(5, TimeUnit.SECONDS));
+            Future<Void> disabling = executor.submit(() -> {
+                supervisor.disablePayload(handle);
+                return null;
+            });
+
+            assertFalse(disabling.isDone());
+            assertFalse(provider.events.contains("disable:" + payloadId));
+            releaseHook.countDown();
+            assertEquals(PluginHookResult.Action.UNCHANGED,
+                    hook.get(5, TimeUnit.SECONDS).action());
+            disabling.get(5, TimeUnit.SECONDS);
+            assertTrue(provider.events.indexOf("hook:" + payloadId)
+                    < provider.events.indexOf("disable:" + payloadId));
+        } finally {
+            releaseHook.countDown();
+            executor.shutdownNow();
+            supervisor.unloadPayload(handle);
+            registration.close();
+        }
+    }
+
+    /// Keeps Hook admission closed when Provider payload enablement fails.
+    ///
+    /// @param temporaryDirectory isolated payload paths
+    /// @throws Exception if fixture setup or cleanup fails
+    @Test
+    public void rejectHookAfterPayloadEnableFailure(@TempDir Path temporaryDirectory) throws Exception {
+        String payloadId = "dev.plugin.hook-enable-failure";
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        RuntimeSupervisor supervisor = new RuntimeSupervisor(registry);
+        RecordingProvider provider = new RecordingProvider("dev.host.rust", true);
+        advanceToBootstrap(supervisor, "dev.host.rust");
+        RuntimeProviderRegistration registration = supervisor.register("dev.host.rust", provider);
+        supervisor.activate(registration);
+        registry.bind(payloadId, requirement("rust"));
+        RuntimePayloadHandle handle = supervisor.loadPayload(
+                payloadId, payloadContext(payloadId, temporaryDirectory));
+        provider.failNextPayloadEnable = true;
+        PluginArtifactIdentity identity = new PluginArtifactIdentity(payloadId, "1.0.0", "a".repeat(64));
+        RuntimeHookEndpoint endpoint = hookEndpoint(
+                supervisor, identity, new PluginPermissionAuthority());
+
+        assertThrows(IOException.class, () -> supervisor.enablePayload(handle));
+        assertThrows(IOException.class,
+                () -> endpoint.invoke(hookEvent(payloadId), Duration.ofSeconds(1)));
+        assertFalse(provider.events.contains("hook:" + payloadId));
+
+        supervisor.unloadPayload(handle);
+        registration.close();
+    }
+
+    /// Retains Stage-1 Patch declarations on the exact payload record and invalidates them on unload.
+    ///
+    /// @param temporaryDirectory isolated payload paths
+    /// @throws Exception if fixture lifecycle or cleanup fails
+    @Test
+    public void retainPatchEndpointOnExactPayloadRecord(@TempDir Path temporaryDirectory) throws Exception {
+        String payloadId = "dev.plugin.patch";
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        RuntimeSupervisor supervisor = new RuntimeSupervisor(registry);
+        RecordingProvider provider = new RecordingProvider("dev.host.rust", true);
+        advanceToBootstrap(supervisor, "dev.host.rust");
+        RuntimeProviderRegistration registration = supervisor.register("dev.host.rust", provider);
+        supervisor.activate(registration);
+        registry.bind(payloadId, requirement("rust"));
+        RuntimePayloadHandle handle = supervisor.loadPayload(
+                payloadId, payloadContext(payloadId, temporaryDirectory));
+        supervisor.enablePayload(handle);
+        PluginArtifactIdentity identity = new PluginArtifactIdentity(payloadId, "1.0.0", "a".repeat(64));
+        PluginPermissionAuthority authority = new PluginPermissionAuthority();
+        PluginPatchDeclaration declaration = new PluginPatchDeclaration(
+                "org.jackhuang.hmcl.test.PatchTarget",
+                "launch",
+                PluginPatchDeclaration.PatchType.BEFORE,
+                List.of("java.lang.String")
+        );
+
+        RuntimePatchEndpoint endpoint = supervisor.retainPatchEndpoint(
+                handle,
+                identity,
+                PluginExecutionMode.EMBEDDED,
+                authority,
+                () -> authority.issue(
+                        identity,
+                        PluginExecutionMode.EMBEDDED,
+                        Set.of(PluginPermission.LAUNCHER_PATCH),
+                        RuntimeHookEndpoint.CALLBACK_DOMAIN,
+                        Duration.ofMinutes(1)
+                ),
+                List.of(declaration)
+        );
+
+        assertSame(endpoint, supervisor.patchEndpoint(payloadId).orElseThrow());
+        assertEquals(
+                RuntimePatchEndpoint.RegistrationStatus.PATCH_ENGINE_UNAVAILABLE,
+                endpoint.register(declaration)
+        );
+        supervisor.disablePayload(handle);
+        assertThrows(IllegalStateException.class, () -> endpoint.register(declaration));
+        supervisor.unloadPayload(handle);
+        assertTrue(supervisor.patchEndpoint(payloadId).isEmpty());
+        registry.bind(payloadId, requirement("rust"));
+        RuntimePayloadHandle replacement = supervisor.loadPayload(
+                payloadId, payloadContext(payloadId, temporaryDirectory));
+        assertEquals(handle, replacement);
+        supervisor.enablePayload(replacement);
+        assertThrows(IllegalStateException.class, () -> endpoint.register(declaration));
+
+        supervisor.unloadPayload(replacement);
+        registration.close();
     }
 
     /// Rolls registration back and records `FAILED` when health negotiation rejects the Provider.
@@ -541,6 +765,48 @@ public final class RuntimeSupervisorTest {
         );
     }
 
+    /// Creates one capability-authorized Hook endpoint backed by an exact Supervisor payload record.
+    ///
+    /// @param supervisor lifecycle owner
+    /// @param identity exact payload identity
+    /// @param authority launcher-owned capability authority
+    /// @return supervised Hook endpoint
+    /// @throws IOException if no current payload record exists
+    private static RuntimeHookEndpoint hookEndpoint(
+            RuntimeSupervisor supervisor,
+            PluginArtifactIdentity identity,
+            PluginPermissionAuthority authority
+    ) throws IOException {
+        return new RuntimeHookEndpoint(
+                identity,
+                PluginExecutionMode.EMBEDDED,
+                authority,
+                () -> authority.issue(
+                        identity,
+                        PluginExecutionMode.EMBEDDED,
+                        Set.of(PluginPermission.LAUNCHER_HOOK),
+                        RuntimeHookEndpoint.CALLBACK_DOMAIN,
+                        Duration.ofMinutes(1)
+                ),
+                supervisor.hookInvoker(identity.getPluginId())
+        );
+    }
+
+    /// Creates one immutable Hook event for an exact external payload.
+    ///
+    /// @param pluginId event secret owner
+    /// @return immutable Hook event
+    private static PluginHookEvent hookEvent(String pluginId) {
+        return new PluginHookEvent(
+                PluginHookEvent.CURRENT_CONTRACT_VERSION,
+                "runtime-supervisor-hook",
+                PluginHookPoint.BEFORE_GAME_LAUNCH,
+                Instant.EPOCH,
+                PluginDataObject.empty(),
+                PluginSecretAccess.denied(pluginId)
+        );
+    }
+
     /// Awaits a mutation which may lose a valid race to an unload that removed the shared handle.
     ///
     /// @param mutation concurrent payload mutation
@@ -619,9 +885,79 @@ public final class RuntimeSupervisorTest {
         }
     }
 
+    /// Runtime Provider fixture which supports payload lifecycle but intentionally exposes no Hook transport.
+    @NotNullByDefault
+    private static final class LifecycleOnlyProvider implements RuntimeProvider {
+        /// Immutable fake Provider descriptor.
+        private final RuntimeProviderDescriptor descriptor;
+
+        /// Creates one lifecycle-only embedded Rust Provider.
+        ///
+        /// @param providerId Provider plugin ID
+        private LifecycleOnlyProvider(String providerId) {
+            descriptor = new RuntimeProviderDescriptor(
+                    providerId,
+                    "1.0.0",
+                    List.of(new RuntimeProviderDeclaration(
+                            "rust",
+                            Set.of(PluginAbi.ABI_2),
+                            1,
+                            Set.of(PluginExecutionMode.EMBEDDED),
+                            Set.of(RuntimeFeature.BRIDGE)
+                    )),
+                    true,
+                    true,
+                    0,
+                    false
+            );
+        }
+
+        /// Returns the immutable fake descriptor.
+        ///
+        /// @return Provider descriptor
+        @Override
+        public RuntimeProviderDescriptor descriptor() {
+            return descriptor;
+        }
+
+        /// Returns one opaque payload handle for the supplied context.
+        ///
+        /// @param context immutable payload loading context
+        /// @return opaque payload handle
+        @Override
+        public RuntimePayloadHandle loadPayload(RuntimePayloadContext context) {
+            return new RuntimePayloadHandle(
+                    context.artifactIdentity().getPluginId(),
+                    descriptor.providerId(),
+                    "lifecycle-only-payload"
+            );
+        }
+
+        /// Enables the loaded payload without additional behavior.
+        ///
+        /// @param handle provider-owned payload handle
+        @Override
+        public void enablePayload(RuntimePayloadHandle handle) {
+        }
+
+        /// Disables the enabled payload without additional behavior.
+        ///
+        /// @param handle provider-owned payload handle
+        @Override
+        public void disablePayload(RuntimePayloadHandle handle) {
+        }
+
+        /// Unloads the disabled payload without additional behavior.
+        ///
+        /// @param handle provider-owned payload handle
+        @Override
+        public void unloadPayload(RuntimePayloadHandle handle) {
+        }
+    }
+
     /// Recording Provider fixture with deterministic health and opaque payload IDs.
     @NotNullByDefault
-    private static final class RecordingProvider implements RuntimeProvider {
+    private static final class RecordingProvider implements RuntimeProvider, RuntimeProvider.HookInvoker {
         /// Immutable fake Provider descriptor.
         private final RuntimeProviderDescriptor descriptor;
 
@@ -637,6 +973,9 @@ public final class RuntimeSupervisorTest {
         /// Whether the next Provider close callback must fail before cleanup completes.
         private boolean failNextClose;
 
+        /// Whether the next payload enable callback must fail.
+        private boolean failNextPayloadEnable;
+
         /// Whether the next load callback must return a handle owned by another plugin.
         private boolean returnWrongPayloadOwner;
 
@@ -651,6 +990,12 @@ public final class RuntimeSupervisorTest {
 
         /// Optional gate which blocks payload enablement until the test releases it.
         private @Nullable CountDownLatch releaseEnable;
+
+        /// Optional signal emitted when Hook invocation enters Provider code.
+        private @Nullable CountDownLatch hookEntered;
+
+        /// Optional gate which blocks Hook invocation until the test releases it.
+        private @Nullable CountDownLatch releaseHook;
 
         /// Optional signal emitted when Provider shutdown enters the callback.
         private @Nullable CountDownLatch closeEntered;
@@ -705,6 +1050,15 @@ public final class RuntimeSupervisorTest {
             releaseEnable = release;
         }
 
+        /// Configures the next Hook callback to block between the supplied latches.
+        ///
+        /// @param entered signal emitted on callback entry
+        /// @param release gate allowing callback completion
+        private void blockHook(CountDownLatch entered, CountDownLatch release) {
+            hookEntered = entered;
+            releaseHook = release;
+        }
+
         /// Returns the immutable fake descriptor.
         @Override
         public RuntimeProviderDescriptor descriptor() {
@@ -738,6 +1092,10 @@ public final class RuntimeSupervisorTest {
         @Override
         public void enablePayload(RuntimePayloadHandle handle) throws IOException {
             events.add("enable:" + handle.ownerPluginId());
+            if (failNextPayloadEnable) {
+                failNextPayloadEnable = false;
+                throw new IOException("configured payload enable failure");
+            }
             awaitCallback(enableEntered, releaseEnable);
         }
 
@@ -755,6 +1113,26 @@ public final class RuntimeSupervisorTest {
                 failNextPayloadUnload = false;
                 throw new IOException("configured payload unload failure");
             }
+        }
+
+        /// Records one exact handle-aware external Hook invocation.
+        ///
+        /// @param handle exact current payload handle
+        /// @param token short-lived payload capability token
+        /// @param event immutable Hook event
+        /// @param timeout dispatcher callback deadline
+        /// @return unchanged result
+        /// @throws IOException if callback coordination is interrupted or times out
+        @Override
+        public PluginHookResult invokeHook(
+                RuntimePayloadHandle handle,
+                PluginCapabilityToken token,
+                PluginHookEvent event,
+                Duration timeout
+        ) throws IOException {
+            events.add("hook:" + handle.ownerPluginId());
+            awaitCallback(hookEntered, releaseHook);
+            return PluginHookResult.unchanged();
         }
 
         /// Records Provider shutdown.
