@@ -61,6 +61,9 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
     /// Canonical external payload plugin ID used by generated packages and bindings.
     private static final String PAYLOAD_ID = "dev.hmclce.test.runtime-payload";
 
+    /// Canonical Java dependent plugin ID used by live graph replacement tests.
+    private static final String JAVA_DEPENDENT_ID = "dev.hmclce.test.runtime-dependent";
+
     /// Rejects an external payload without an exact binding even when a compatible Provider is registered.
     ///
     /// @param temporaryDirectory isolated launcher home
@@ -124,7 +127,7 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
                     "host.onLoad", "provider.initialize", "provider.health", "host.onEnable",
                     "payload.load", "payload.enable",
                     "payload.disable", "payload.unload",
-                    "host.onDisable", "host.onUnload", "provider.close"
+                    "host.onDisable", "provider.close", "host.onUnload"
             ), events());
             assertNull(manager.getPlugin(PAYLOAD_ID));
             assertNull(manager.getPlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID));
@@ -203,6 +206,37 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
                     "provider.close", "host.onUnload"), events());
         } finally {
             System.clearProperty(PackagedRuntimeProviderPlugin.FAIL_HEALTH_PROPERTY);
+            clearFixture(registry);
+        }
+    }
+
+    /// Retries Provider discovery on the same manager after an early dependency failure is repaired.
+    ///
+    /// @param temporaryDirectory isolated launcher home
+    /// @throws Exception if package creation, discovery, replacement, or cleanup fails
+    @Test
+    public void retryProviderDiscoveryAfterEarlyDependencyFailure(@TempDir Path temporaryDirectory) throws Exception {
+        Path localHome = temporaryDirectory.resolve("home");
+        RuntimeProviderRegistry registry = RuntimeProviderRegistry.processWide();
+        clearFixture(registry);
+        try {
+            PluginManager manager = new PluginManager(localHome);
+            Path hostPackage = manager.getPluginsDirectory().resolve("99-host.npl");
+            writeHostPackageWithDependency(hostPackage, "dev.hmclce.test.missing");
+            manager.enablePlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID);
+
+            FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
+            assertNull(manager.getPlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID));
+
+            writeHostPackage(hostPackage);
+            FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
+
+            assertTrue(Objects.requireNonNull(
+                    manager.getPlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID)).isEnabled());
+            assertEquals(PluginRuntimeStatus.ENABLED,
+                    manager.getPluginRuntimeStatus(PackagedRuntimeProviderPlugin.PROVIDER_ID));
+            assertTrue(registry.findById(PackagedRuntimeProviderPlugin.PROVIDER_ID).isPresent());
+        } finally {
             clearFixture(registry);
         }
     }
@@ -361,6 +395,87 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
         }
     }
 
+    /// Rejects live replacement when the loaded Host differs from the confirmed prior package artifact.
+    ///
+    /// @param temporaryDirectory isolated launcher home
+    /// @throws Exception if package creation, discovery, inspection, or verification fails
+    @Test
+    public void rejectLiveSwapWhenLoadedHostDiffersFromPriorArtifact(@TempDir Path temporaryDirectory)
+            throws Exception {
+        Path localHome = temporaryDirectory.resolve("home");
+        RuntimeProviderRegistry registry = RuntimeProviderRegistry.processWide();
+        clearFixture(registry);
+        try {
+            PluginManager manager = new PluginManager(localHome);
+            Path installedHost = manager.getPluginsDirectory().resolve("99-host.npl");
+            writeHostPackage(installedHost, "1.0.0");
+            manager.enablePlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID);
+            FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
+            PluginContainer loadedHost = Objects.requireNonNull(
+                    manager.getPlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID));
+            RuntimeProvider loadedProvider = registry.findById(PackagedRuntimeProviderPlugin.PROVIDER_ID)
+                    .orElseThrow();
+
+            writeHostPackage(installedHost, "1.5.0");
+            Path replacement = temporaryDirectory.resolve("runtime-host-v2.npl");
+            writeHostPackage(replacement, "2.0.0");
+            LocalPluginInspection inspection = manager.inspectLocalPluginPackage(replacement);
+
+            IOException failure = assertThrows(IOException.class,
+                    () -> manager.stagePluginInstallations(List.of(inspection)));
+
+            assertTrue(Objects.requireNonNull(failure.getMessage()).contains("loaded artifact"));
+            assertSame(loadedHost, manager.getPlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID));
+            assertSame(loadedProvider,
+                    registry.findById(PackagedRuntimeProviderPlugin.PROVIDER_ID).orElseThrow());
+            assertTrue(loadedHost.isEnabled());
+            assertEquals("1.0.0", loadedHost.getManifest().getVersion());
+            assertEquals("1.5.0", manager.inspectLocalPluginPackage(installedHost).getManifest().getVersion());
+            assertEquals(0, events().stream().filter("host.onUnload"::equals).count());
+            assertEquals(0, events().stream().filter("provider.close"::equals).count());
+        } finally {
+            clearFixture(registry);
+        }
+    }
+
+    /// Keeps a successfully reloaded dependent out of restart-waiting state after a live Host batch replacement.
+    ///
+    /// @param temporaryDirectory isolated launcher home
+    /// @throws Exception if package creation, discovery, staging, or verification fails
+    @Test
+    public void keepReloadedDependentsInLiveRuntimeState(@TempDir Path temporaryDirectory) throws Exception {
+        Path localHome = temporaryDirectory.resolve("home");
+        RuntimeProviderRegistry registry = RuntimeProviderRegistry.processWide();
+        clearFixture(registry);
+        try {
+            PluginManager manager = new PluginManager(localHome);
+            writeHostPackage(manager.getPluginsDirectory().resolve("99-host.npl"), "1.0.0");
+            writeJavaDependentPackage(
+                    manager.getPluginsDirectory().resolve("98-dependent.npl"), "1.0.0");
+            manager.enablePlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID);
+            manager.enablePlugin(JAVA_DEPENDENT_ID);
+            FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
+
+            Path replacementHost = temporaryDirectory.resolve("runtime-host-v2.npl");
+            Path replacementDependent = temporaryDirectory.resolve("runtime-dependent-v2.npl");
+            writeHostPackage(replacementHost, "2.0.0");
+            writeJavaDependentPackage(replacementDependent, "2.0.0");
+
+            manager.stagePluginInstallations(List.of(
+                    manager.inspectLocalPluginPackage(replacementHost),
+                    manager.inspectLocalPluginPackage(replacementDependent)
+            ));
+
+            PluginContainer dependent = Objects.requireNonNull(manager.getPlugin(JAVA_DEPENDENT_ID));
+            assertEquals("2.0.0", dependent.getManifest().getVersion());
+            assertTrue(dependent.isEnabled());
+            assertFalse(dependent.isRestartRequired());
+            assertEquals(PluginRuntimeStatus.ENABLED, manager.getPluginRuntimeStatus(JAVA_DEPENDENT_ID));
+        } finally {
+            clearFixture(registry);
+        }
+    }
+
     /// Retains a failed external payload unload so the same container, handle, and binding can be retried.
     ///
     /// @param temporaryDirectory isolated launcher home
@@ -396,6 +511,45 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
             assertTrue(registry.bindingFor(PAYLOAD_ID).isEmpty());
             assertEquals(1, events().stream().filter("payload.load"::equals).count());
             assertEquals(2, events().stream().filter("payload.unload"::equals).count());
+        } finally {
+            clearFixture(registry);
+        }
+    }
+
+    /// Retains a Host container and registration until a failed Provider close succeeds on retry.
+    ///
+    /// @param temporaryDirectory isolated launcher home
+    /// @throws Exception if package creation, discovery, unload, or retry verification fails
+    @Test
+    public void retryFailedRuntimeProviderClose(@TempDir Path temporaryDirectory) throws Exception {
+        Path localHome = temporaryDirectory.resolve("home");
+        RuntimeProviderRegistry registry = RuntimeProviderRegistry.processWide();
+        clearFixture(registry);
+        try {
+            PluginManager manager = new PluginManager(localHome);
+            writeHostPackage(manager.getPluginsDirectory().resolve("99-host.npl"));
+            manager.enablePlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID);
+            FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
+            PluginContainer host = Objects.requireNonNull(
+                    manager.getPlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID));
+            RuntimeProvider provider = registry.findById(PackagedRuntimeProviderPlugin.PROVIDER_ID).orElseThrow();
+            System.setProperty(PackagedRuntimeProviderPlugin.FAIL_CLOSE_ONCE_PROPERTY, "true");
+
+            FXThreadTestSupport.runOnFxThread(
+                    () -> manager.unloadPlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID));
+
+            assertSame(host, manager.getPlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID));
+            assertSame(provider, registry.findById(PackagedRuntimeProviderPlugin.PROVIDER_ID).orElseThrow());
+            assertEquals("1", System.getProperty(PackagedRuntimeProviderPlugin.ACTIVE_INSTANCES_PROPERTY));
+
+            FXThreadTestSupport.runOnFxThread(
+                    () -> manager.unloadPlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID));
+
+            assertNull(manager.getPlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID));
+            assertTrue(registry.findById(PackagedRuntimeProviderPlugin.PROVIDER_ID).isEmpty());
+            assertEquals("0", System.getProperty(PackagedRuntimeProviderPlugin.ACTIVE_INSTANCES_PROPERTY));
+            assertEquals(2, events().stream().filter("provider.close"::equals).count());
+            assertEquals(1, events().stream().filter("host.onUnload"::equals).count());
         } finally {
             clearFixture(registry);
         }
@@ -464,6 +618,66 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
                 PackagedRuntimeProviderPlugin.class.getName(),
                 permissions);
         writePackage(target, manifest, PackagedRuntimeProviderPlugin.class, false);
+    }
+
+    /// Writes a Java bootstrap Host package with one required concrete dependency.
+    ///
+    /// @param target Host package path
+    /// @param dependencyId required dependency plugin ID
+    /// @throws IOException if package creation fails
+    private static void writeHostPackageWithDependency(Path target, String dependencyId) throws IOException {
+        String manifest = """
+                {
+                  "schemaVersion": 5,
+                  "id": "%s",
+                  "name": "Runtime Host",
+                  "version": "1.0.0",
+                  "type": "java",
+                  "entrypoint": "%s",
+                  "permissions": [],
+                  "requiredPermissions": [],
+                  "launcherVersion": "*",
+                  "runtime": "java",
+                  "abi": 2,
+                  "pluginKind": "runtime-provider",
+                  "dependencies": ["%s"],
+                  "providesRuntimes": [{
+                    "runtime": "rust",
+                    "abis": [2],
+                    "bridgeAbi": 1,
+                    "executionModes": ["embedded"],
+                    "features": ["bridge"]
+                  }]
+                }
+                """.formatted(PackagedRuntimeProviderPlugin.PROVIDER_ID,
+                PackagedRuntimeProviderPlugin.class.getName(), dependencyId);
+        writePackage(target, manifest, PackagedRuntimeProviderPlugin.class, false);
+    }
+
+    /// Writes a Java plugin package which depends directly on the runtime Host package.
+    ///
+    /// @param target dependent package path
+    /// @param version dependent package version
+    /// @throws IOException if package creation fails
+    private static void writeJavaDependentPackage(Path target, String version) throws IOException {
+        String manifest = """
+                {
+                  "schemaVersion": 5,
+                  "id": "%s",
+                  "name": "Runtime Host Dependent",
+                  "version": "%s",
+                  "type": "java",
+                  "entrypoint": "%s",
+                  "permissions": [],
+                  "requiredPermissions": [],
+                  "launcherVersion": "*",
+                  "runtime": "java",
+                  "abi": 2,
+                  "dependencies": ["%s"]
+                }
+                """.formatted(JAVA_DEPENDENT_ID, version, PackagedTestPlugin.class.getName(),
+                PackagedRuntimeProviderPlugin.PROVIDER_ID);
+        writePackage(target, manifest, PackagedTestPlugin.class, false);
     }
 
     /// Writes an external payload package without a JVM lifecycle class.
@@ -639,6 +853,7 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
     /// @param registry process-wide runtime registry
     private static void clearFixture(RuntimeProviderRegistry registry) {
         registry.unbind(PAYLOAD_ID);
+        registry.unbind(JAVA_DEPENDENT_ID);
         registry.unregister(PackagedRuntimeProviderPlugin.PROVIDER_ID);
         System.clearProperty(PackagedRuntimeProviderPlugin.EVENTS_PROPERTY);
         System.clearProperty(PackagedRuntimeProviderPlugin.FAIL_HEALTH_PROPERTY);
@@ -648,6 +863,7 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
         System.clearProperty(PackagedRuntimeProviderPlugin.FAIL_HEALTH_VERSION_PROPERTY);
         System.clearProperty(PackagedRuntimeProviderPlugin.ACTIVE_INSTANCES_PROPERTY);
         System.clearProperty(PackagedRuntimeProviderPlugin.FAIL_UNLOAD_ONCE_PROPERTY);
+        System.clearProperty(PackagedRuntimeProviderPlugin.FAIL_CLOSE_ONCE_PROPERTY);
         FXThreadTestSupport.runOnFxThread(
                 () -> PluginUIRegistry.unregisterAll(PackagedRuntimeProviderPlugin.PROVIDER_ID));
     }

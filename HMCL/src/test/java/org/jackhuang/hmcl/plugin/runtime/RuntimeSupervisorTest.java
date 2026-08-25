@@ -19,15 +19,22 @@ package org.jackhuang.hmcl.plugin.runtime;
 
 import org.jackhuang.hmcl.plugin.PluginArtifactIdentity;
 import org.jetbrains.annotations.NotNullByDefault;
+import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.nio.file.Path;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -176,6 +183,211 @@ public final class RuntimeSupervisorTest {
         assertTrue(registry.bindingFor("dev.plugin.second").isEmpty());
     }
 
+    /// Retains an incomplete registration across payload, Provider, and registry cleanup failures until retry succeeds.
+    ///
+    /// @param temporaryDirectory isolated payload paths
+    /// @throws Exception if fixture setup or the final retry fails unexpectedly
+    @Test
+    public void retryIncompleteRegistrationClose(@TempDir Path temporaryDirectory) throws Exception {
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        RuntimeSupervisor supervisor = new RuntimeSupervisor(registry);
+        RecordingProvider provider = new RecordingProvider("dev.host.rust", true);
+        provider.failNextPayloadUnload = true;
+        provider.failNextClose = true;
+        advanceToBootstrap(supervisor, "dev.host.rust");
+        RuntimeProviderRegistration registration = supervisor.register("dev.host.rust", provider);
+        supervisor.activate(registration);
+        registry.bind("dev.plugin.loaded", requirement("rust"));
+        registry.bind("dev.plugin.bound-only", requirement("rust"));
+        RuntimePayloadHandle handle = supervisor.loadPayload(
+                "dev.plugin.loaded", payloadContext("dev.plugin.loaded", temporaryDirectory));
+        supervisor.enablePayload(handle);
+
+        assertThrows(IOException.class, registration::close);
+        assertFalse(registration.isClosed());
+        assertSame(provider, registry.findById("dev.host.rust").orElseThrow());
+        assertTrue(registry.bindingFor("dev.plugin.loaded").isPresent());
+        assertEquals(0, provider.events.stream().filter("close"::equals).count());
+
+        assertThrows(IOException.class, registration::close);
+        assertFalse(registration.isClosed());
+        assertTrue(registry.bindingFor("dev.plugin.loaded").isEmpty());
+        assertEquals(1, provider.events.stream().filter("close"::equals).count());
+
+        assertThrows(IOException.class, registration::close);
+        assertFalse(registration.isClosed());
+        assertEquals(2, provider.events.stream().filter("close"::equals).count());
+        assertSame(provider, registry.findById("dev.host.rust").orElseThrow());
+
+        registry.unbind("dev.plugin.bound-only");
+        registration.close();
+
+        assertTrue(registration.isClosed());
+        assertTrue(registry.findById("dev.host.rust").isEmpty());
+        assertEquals(RuntimeProviderState.STOPPED, supervisor.state("dev.host.rust").orElseThrow());
+        assertEquals(2, provider.events.stream().filter("unload:dev.plugin.loaded"::equals).count());
+        assertEquals(2, provider.events.stream().filter("close"::equals).count());
+    }
+
+    /// Serializes a blocked payload load with registration close so the returned handle is tracked and released.
+    ///
+    /// @param temporaryDirectory isolated payload paths
+    /// @throws Exception if fixture setup, synchronization, or lifecycle completion fails
+    @Test
+    public void serializePayloadLoadWithRegistrationClose(@TempDir Path temporaryDirectory) throws Exception {
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        RuntimeSupervisor supervisor = new RuntimeSupervisor(registry);
+        RecordingProvider provider = new RecordingProvider("dev.host.rust", true);
+        CountDownLatch loadEntered = new CountDownLatch(1);
+        CountDownLatch releaseLoad = new CountDownLatch(1);
+        CountDownLatch closeEntered = new CountDownLatch(1);
+        provider.blockLoad(loadEntered, releaseLoad);
+        provider.closeEntered = closeEntered;
+        advanceToBootstrap(supervisor, "dev.host.rust");
+        RuntimeProviderRegistration registration = supervisor.register("dev.host.rust", provider);
+        supervisor.activate(registration);
+        registry.bind("dev.plugin.loaded", requirement("rust"));
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<RuntimePayloadHandle> loading = executor.submit(() -> supervisor.loadPayload(
+                    "dev.plugin.loaded", payloadContext("dev.plugin.loaded", temporaryDirectory)));
+            assertTrue(loadEntered.await(5, TimeUnit.SECONDS));
+            Future<Void> closing = executor.submit(() -> {
+                registration.close();
+                return null;
+            });
+
+            assertFalse(closeEntered.await(200, TimeUnit.MILLISECONDS));
+            releaseLoad.countDown();
+
+            assertEquals("dev.plugin.loaded", loading.get(5, TimeUnit.SECONDS).ownerPluginId());
+            closing.get(5, TimeUnit.SECONDS);
+            assertTrue(registration.isClosed());
+            assertEquals(1, provider.events.stream().filter("unload:dev.plugin.loaded"::equals).count());
+            assertEquals(1, provider.events.stream().filter("close"::equals).count());
+        } finally {
+            releaseLoad.countDown();
+            executor.shutdownNow();
+        }
+    }
+
+    /// Allows an unrelated Provider to make progress while another Provider callback is blocked.
+    ///
+    /// @param temporaryDirectory isolated payload paths
+    /// @throws Exception if fixture setup, synchronization, or lifecycle completion fails
+    @Test
+    public void isolateLifecycleSerializationByProvider(@TempDir Path temporaryDirectory) throws Exception {
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        RuntimeSupervisor supervisor = new RuntimeSupervisor(registry);
+        RecordingProvider rustProvider = new RecordingProvider("dev.host.rust", "rust", true);
+        RecordingProvider pythonProvider = new RecordingProvider("dev.host.python", "python", true);
+        CountDownLatch rustLoadEntered = new CountDownLatch(1);
+        CountDownLatch releaseRustLoad = new CountDownLatch(1);
+        rustProvider.blockLoad(rustLoadEntered, releaseRustLoad);
+        advanceToBootstrap(supervisor, "dev.host.rust");
+        RuntimeProviderRegistration rustRegistration = supervisor.register("dev.host.rust", rustProvider);
+        supervisor.activate(rustRegistration);
+        advanceToBootstrap(supervisor, "dev.host.python");
+        RuntimeProviderRegistration pythonRegistration = supervisor.register("dev.host.python", pythonProvider);
+        supervisor.activate(pythonRegistration);
+        registry.bind("dev.plugin.rust", requirement("rust"));
+        registry.bind("dev.plugin.python", requirement("python"));
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<RuntimePayloadHandle> rustLoad = executor.submit(() -> supervisor.loadPayload(
+                    "dev.plugin.rust", payloadContext("dev.plugin.rust", temporaryDirectory)));
+            assertTrue(rustLoadEntered.await(5, TimeUnit.SECONDS));
+
+            Future<RuntimePayloadHandle> pythonLoad = executor.submit(() -> supervisor.loadPayload(
+                    "dev.plugin.python", payloadContext("dev.plugin.python", temporaryDirectory)));
+            assertEquals("dev.plugin.python", pythonLoad.get(1, TimeUnit.SECONDS).ownerPluginId());
+
+            releaseRustLoad.countDown();
+            RuntimePayloadHandle rustHandle = rustLoad.get(5, TimeUnit.SECONDS);
+            supervisor.unloadPayload(rustHandle);
+            supervisor.unloadPayload(pythonLoad.get());
+            rustRegistration.close();
+            pythonRegistration.close();
+        } finally {
+            releaseRustLoad.countDown();
+            executor.shutdownNow();
+        }
+    }
+
+    /// Compensates a Provider-owned handle when post-callback ownership validation rejects publication.
+    ///
+    /// @param temporaryDirectory isolated payload paths
+    /// @throws Exception if fixture setup or registration cleanup fails
+    @Test
+    public void unloadPayloadHandleRejectedAfterLoad(@TempDir Path temporaryDirectory) throws Exception {
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        RuntimeSupervisor supervisor = new RuntimeSupervisor(registry);
+        RecordingProvider provider = new RecordingProvider("dev.host.rust", true);
+        provider.returnWrongPayloadOwner = true;
+        advanceToBootstrap(supervisor, "dev.host.rust");
+        RuntimeProviderRegistration registration = supervisor.register("dev.host.rust", provider);
+        supervisor.activate(registration);
+        registry.bind("dev.plugin.loaded", requirement("rust"));
+
+        assertThrows(IOException.class, () -> supervisor.loadPayload(
+                "dev.plugin.loaded", payloadContext("dev.plugin.loaded", temporaryDirectory)));
+
+        assertEquals(1, provider.events.stream().filter("unload:dev.plugin.wrong"::equals).count());
+        registry.unbind("dev.plugin.loaded");
+        registration.close();
+    }
+
+    /// Serializes concurrent enable, disable, and unload requests without duplicating callbacks or leaking a handle.
+    ///
+    /// @param temporaryDirectory isolated payload paths
+    /// @throws Exception if fixture setup, synchronization, or lifecycle completion fails
+    @Test
+    public void serializeConcurrentPayloadMutations(@TempDir Path temporaryDirectory) throws Exception {
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        RuntimeSupervisor supervisor = new RuntimeSupervisor(registry);
+        RecordingProvider provider = new RecordingProvider("dev.host.rust", true);
+        advanceToBootstrap(supervisor, "dev.host.rust");
+        RuntimeProviderRegistration registration = supervisor.register("dev.host.rust", provider);
+        supervisor.activate(registration);
+        registry.bind("dev.plugin.loaded", requirement("rust"));
+        RuntimePayloadHandle handle = supervisor.loadPayload(
+                "dev.plugin.loaded", payloadContext("dev.plugin.loaded", temporaryDirectory));
+        CountDownLatch enableEntered = new CountDownLatch(1);
+        CountDownLatch releaseEnable = new CountDownLatch(1);
+        provider.blockEnable(enableEntered, releaseEnable);
+        ExecutorService executor = Executors.newFixedThreadPool(3);
+        try {
+            Future<Void> enabling = executor.submit(() -> {
+                supervisor.enablePayload(handle);
+                return null;
+            });
+            assertTrue(enableEntered.await(5, TimeUnit.SECONDS));
+            Future<Void> disabling = executor.submit(() -> {
+                supervisor.disablePayload(handle);
+                return null;
+            });
+            Future<Void> unloading = executor.submit(() -> {
+                supervisor.unloadPayload(handle);
+                return null;
+            });
+
+            releaseEnable.countDown();
+            enabling.get(5, TimeUnit.SECONDS);
+            awaitConcurrentMutation(disabling);
+            unloading.get(5, TimeUnit.SECONDS);
+
+            assertEquals(1, provider.events.stream().filter("enable:dev.plugin.loaded"::equals).count());
+            assertEquals(1, provider.events.stream().filter("disable:dev.plugin.loaded"::equals).count());
+            assertEquals(1, provider.events.stream().filter("unload:dev.plugin.loaded"::equals).count());
+            assertThrows(IOException.class, () -> supervisor.unloadPayload(handle));
+            assertTrue(registry.bindingFor("dev.plugin.loaded").isEmpty());
+            registration.close();
+        } finally {
+            releaseEnable.countDown();
+            executor.shutdownNow();
+        }
+    }
+
     /// Restores the previous Host registration after a replacement fails health negotiation.
     @Test
     public void restorePreviousHostAfterFailedUpdate() throws Exception {
@@ -237,6 +449,21 @@ public final class RuntimeSupervisorTest {
         );
     }
 
+    /// Awaits a mutation which may lose a valid race to an unload that removed the shared handle.
+    ///
+    /// @param mutation concurrent payload mutation
+    /// @throws Exception if waiting times out or the mutation fails for any reason except an unknown handle
+    private static void awaitConcurrentMutation(Future<Void> mutation) throws Exception {
+        try {
+            mutation.get(5, TimeUnit.SECONDS);
+        } catch (ExecutionException exception) {
+            if (!(exception.getCause() instanceof IOException ioException)
+                    || !ioException.getMessage().contains("Unknown runtime payload handle")) {
+                throw exception;
+            }
+        }
+    }
+
     /// Recording Provider fixture with deterministic health and opaque payload IDs.
     @NotNullByDefault
     private static final class RecordingProvider implements RuntimeProvider {
@@ -247,18 +474,51 @@ public final class RuntimeSupervisorTest {
         private final boolean healthy;
 
         /// Ordered Provider callbacks.
-        private final List<String> events = new ArrayList<>();
+        private final List<String> events = new CopyOnWriteArrayList<>();
+
+        /// Whether the next payload unload callback must fail before releasing its handle.
+        private boolean failNextPayloadUnload;
+
+        /// Whether the next Provider close callback must fail before cleanup completes.
+        private boolean failNextClose;
+
+        /// Whether the next load callback must return a handle owned by another plugin.
+        private boolean returnWrongPayloadOwner;
+
+        /// Optional signal emitted when payload loading enters the Provider callback.
+        private @Nullable CountDownLatch loadEntered;
+
+        /// Optional gate which blocks payload loading until the test releases it.
+        private @Nullable CountDownLatch releaseLoad;
+
+        /// Optional signal emitted when payload enablement enters the Provider callback.
+        private @Nullable CountDownLatch enableEntered;
+
+        /// Optional gate which blocks payload enablement until the test releases it.
+        private @Nullable CountDownLatch releaseEnable;
+
+        /// Optional signal emitted when Provider shutdown enters the callback.
+        private @Nullable CountDownLatch closeEntered;
 
         /// Creates a fake embedded Rust Provider.
         ///
         /// @param providerId Provider plugin ID
         /// @param healthy health result
         private RecordingProvider(String providerId, boolean healthy) {
+            this(providerId, "rust", healthy);
+        }
+
+        /// Creates a fake embedded Provider for one exact runtime.
+        ///
+        /// @param providerId Provider plugin ID
+        /// @param runtime canonical provided runtime
+        /// @param healthy health result
+        private RecordingProvider(String providerId, String runtime, boolean healthy) {
             this.descriptor = new RuntimeProviderDescriptor(
                     providerId,
                     "1.0.0",
                     List.of(new RuntimeProviderDeclaration(
-                            "rust",
+                            runtime,
                             Set.of(PluginAbi.ABI_2),
                             1,
                             Set.of(PluginExecutionMode.EMBEDDED),
@@ -270,6 +530,24 @@ public final class RuntimeSupervisorTest {
                     false
             );
             this.healthy = healthy;
+        }
+
+        /// Configures the next payload load callback to block between the supplied latches.
+        ///
+        /// @param entered signal emitted on callback entry
+        /// @param release gate allowing callback completion
+        private void blockLoad(CountDownLatch entered, CountDownLatch release) {
+            loadEntered = entered;
+            releaseLoad = release;
+        }
+
+        /// Configures the next payload enable callback to block between the supplied latches.
+        ///
+        /// @param entered signal emitted on callback entry
+        /// @param release gate allowing callback completion
+        private void blockEnable(CountDownLatch entered, CountDownLatch release) {
+            enableEntered = entered;
+            releaseEnable = release;
         }
 
         /// Returns the immutable fake descriptor.
@@ -293,16 +571,19 @@ public final class RuntimeSupervisorTest {
 
         /// Records payload loading and returns an opaque owner/provider/payload tuple.
         @Override
-        public RuntimePayloadHandle loadPayload(RuntimePayloadContext context) {
+        public RuntimePayloadHandle loadPayload(RuntimePayloadContext context) throws IOException {
             String pluginId = context.artifactIdentity().getPluginId();
             events.add("load:" + pluginId);
-            return new RuntimePayloadHandle(pluginId, descriptor.providerId(), "payload-" + pluginId);
+            awaitCallback(loadEntered, releaseLoad);
+            String returnedOwner = returnWrongPayloadOwner ? "dev.plugin.wrong" : pluginId;
+            return new RuntimePayloadHandle(returnedOwner, descriptor.providerId(), "payload-" + pluginId);
         }
 
         /// Records payload enablement.
         @Override
-        public void enablePayload(RuntimePayloadHandle handle) {
+        public void enablePayload(RuntimePayloadHandle handle) throws IOException {
             events.add("enable:" + handle.ownerPluginId());
+            awaitCallback(enableEntered, releaseEnable);
         }
 
         /// Records payload disablement.
@@ -313,14 +594,51 @@ public final class RuntimeSupervisorTest {
 
         /// Records payload unloading.
         @Override
-        public void unloadPayload(RuntimePayloadHandle handle) {
+        public void unloadPayload(RuntimePayloadHandle handle) throws IOException {
             events.add("unload:" + handle.ownerPluginId());
+            if (failNextPayloadUnload) {
+                failNextPayloadUnload = false;
+                throw new IOException("configured payload unload failure");
+            }
         }
 
         /// Records Provider shutdown.
         @Override
-        public void close() {
+        public void close() throws IOException {
             events.add("close");
+            @Nullable CountDownLatch entered = closeEntered;
+            if (entered != null) {
+                entered.countDown();
+            }
+            if (failNextClose) {
+                failNextClose = false;
+                throw new IOException("configured Provider close failure");
+            }
+        }
+
+        /// Signals callback entry and waits for its optional release gate with a bounded timeout.
+        ///
+        /// @param entered optional callback-entry signal
+        /// @param release optional callback release gate
+        /// @throws IOException if the callback is interrupted or its release times out
+        private static void awaitCallback(
+                @Nullable CountDownLatch entered,
+                @Nullable CountDownLatch release
+        ) throws IOException {
+            if (entered != null) {
+                entered.countDown();
+            }
+            if (release == null) {
+                return;
+            }
+            try {
+                if (!release.await(5, TimeUnit.SECONDS)) {
+                    throw new IOException("Timed out waiting to release Provider callback");
+                }
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted while waiting to release Provider callback", exception);
+            }
         }
     }
 }

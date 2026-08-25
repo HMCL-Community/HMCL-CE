@@ -68,6 +68,9 @@ public final class PackagedRuntimeProviderPlugin implements Plugin, RuntimeProvi
     /// Process property forcing the next payload unload to fail once when set to `true`.
     public static final String FAIL_UNLOAD_ONCE_PROPERTY = "hmcl.test.runtime-provider.fail-unload-once";
 
+    /// Process property forcing the next Provider close to fail once when set to `true`.
+    public static final String FAIL_CLOSE_ONCE_PROPERTY = "hmcl.test.runtime-provider.fail-close-once";
+
     /// Manifest received during Host loading, or `null` before registration.
     private @Nullable PluginManifest manifest;
 
@@ -199,8 +202,12 @@ public final class PackagedRuntimeProviderPlugin implements Plugin, RuntimeProvi
 
     /// Records Provider-wide resource shutdown.
     @Override
-    public void close() {
+    public void close() throws IOException {
         append("provider.close");
+        if (Boolean.getBoolean(FAIL_CLOSE_ONCE_PROPERTY)) {
+            System.clearProperty(FAIL_CLOSE_ONCE_PROPERTY);
+            throw new IOException("Configured one-shot Provider close failure");
+        }
     }
 
     /// Appends one callback marker to the process-global fixture log.

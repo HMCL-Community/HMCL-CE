@@ -113,6 +113,16 @@ public final class RuntimeSupervisor {
     /// @param registration exact active registration
     /// @throws IOException if initialization or health negotiation fails
     public void activate(RuntimeProviderRegistration registration) throws IOException {
+        synchronized (registration.lifecycleLock()) {
+            activateLocked(registration);
+        }
+    }
+
+    /// Activates one registration while holding its Provider-scoped lifecycle monitor.
+    ///
+    /// @param registration exact active registration
+    /// @throws IOException if initialization or health negotiation fails
+    private void activateLocked(RuntimeProviderRegistration registration) throws IOException {
         String providerId = registration.provider().descriptor().providerId();
         synchronized (this) {
             requireRegistration(registration);
@@ -192,34 +202,59 @@ public final class RuntimeSupervisor {
             String dependentPluginId,
             RuntimePayloadContext context
     ) throws IOException {
-        RuntimeProviderBinding binding;
-        RuntimeProvider provider;
+        RuntimeProviderRegistration registration;
         synchronized (this) {
-            requireCanonicalId(dependentPluginId);
-            if (!dependentPluginId.equals(context.artifactIdentity().getPluginId())) {
-                throw new IOException("Runtime payload context owner does not match dependent binding: "
-                        + dependentPluginId);
-            }
-            binding = registry.bindingFor(dependentPluginId)
-                    .orElseThrow(() -> new IOException("Plugin has no runtime Provider binding: "
-                            + dependentPluginId));
-            requireReady(binding.providerId());
-            provider = registry.findById(binding.providerId())
-                    .orElseThrow(() -> new IOException("Bound runtime Provider is not registered: "
-                            + binding.providerId()));
+            RuntimeProviderBinding binding = requirePayloadBinding(dependentPluginId, context);
+            registration = requireProviderRegistration(binding.providerId());
         }
+        synchronized (registration.lifecycleLock()) {
+            return loadPayloadLocked(registration, dependentPluginId, context);
+        }
+    }
 
-        RuntimePayloadHandle handle = provider.loadPayload(context);
+    /// Loads and publishes one payload while holding its Provider-scoped lifecycle monitor.
+    ///
+    /// @param registration selected Provider registration
+    /// @param dependentPluginId canonical dependent plugin ID
+    /// @param context exact immutable payload context
+    /// @return opaque Provider-owned payload handle
+    /// @throws IOException if loading or publication validation fails
+    private RuntimePayloadHandle loadPayloadLocked(
+            RuntimeProviderRegistration registration,
+            String dependentPluginId,
+            RuntimePayloadContext context
+    ) throws IOException {
+        RuntimeProviderBinding binding;
         synchronized (this) {
-            requireReady(binding.providerId());
-            if (!dependentPluginId.equals(handle.ownerPluginId())
-                    || !binding.providerId().equals(handle.providerId())) {
-                throw new IOException("Runtime Provider returned a payload handle outside its binding: "
-                        + dependentPluginId);
+            binding = requirePayloadBinding(dependentPluginId, context);
+            requireRegistration(registration);
+            if (!binding.providerId().equals(registration.ownerPluginId())) {
+                throw new IOException("Runtime Provider binding changed before payload loading: " + dependentPluginId);
             }
-            if (payloads.putIfAbsent(handle, new PayloadRecord(provider)) != null) {
-                throw new IOException("Runtime Provider returned a duplicate payload handle: " + handle.payloadId());
+        }
+        RuntimeProvider provider = registration.provider();
+        RuntimePayloadHandle handle = provider.loadPayload(context);
+        try {
+            synchronized (this) {
+                requireReady(binding.providerId());
+                requireRegistration(registration);
+                if (!dependentPluginId.equals(handle.ownerPluginId())
+                        || !binding.providerId().equals(handle.providerId())) {
+                    throw new IOException("Runtime Provider returned a payload handle outside its binding: "
+                            + dependentPluginId);
+                }
+                if (payloads.putIfAbsent(handle, new PayloadRecord(registration)) != null) {
+                    throw new IOException("Runtime Provider returned a duplicate payload handle: "
+                            + handle.payloadId());
+                }
             }
+        } catch (IOException | RuntimeException | Error exception) {
+            try {
+                provider.unloadPayload(handle);
+            } catch (IOException | RuntimeException | Error cleanupFailure) {
+                exception.addSuppressed(cleanupFailure);
+            }
+            throw exception;
         }
         return handle;
     }
@@ -229,17 +264,23 @@ public final class RuntimeSupervisor {
     /// @param handle exact loaded payload handle
     /// @throws IOException if the handle is unknown, Provider is not ready, or enablement fails
     public void enablePayload(RuntimePayloadHandle handle) throws IOException {
-        PayloadRecord record;
+        PayloadRecord initial;
         synchronized (this) {
-            record = requirePayload(handle);
-            requireReady(handle.providerId());
-            if (record.enabled) {
-                return;
-            }
+            initial = requirePayload(handle);
         }
-        record.provider.enablePayload(handle);
-        synchronized (this) {
-            requirePayload(handle).enabled = true;
+        synchronized (initial.registration.lifecycleLock()) {
+            PayloadRecord record;
+            synchronized (this) {
+                record = requirePayload(handle);
+                requireReady(handle.providerId());
+                if (record.enabled) {
+                    return;
+                }
+            }
+            record.registration.provider().enablePayload(handle);
+            synchronized (this) {
+                requirePayload(handle).enabled = true;
+            }
         }
     }
 
@@ -248,16 +289,22 @@ public final class RuntimeSupervisor {
     /// @param handle exact loaded payload handle
     /// @throws IOException if the handle is unknown or disablement fails
     public void disablePayload(RuntimePayloadHandle handle) throws IOException {
-        PayloadRecord record;
+        PayloadRecord initial;
         synchronized (this) {
-            record = requirePayload(handle);
-            if (!record.enabled) {
-                return;
-            }
+            initial = requirePayload(handle);
         }
-        record.provider.disablePayload(handle);
-        synchronized (this) {
-            requirePayload(handle).enabled = false;
+        synchronized (initial.registration.lifecycleLock()) {
+            PayloadRecord record;
+            synchronized (this) {
+                record = requirePayload(handle);
+                if (!record.enabled) {
+                    return;
+                }
+            }
+            record.registration.provider().disablePayload(handle);
+            synchronized (this) {
+                requirePayload(handle).enabled = false;
+            }
         }
     }
 
@@ -266,15 +313,21 @@ public final class RuntimeSupervisor {
     /// @param handle exact loaded payload handle
     /// @throws IOException if disablement or unloading fails
     public void unloadPayload(RuntimePayloadHandle handle) throws IOException {
-        disablePayload(handle);
-        PayloadRecord record;
+        PayloadRecord initial;
         synchronized (this) {
-            record = requirePayload(handle);
+            initial = requirePayload(handle);
         }
-        record.provider.unloadPayload(handle);
-        synchronized (this) {
-            payloads.remove(handle);
-            registry.unbind(handle.ownerPluginId());
+        synchronized (initial.registration.lifecycleLock()) {
+            disablePayload(handle);
+            PayloadRecord record;
+            synchronized (this) {
+                record = requirePayload(handle);
+            }
+            record.registration.provider().unloadPayload(handle);
+            synchronized (this) {
+                payloads.remove(handle);
+                registry.unbind(handle.ownerPluginId());
+            }
         }
     }
 
@@ -327,7 +380,9 @@ public final class RuntimeSupervisor {
                 registrations.remove(providerId);
                 return;
             }
-            transition(providerId, RuntimeProviderState.STOPPING);
+            if (state != RuntimeProviderState.STOPPING) {
+                transition(providerId, RuntimeProviderState.STOPPING);
+            }
             enabledHosts.remove(providerId);
         }
 
@@ -339,24 +394,22 @@ public final class RuntimeSupervisor {
                 failure = append(failure, exception);
             }
         }
-        try {
+        if (failure != null) {
+            throw failure;
+        }
+        if (!registration.isProviderClosed()) {
             registration.provider().close();
-        } catch (IOException exception) {
-            failure = append(failure, exception);
+            registration.markProviderClosed();
         }
         synchronized (this) {
-            registrations.remove(providerId);
-            enabledHosts.remove(providerId);
             try {
                 registry.unregister(providerId);
             } catch (RuntimeException exception) {
-                failure = append(failure, new IOException("Failed to unregister runtime Provider: " + providerId,
-                        exception));
+                throw new IOException("Failed to unregister runtime Provider: " + providerId, exception);
             }
-            transition(providerId, failure == null ? RuntimeProviderState.STOPPED : RuntimeProviderState.FAILED);
-        }
-        if (failure != null) {
-            throw failure;
+            registrations.remove(providerId);
+            enabledHosts.remove(providerId);
+            transition(providerId, RuntimeProviderState.STOPPED);
         }
     }
 
@@ -432,6 +485,42 @@ public final class RuntimeSupervisor {
         if (registration.isClosed() || registrations.get(providerId) != registration) {
             throw new IllegalStateException("Runtime Provider registration is not active: " + providerId);
         }
+    }
+
+    /// Resolves and validates the current binding and readiness for one exact payload context.
+    ///
+    /// @param dependentPluginId canonical dependent plugin ID
+    /// @param context exact immutable payload context
+    /// @return current ready binding
+    /// @throws IOException if ownership, binding, or readiness is invalid
+    private synchronized RuntimeProviderBinding requirePayloadBinding(
+            String dependentPluginId,
+            RuntimePayloadContext context
+    ) throws IOException {
+        requireCanonicalId(dependentPluginId);
+        if (!dependentPluginId.equals(context.artifactIdentity().getPluginId())) {
+            throw new IOException("Runtime payload context owner does not match dependent binding: "
+                    + dependentPluginId);
+        }
+        RuntimeProviderBinding binding = registry.bindingFor(dependentPluginId)
+                .orElseThrow(() -> new IOException("Plugin has no runtime Provider binding: "
+                        + dependentPluginId));
+        requireReady(binding.providerId());
+        return binding;
+    }
+
+    /// Returns the active registration for one bound Provider ID.
+    ///
+    /// @param providerId canonical Provider plugin ID
+    /// @return active registration
+    /// @throws IOException if the Provider is not registered
+    private synchronized RuntimeProviderRegistration requireProviderRegistration(String providerId)
+            throws IOException {
+        @Nullable RuntimeProviderRegistration registration = registrations.get(providerId);
+        if (registration == null || registration.isClosed()) {
+            throw new IOException("Bound runtime Provider is not registered: " + providerId);
+        }
+        return registration;
     }
 
     /// Advances one exact expected state to its successor.
@@ -520,17 +609,17 @@ public final class RuntimeSupervisor {
     /// Mutable Supervisor-owned payload lifecycle record.
     @NotNullByDefault
     private static final class PayloadRecord {
-        /// Provider implementation which issued the handle.
-        private final RuntimeProvider provider;
+        /// Registration which issued the handle and owns its Provider-scoped lifecycle monitor.
+        private final RuntimeProviderRegistration registration;
 
         /// Whether Provider enablement completed.
         private boolean enabled;
 
         /// Creates one loaded disabled payload record.
         ///
-        /// @param provider issuing Provider
-        private PayloadRecord(RuntimeProvider provider) {
-            this.provider = provider;
+        /// @param registration issuing registration
+        private PayloadRecord(RuntimeProviderRegistration registration) {
+            this.registration = registration;
         }
     }
 }

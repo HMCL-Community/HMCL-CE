@@ -564,9 +564,6 @@ public final class PluginManager {
         }
 
         boolean runtimeProviderHost = candidate.manifest.getPluginKind() == PluginKind.RUNTIME_PROVIDER;
-        if (runtimeProviderHost) {
-            runtimeSupervisor.discover(pluginId);
-        }
         visitStates.put(pluginId, PluginVisitState.VISITING);
 
         @Nullable RuntimeProviderBinding persistedRuntimeBinding = null;
@@ -682,6 +679,7 @@ public final class PluginManager {
         }
 
         if (runtimeProviderHost) {
+            runtimeSupervisor.discover(pluginId);
             runtimeSupervisor.resolve(pluginId);
         }
 
@@ -1603,6 +1601,9 @@ public final class PluginManager {
             disablePluginLocked(pluginId);
         }
 
+        if (container.getManifest().getPluginKind() == PluginKind.RUNTIME_PROVIDER) {
+            container.closeRuntimeProviderRegistrations();
+        }
         try {
             runPluginCallback(
                     container.getContext().getClassLoader(),
@@ -1620,10 +1621,8 @@ public final class PluginManager {
             }
             LOG.warning("Plugin onUnload failed: " + pluginId, exception);
         }
-        try {
+        if (container.getManifest().getPluginKind() != PluginKind.RUNTIME_PROVIDER) {
             container.closeRuntimeProviderRegistrations();
-        } catch (IOException exception) {
-            LOG.warning("Failed to close runtime Provider registrations: " + pluginId, exception);
         }
         stateLock.writeLock().lock();
         try {
@@ -2460,6 +2459,7 @@ public final class PluginManager {
         LiveRuntimeProviderSwapSession liveSwapSession = captureLiveRuntimeProviderSwapSession(
                 installedBefore,
                 inspectionsById,
+                expectedPriorArtifacts,
                 runtimeBindingStore.readStrict(),
                 Set.copyOf(enabledStates),
                 Set.copyOf(pendingUninstall)
@@ -2514,7 +2514,7 @@ public final class PluginManager {
             runtimeState.remember(identity);
             Path installedPackage = pluginsDirectory.resolve(pluginId + ".npl").toAbsolutePath().normalize();
             @Nullable PluginContainer container = pluginMap.get(pluginId);
-            if (liveSwapSession.providerIds().contains(pluginId)
+            if (liveSwapSession.liveGraphIds().contains(pluginId)
                     && container != null
                     && identity.equals(loadedIdentity(container))) {
                 container.setNplFile(installedPackage);
@@ -2544,6 +2544,7 @@ public final class PluginManager {
     ///
     /// @param installedBefore immutable installed manifests before publication
     /// @param inspections immutable replacement inspections indexed by plugin ID
+    /// @param expectedPriorArtifacts confirmed prior artifact for every replacement ID
     /// @param runtimeBindings immutable live dependent-to-Provider bindings before publication
     /// @param originalEnabledStates immutable desired enablement before publication
     /// @param originalPendingUninstall immutable pending removals before publication
@@ -2552,6 +2553,7 @@ public final class PluginManager {
     private LiveRuntimeProviderSwapSession captureLiveRuntimeProviderSwapSession(
             @Unmodifiable Map<String, PluginManifest> installedBefore,
             @Unmodifiable Map<String, LocalPluginInspection> inspections,
+            @Unmodifiable Map<String, Optional<PluginArtifactIdentity>> expectedPriorArtifacts,
             @Unmodifiable Map<String, RuntimeProviderBinding> runtimeBindings,
             @Unmodifiable Set<String> originalEnabledStates,
             @Unmodifiable Set<String> originalPendingUninstall
@@ -2576,6 +2578,14 @@ public final class PluginManager {
                     || providerContainer == null
                     || !providerContainer.isEnabled()) {
                 continue;
+            }
+            PluginArtifactIdentity loadedProviderIdentity = loadedIdentity(providerContainer);
+            Optional<PluginArtifactIdentity> expectedPrior = Objects.requireNonNull(
+                    expectedPriorArtifacts.get(providerId)
+            );
+            if (expectedPrior.isEmpty() || !loadedProviderIdentity.equals(expectedPrior.get())) {
+                throw new IOException("Live runtime Provider loaded artifact does not match confirmed prior artifact: "
+                        + providerId);
             }
             List<LivePluginSnapshot> dependents = new ArrayList<>();
             collectLoadedDependents(
@@ -3399,8 +3409,8 @@ public final class PluginManager {
         /// Immutable active Host replacements captured before publication.
         private final @Unmodifiable List<LiveRuntimeProviderSwap> swaps;
 
-        /// Immutable IDs of active Host replacements used by post-commit status publication.
-        private final @Unmodifiable Set<String> providerIds;
+        /// Immutable IDs of every actively reloaded Host and dependent used by post-commit status publication.
+        private final @Unmodifiable Set<String> liveGraphIds;
 
         /// Immutable desired enablement restored by journal rollback.
         private final @Unmodifiable Set<String> originalEnabledStates;
@@ -3422,8 +3432,12 @@ public final class PluginManager {
                 @Unmodifiable Set<String> originalPendingUninstall
         ) {
             this.swaps = List.copyOf(swaps);
-            providerIds = swaps.stream()
-                    .map(swap -> swap.provider().identity().getPluginId())
+            liveGraphIds = swaps.stream()
+                    .flatMap(swap -> java.util.stream.Stream.concat(
+                            java.util.stream.Stream.of(swap.provider()),
+                            swap.dependents().stream()
+                    ))
+                    .map(snapshot -> snapshot.identity().getPluginId())
                     .collect(Collectors.toUnmodifiableSet());
             this.originalEnabledStates = Set.copyOf(originalEnabledStates);
             this.originalPendingUninstall = Set.copyOf(originalPendingUninstall);
@@ -3436,11 +3450,11 @@ public final class PluginManager {
             return swaps;
         }
 
-        /// Returns every active Host replacement ID.
+        /// Returns every plugin ID whose exact target artifact was actively reloaded with a Host graph.
         ///
-        /// @return immutable Provider ID set
-        private @Unmodifiable Set<String> providerIds() {
-            return providerIds;
+        /// @return immutable live graph ID set
+        private @Unmodifiable Set<String> liveGraphIds() {
+            return liveGraphIds;
         }
 
         /// Marks one Host graph as requiring rollback restoration.

@@ -173,6 +173,7 @@ public final class PluginContext {
         for (int index = runtimeProviderRegistrations.size() - 1; index >= 0; index--) {
             try {
                 runtimeProviderRegistrations.get(index).close();
+                runtimeProviderRegistrations.remove(index);
             } catch (IOException exception) {
                 if (failure == null) {
                     failure = exception;
@@ -181,7 +182,6 @@ public final class PluginContext {
                 }
             }
         }
-        runtimeProviderRegistrations.clear();
         if (failure != null) {
             throw failure;
         }

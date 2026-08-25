@@ -37,6 +37,12 @@ public final class RuntimeProviderRegistration implements AutoCloseable {
     /// Whether registration teardown has already been selected.
     private final AtomicBoolean closed = new AtomicBoolean();
 
+    /// Whether Provider-wide resources closed successfully during a prior teardown attempt.
+    private boolean providerClosed;
+
+    /// Provider-scoped monitor serializing callbacks and teardown without blocking unrelated Providers.
+    private final Object lifecycleLock = new Object();
+
     /// Creates a Supervisor-owned registration handle.
     ///
     /// @param supervisor lifecycle owner
@@ -73,17 +79,40 @@ public final class RuntimeProviderRegistration implements AutoCloseable {
         return closed.get();
     }
 
-    /// Stops dependents and unregisters the Provider exactly once.
+    /// Stops dependents and unregisters the Provider, retaining incomplete cleanup for retry.
     ///
     /// @throws IOException if Provider payload or Host resource cleanup fails
     @Override
     public void close() throws IOException {
-        if (closed.compareAndSet(false, true)) {
+        synchronized (lifecycleLock) {
+            if (closed.get()) {
+                return;
+            }
             supervisor.closeRegistration(this);
+            closed.set(true);
         }
     }
 
-    /// Marks a registration closed after Supervisor-owned failure rollback.
+    /// Returns the Provider-scoped lifecycle monitor owned by this registration.
+    ///
+    /// @return lifecycle monitor
+    Object lifecycleLock() {
+        return lifecycleLock;
+    }
+
+    /// Returns whether Provider-wide resources already closed successfully.
+    ///
+    /// @return whether Provider close completed
+    boolean isProviderClosed() {
+        return providerClosed;
+    }
+
+    /// Records successful Provider-wide resource shutdown for later unregister retries.
+    void markProviderClosed() {
+        providerClosed = true;
+    }
+
+    /// Marks a registration closed after Supervisor-owned teardown or failure rollback.
     void markClosed() {
         closed.set(true);
     }
