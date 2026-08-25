@@ -18,10 +18,13 @@
 package org.jackhuang.hmcl.plugin.bridge;
 
 import org.jetbrains.annotations.NotNullByDefault;
+import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -127,7 +130,7 @@ class BridgeHandleRegistryTest {
 
         assertTrue(entered.await(5, TimeUnit.SECONDS));
         assertTrue(dispatch.cancel());
-        BridgeValue result = dispatch.completion().get(5, TimeUnit.SECONDS);
+        BridgeValue result = await(dispatch);
 
         assertEquals(BridgeError.Category.CANCELLED, ((BridgeValue.ErrorValue) result).value().category());
         assertTrue(cancellationObserved.await(5, TimeUnit.SECONDS));
@@ -150,11 +153,12 @@ class BridgeHandleRegistryTest {
         BridgeDispatcher.Dispatch untouched = dispatcher.dispatch(
                 "plugin-b", "core.read", cancellation -> BridgeValue.integer(7));
 
-        dispatcher.cancelOwner("plugin-a");
+        CompletionStage<@Nullable Void> drained = dispatcher.cancelOwner("plugin-a");
 
         assertEquals(BridgeError.Category.CANCELLED,
-                ((BridgeValue.ErrorValue) cancelled.completion().get(5, TimeUnit.SECONDS)).value().category());
-        assertEquals(BridgeValue.integer(7), untouched.completion().get(5, TimeUnit.SECONDS));
+                ((BridgeValue.ErrorValue) await(cancelled)).value().category());
+        drained.toCompletableFuture().get(5, TimeUnit.SECONDS);
+        assertEquals(BridgeValue.integer(7), await(untouched));
     }
 
     /// Removes a cancelled callback from owner tracking even when it never starts on the executor.
@@ -177,12 +181,143 @@ class BridgeHandleRegistryTest {
 
         dispatcher.cancelOwner("plugin-a");
 
-        assertEquals(BridgeError.Category.CANCELLED,
-                ((BridgeValue.ErrorValue) queued.completion().get(5, TimeUnit.SECONDS)).value().category());
+        assertEquals(BridgeError.Category.CANCELLED, ((BridgeValue.ErrorValue) await(queued)).value().category());
         assertEquals(0, dispatcher.activeCount("plugin-a"));
         assertFalse(queuedCallbackRan.get());
         releaseBlocker.countDown();
-        blocker.completion().get(5, TimeUnit.SECONDS);
+        await(blocker);
+    }
+
+    /// Keeps a cancelled running callback reserved until it actually exits, even when it ignores interruption.
+    @Test
+    void cancellationIntentWinsWhileWorkerRemainsTrackedUntilExit() throws Exception {
+        BridgeDispatcher dispatcher = new BridgeDispatcher(executor, 2, 2);
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        BridgeDispatcher.Dispatch dispatch = dispatcher.dispatch("plugin-a", "core.ignore-cancel", cancellation -> {
+            entered.countDown();
+            boolean released = false;
+            while (!released) {
+                try {
+                    released = release.await(20, TimeUnit.MILLISECONDS);
+                } catch (InterruptedException exception) {
+                    // Deliberately ignore interruption to prove lifecycle tracking follows actual callback exit.
+                }
+            }
+            return BridgeValue.string("must-not-win");
+        });
+        assertTrue(entered.await(5, TimeUnit.SECONDS));
+
+        assertTrue(dispatch.cancel());
+        assertFalse(dispatch.cancel());
+        assertEquals(BridgeError.Category.CANCELLED, ((BridgeValue.ErrorValue) await(dispatch)).value().category());
+        assertEquals(1, dispatcher.activeCount("plugin-a"));
+        CompletionStage<@Nullable Void> drained = dispatcher.cancelOwner("plugin-a");
+        assertFalse(drained.toCompletableFuture().isDone());
+
+        release.countDown();
+        drained.toCompletableFuture().get(5, TimeUnit.SECONDS);
+        assertEquals(0, dispatcher.activeCount("plugin-a"));
+    }
+
+    /// Returns false from cancellation after a callback result has already won completion.
+    @Test
+    void completedCallbackWinsBeforeLaterCancellation() throws Exception {
+        BridgeDispatcher dispatcher = new BridgeDispatcher(executor);
+        BridgeDispatcher.Dispatch dispatch = dispatcher.dispatch(
+                "plugin-a", "core.complete-first", cancellation -> BridgeValue.integer(11));
+
+        assertEquals(BridgeValue.integer(11), await(dispatch));
+        assertFalse(dispatch.cancel());
+    }
+
+    /// Enforces global and per-owner reservations before executor submission without leaking rejected slots.
+    @Test
+    void enforcesGlobalAndPerOwnerInFlightLimits() throws Exception {
+        ExecutorService twoWorkers = Executors.newFixedThreadPool(2);
+        try {
+            BridgeDispatcher dispatcher = new BridgeDispatcher(twoWorkers, 2, 1);
+            CountDownLatch entered = new CountDownLatch(2);
+            CountDownLatch release = new CountDownLatch(1);
+            BridgeDispatcher.Callback blocking = cancellation -> {
+                entered.countDown();
+                release.await(5, TimeUnit.SECONDS);
+                return BridgeValue.nullValue();
+            };
+            BridgeDispatcher.Dispatch ownerA = dispatcher.dispatch("plugin-a", "core.a", blocking);
+            BridgeDispatcher.Dispatch ownerB = dispatcher.dispatch("plugin-b", "core.b", blocking);
+            assertTrue(entered.await(5, TimeUnit.SECONDS));
+            AtomicBoolean perOwnerRejectedRan = new AtomicBoolean();
+            AtomicBoolean globalRejectedRan = new AtomicBoolean();
+
+            BridgeDispatcher.Dispatch perOwnerRejected = dispatcher.dispatch(
+                    "plugin-a", "core.a-second", cancellation -> {
+                        perOwnerRejectedRan.set(true);
+                        return BridgeValue.nullValue();
+                    });
+            BridgeDispatcher.Dispatch globalRejected = dispatcher.dispatch(
+                    "plugin-c", "core.c", cancellation -> {
+                        globalRejectedRan.set(true);
+                        return BridgeValue.nullValue();
+                    });
+
+            assertUnavailable(perOwnerRejected);
+            assertUnavailable(globalRejected);
+            assertFalse(perOwnerRejectedRan.get());
+            assertFalse(globalRejectedRan.get());
+            assertEquals(2, dispatcher.globalActiveCount());
+            assertEquals(1, dispatcher.activeCount("plugin-a"));
+            release.countDown();
+            await(ownerA);
+            await(ownerB);
+            ownerA.termination().toCompletableFuture().get(5, TimeUnit.SECONDS);
+            ownerB.termination().toCompletableFuture().get(5, TimeUnit.SECONDS);
+            assertEquals(0, dispatcher.globalActiveCount());
+        } finally {
+            twoWorkers.shutdownNow();
+        }
+    }
+
+    /// Releases an accepted reservation when the executor rejects submission.
+    @Test
+    void releasesReservationAfterExecutorRejection() throws Exception {
+        ExecutorService rejectingExecutor = Executors.newSingleThreadExecutor();
+        rejectingExecutor.shutdownNow();
+        BridgeDispatcher dispatcher = new BridgeDispatcher(rejectingExecutor, 1, 1);
+
+        BridgeDispatcher.Dispatch dispatch = dispatcher.dispatch(
+                "plugin-a", "core.rejected", cancellation -> BridgeValue.nullValue());
+
+        assertUnavailable(dispatch);
+        dispatch.termination().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        assertEquals(0, dispatcher.globalActiveCount());
+        assertEquals(0, dispatcher.activeCount("plugin-a"));
+    }
+
+    /// Exposes a minimal completion stage that cannot mutate or obtrude the dispatch's internal result.
+    @Test
+    void exposesReadOnlyCompletionStage() throws Exception {
+        BridgeDispatcher dispatcher = new BridgeDispatcher(executor);
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        BridgeDispatcher.Dispatch dispatch = dispatcher.dispatch("plugin-a", "core.read-only", cancellation -> {
+            entered.countDown();
+            release.await(5, TimeUnit.SECONDS);
+            return BridgeValue.integer(23);
+        });
+        assertTrue(entered.await(5, TimeUnit.SECONDS));
+        CompletionStage<BridgeValue> view = dispatch.completion();
+        CompletableFuture<BridgeValue> exposedObject = (CompletableFuture<BridgeValue>) view;
+
+        assertThrows(UnsupportedOperationException.class,
+                () -> exposedObject.complete(BridgeValue.integer(99)));
+        assertThrows(UnsupportedOperationException.class,
+                () -> exposedObject.obtrudeValue(BridgeValue.integer(99)));
+        CompletableFuture<BridgeValue> detachedCopy = view.toCompletableFuture();
+        assertTrue(detachedCopy.complete(BridgeValue.integer(99)));
+
+        release.countDown();
+        assertEquals(BridgeValue.integer(23), await(dispatch));
     }
 
     /// Converts callback exceptions to a stable category without retaining their cause or secret message.
@@ -193,7 +328,7 @@ class BridgeHandleRegistryTest {
             throw new IllegalStateException("access-token=very-secret");
         });
 
-        BridgeError error = ((BridgeValue.ErrorValue) dispatch.completion().get(5, TimeUnit.SECONDS)).value();
+        BridgeError error = ((BridgeValue.ErrorValue) await(dispatch)).value();
 
         assertEquals(BridgeError.Category.CALLBACK_FAILED, error.category());
         assertFalse(error.getMessage().contains("very-secret"));
@@ -212,6 +347,22 @@ class BridgeHandleRegistryTest {
     private static void assertCategory(BridgeError.Category expected, Runnable operation) {
         BridgeError error = assertThrows(BridgeError.class, operation::run);
         assertEquals(expected, error.category());
+    }
+
+    /// Awaits one dispatch's read-only completion view.
+    ///
+    /// @param dispatch dispatch to await
+    /// @return portable completion value
+    private static BridgeValue await(BridgeDispatcher.Dispatch dispatch) throws Exception {
+        return dispatch.completion().toCompletableFuture().get(5, TimeUnit.SECONDS);
+    }
+
+    /// Asserts one rejected dispatch completes with the stable unavailable category.
+    ///
+    /// @param dispatch rejected dispatch
+    private static void assertUnavailable(BridgeDispatcher.Dispatch dispatch) throws Exception {
+        BridgeValue value = await(dispatch);
+        assertEquals(BridgeError.Category.UNAVAILABLE, ((BridgeValue.ErrorValue) value).value().category());
     }
 
 }
