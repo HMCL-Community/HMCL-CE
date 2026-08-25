@@ -20,6 +20,9 @@ package org.jackhuang.hmcl.plugin.bridge;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Unmodifiable;
 
+import java.nio.CharBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -231,7 +234,15 @@ public sealed interface BridgeValue permits BridgeValue.NullValue, BridgeValue.B
     /// @return UTF-8 byte length
     private static int encodedStringLength(String value) {
         Objects.requireNonNull(value, "value");
-        return value.getBytes(StandardCharsets.UTF_8).length;
+        try {
+            return StandardCharsets.UTF_8.newEncoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .encode(CharBuffer.wrap(value))
+                    .remaining();
+        } catch (CharacterCodingException exception) {
+            throw new IllegalArgumentException("Bridge string must contain well-formed UTF-16", exception);
+        }
     }
 
     /// Enumerates stable tags used by embedded tables and isolated messages.

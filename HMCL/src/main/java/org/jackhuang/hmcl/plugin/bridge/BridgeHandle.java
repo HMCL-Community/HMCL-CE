@@ -43,9 +43,18 @@ public record BridgeHandle(long id, long generation, String type) {
         if (generation <= 0L) {
             throw new IllegalArgumentException("Bridge handle generation must be positive");
         }
+        type = requireValidType(type);
+    }
+
+    /// Validates and returns one canonical language-neutral type descriptor.
+    ///
+    /// @param type candidate type descriptor
+    /// @return validated descriptor
+    static String requireValidType(String type) {
         Objects.requireNonNull(type, "type");
         if (type.length() > MAX_TYPE_LENGTH || !TYPE_PATTERN.matcher(type).matches()) {
             throw new IllegalArgumentException("Bridge handle type must be canonical");
         }
+        return type;
     }
 }

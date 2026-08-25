@@ -107,6 +107,24 @@ class BridgeHandleRegistryTest {
         assertSame(replacement, registry.resolve("plugin-a", current, current.type()));
     }
 
+    /// Validates handle types before allocating fresh or reusable slots.
+    @Test
+    void invalidHandleTypeDoesNotConsumeRegistrySlots() {
+        BridgeHandleRegistry<String> freshRegistry = ownerRegistry();
+        assertThrows(IllegalArgumentException.class,
+                () -> freshRegistry.register("plugin-a", "Invalid Type", new Object()));
+        BridgeHandle first = freshRegistry.register("plugin-a", "launcher.profile", new Object());
+        assertEquals(1L, first.id());
+        assertEquals(1L, first.generation());
+
+        freshRegistry.revokeOwner("plugin-a");
+        assertThrows(IllegalArgumentException.class,
+                () -> freshRegistry.register("plugin-a", "Invalid Type", new Object()));
+        BridgeHandle reused = freshRegistry.register("plugin-a", "launcher.profile", new Object());
+        assertEquals(first.id(), reused.id());
+        assertEquals(first.generation() + 1L, reused.generation());
+    }
+
     /// Cancels an in-flight callback and completes it with the portable cancellation category.
     @Test
     void propagatesCallbackCancellation() throws Exception {

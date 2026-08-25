@@ -83,12 +83,13 @@ public final class BridgeHandleRegistry<T> {
             Runnable release
     ) {
         requireOwnerId(ownerPluginId);
+        String validatedType = BridgeHandle.requireValidType(type);
         Objects.requireNonNull(reference, "reference");
         Objects.requireNonNull(release, "release");
 
         long id = allocateId();
         long generation = generations.computeIfAbsent(id, ignored -> 1L);
-        BridgeHandle handle = new BridgeHandle(id, generation, type);
+        BridgeHandle handle = new BridgeHandle(id, generation, validatedType);
         entries.put(id, new Entry(ownerPluginId, handle, reference, release));
         return handle;
     }

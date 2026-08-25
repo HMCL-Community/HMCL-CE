@@ -59,6 +59,25 @@ public final class BridgeError extends RuntimeException {
         return category.code();
     }
 
+    /// Compares portable category and wire code rather than exception identity.
+    ///
+    /// @param other candidate error
+    /// @return whether both errors carry the same stable Bridge failure
+    @Override
+    public boolean equals(Object other) {
+        return this == other || other instanceof BridgeError that
+                && category == that.category
+                && code().equals(that.code());
+    }
+
+    /// Returns the portable category and wire-code hash.
+    ///
+    /// @return structural error hash
+    @Override
+    public int hashCode() {
+        return Objects.hash(category, code());
+    }
+
     /// Enumerates errors that every embedded and isolated Runtime transport must preserve.
     @NotNullByDefault
     public enum Category {

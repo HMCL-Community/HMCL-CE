@@ -28,6 +28,7 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -53,6 +54,28 @@ class BridgeValueTest {
         assertThrows(IllegalArgumentException.class, () -> BridgeValue.floating(Double.NaN));
         assertThrows(IllegalArgumentException.class, () -> BridgeValue.floating(Double.POSITIVE_INFINITY));
         assertThrows(IllegalArgumentException.class, () -> new BridgeValue.FloatValue(Double.NEGATIVE_INFINITY));
+    }
+
+    /// Rejects malformed UTF-16 strings and map keys instead of silently replacing isolated surrogates.
+    @Test
+    void rejectsMalformedUnicodeText() {
+        assertThrows(IllegalArgumentException.class, () -> BridgeValue.string("\uD800"));
+        assertThrows(IllegalArgumentException.class, () -> BridgeValue.string("\uDC00"));
+        assertThrows(IllegalArgumentException.class,
+                () -> BridgeValue.map(Map.of("broken-\uD800", BridgeValue.nullValue())));
+        assertThrows(IllegalArgumentException.class,
+                () -> BridgeValue.map(Map.of("broken-\uDC00", BridgeValue.nullValue())));
+    }
+
+    /// Accepts valid surrogate pairs and counts their actual four-byte UTF-8 encoding against limits.
+    @Test
+    void acceptsPairedSurrogatesWithinUtf8Budget() {
+        String emoji = "\uD83D\uDE00";
+        String exactBudget = emoji.repeat(BridgeValue.MAX_STRING_UTF8_LENGTH / 4);
+
+        assertEquals(new BridgeValue.StringValue(emoji), BridgeValue.string(emoji));
+        assertEquals(exactBudget, ((BridgeValue.StringValue) BridgeValue.string(exactBudget)).value());
+        assertThrows(IllegalArgumentException.class, () -> BridgeValue.string(exactBudget + emoji));
     }
 
     /// Copies byte arrays on input and output so payload code cannot mutate a published value.
@@ -99,6 +122,24 @@ class BridgeValueTest {
 
         assertEquals(handle, ((BridgeValue.HandleValue) BridgeValue.handle(handle)).value());
         assertSame(error, ((BridgeValue.ErrorValue) BridgeValue.error(error)).value());
+    }
+
+    /// Compares errors structurally by portable category through direct and nested Bridge values.
+    @Test
+    void comparesErrorValuesStructurally() {
+        BridgeValue first = BridgeValue.error(BridgeError.of(BridgeError.Category.CALLBACK_FAILED));
+        BridgeValue sameCategory = BridgeValue.error(BridgeError.of(BridgeError.Category.CALLBACK_FAILED));
+        BridgeValue differentCategory = BridgeValue.error(BridgeError.of(BridgeError.Category.CANCELLED));
+
+        assertEquals(first, sameCategory);
+        assertEquals(first.hashCode(), sameCategory.hashCode());
+        assertNotEquals(first, differentCategory);
+        assertEquals(
+                BridgeValue.array(List.of(first)),
+                BridgeValue.array(List.of(sameCategory)));
+        assertEquals(
+                BridgeValue.map(Map.of("error", first)),
+                BridgeValue.map(Map.of("error", sameCategory)));
     }
 
     /// Rejects null keys, null values, and arbitrary objects smuggled through erased collection types.
