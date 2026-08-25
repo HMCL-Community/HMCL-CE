@@ -72,6 +72,9 @@ final class PluginHookDispatcher {
     /// Per-subscriber wait limit expressed without conversion during dispatch.
     private final long timeoutNanos;
 
+    /// Exact per-subscriber deadline forwarded to Runtime Provider transports.
+    private final Duration timeout;
+
     /// Clock shared with policies that construct deterministic event envelopes and launch sessions.
     private final Clock clock;
 
@@ -103,7 +106,7 @@ final class PluginHookDispatcher {
             SubscriberSource subscriberSource
     ) {
         this.executor = Objects.requireNonNull(executor, "executor");
-        Objects.requireNonNull(timeout, "timeout");
+        this.timeout = Objects.requireNonNull(timeout, "timeout");
         if (timeout.isZero() || timeout.isNegative()) {
             throw new IllegalArgumentException("Plugin Hook timeout must be positive");
         }
@@ -296,7 +299,7 @@ final class PluginHookDispatcher {
                     started.set(true);
                 }
                 try {
-                    return subscriber.endpoint().invoke(event);
+                    return subscriber.endpoint().invoke(event, timeout);
                 } finally {
                     subscriber.close();
                 }

@@ -18,15 +18,31 @@
 package org.jackhuang.hmcl.plugin;
 
 import org.jetbrains.annotations.NotNullByDefault;
+import org.jetbrains.annotations.Nullable;
+
+import java.time.Duration;
 
 /// Invokes one runtime-neutral Hook endpoint through the immutable public event contract.
 @FunctionalInterface
 @NotNullByDefault
-interface PluginHookEndpoint {
+public interface PluginHookEndpoint {
     /// Invokes the endpoint.
     ///
     /// @param event immutable Hook event
     /// @return endpoint result
     /// @throws Exception if the endpoint transport or plugin callback fails
-    PluginHookResult invoke(PluginHookEvent event) throws Exception;
+    @Nullable PluginHookResult invoke(PluginHookEvent event) throws Exception;
+
+    /// Invokes the endpoint with the dispatcher's exact callback deadline.
+    ///
+    /// Java endpoints retain the source-compatible single-argument callback. Runtime endpoints override this
+    /// overload so their Provider transport can apply the same deadline as the launcher dispatcher.
+    ///
+    /// @param event immutable Hook event
+    /// @param timeout positive per-subscriber callback deadline
+    /// @return endpoint result, or `null` when a malformed endpoint violates the contract
+    /// @throws Exception if the endpoint transport or plugin callback fails
+    default @Nullable PluginHookResult invoke(PluginHookEvent event, Duration timeout) throws Exception {
+        return invoke(event);
+    }
 }

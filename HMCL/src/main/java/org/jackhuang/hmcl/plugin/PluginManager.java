@@ -35,6 +35,8 @@ import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityRequirements;
 import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityResult;
 import org.jackhuang.hmcl.plugin.runtime.PluginCompatibilityStatus;
 import org.jackhuang.hmcl.plugin.runtime.PluginRuntimeTypes;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeHookEndpoint;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeProvider;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderBinding;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderDeclaration;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderRegistry;
@@ -1026,20 +1028,65 @@ public final class PluginManager {
                         continue;
                     }
                     Runnable releaseLease = container.acquireHookLease();
-                    @Unmodifiable Set<String> dependencyIds = manifest.getPluginDependencies().stream()
-                            .map(PluginDependency::getId)
-                            .collect(Collectors.toUnmodifiableSet());
-                    PluginHookEndpoint endpoint = event -> runPluginCallback(
-                            container.getContext().getClassLoader(),
-                            () -> container.getPlugin().onHook(event)
-                    );
-                    subscribers.add(new PluginHookSubscriber(
-                            manifest.getId(),
-                            dependencyIds,
-                            permissions,
-                            endpoint,
-                            releaseLease
-                    ));
+                    try {
+                        @Unmodifiable Set<String> dependencyIds = manifest.getPluginDependencies().stream()
+                                .map(PluginDependency::getId)
+                                .collect(Collectors.toUnmodifiableSet());
+                        PluginHookEndpoint endpoint;
+                        if (isExternalRuntimePayload(manifest)) {
+                            @Nullable RuntimeHookEndpoint.ProviderInvoker providerInvoker = null;
+                            @Nullable RuntimeProviderBinding binding =
+                                    runtimeProviders.bindingFor(manifest.getId()).orElse(null);
+                            if (binding != null) {
+                                @Nullable RuntimeProvider provider =
+                                        runtimeProviders.findById(binding.providerId()).orElse(null);
+                                @Nullable PluginContainer providerContainer = pluginMap.get(binding.providerId());
+                                if (provider instanceof RuntimeHookEndpoint.ProviderInvoker selectedInvoker
+                                        && providerContainer != null
+                                        && providerContainer.isEnabled()) {
+                                    Runnable providerReleaseLease = providerContainer.acquireHookLease();
+                                    Runnable payloadReleaseLease = releaseLease;
+                                    releaseLease = () -> {
+                                        try {
+                                            providerReleaseLease.run();
+                                        } finally {
+                                            payloadReleaseLease.run();
+                                        }
+                                    };
+                                    ClassLoader providerClassLoader =
+                                            providerContainer.getContext().getClassLoader();
+                                    providerInvoker = (ownerPluginId, token, event, timeout) -> runPluginCallback(
+                                            providerClassLoader,
+                                            () -> selectedInvoker.invokeHook(
+                                                    ownerPluginId, token, event, timeout)
+                                    );
+                                }
+                            }
+                            endpoint = new RuntimeHookEndpoint(
+                                    PluginArtifactIdentity.of(
+                                            manifest, container.getContext().getArtifactSha256()),
+                                    manifest.getExecutionMode(),
+                                    permissionAuthority,
+                                    container.getContext()::issueRuntimeCapabilityToken,
+                                    providerInvoker
+                            );
+                        } else {
+                            endpoint = event -> runPluginCallback(
+                                    container.getContext().getClassLoader(),
+                                    () -> container.getPlugin().onHook(event)
+                            );
+                        }
+                        subscribers.add(new PluginHookSubscriber(
+                                manifest.getId(),
+                                dependencyIds,
+                                permissions,
+                                endpoint,
+                                releaseLease
+                        ));
+                    } catch (RuntimeException | Error exception) {
+                        releaseLease.run();
+                        throw exception;
+                    }
                 }
             } finally {
                 stateLock.readLock().unlock();

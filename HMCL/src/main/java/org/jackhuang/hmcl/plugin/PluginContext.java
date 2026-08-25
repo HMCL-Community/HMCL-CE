@@ -240,6 +240,18 @@ public final class PluginContext {
         );
     }
 
+    /// Issues one token from this external payload lifecycle's current active session generation.
+    ///
+    /// @return opaque plugin-scoped runtime payload token
+    /// @throws IllegalStateException if this is not an active external payload context
+    PluginCapabilityToken issueRuntimeCapabilityToken() {
+        @Nullable PluginCapabilitySession session = capabilitySession;
+        if (session == null) {
+            throw new IllegalStateException("Runtime capability tokens require an external payload session");
+        }
+        return session.issue();
+    }
+
     /// Revokes every token issued for this context's exact package artifact.
     void revokeCapabilityTokens() {
         @Nullable PluginPermissionAuthority authority = permissionAuthority;
