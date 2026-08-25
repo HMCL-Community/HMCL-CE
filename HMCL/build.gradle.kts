@@ -47,7 +47,7 @@ if (buildVersion != null) {
 } else {
     val shortCommit = System.getenv("GITHUB_SHA")?.lowercase()?.substring(0, 7)
     version = if (shortCommit.isNullOrBlank()) {
-        "$versionRoot.SNAPSHOT"
+        "$versionRoot-beta.SNAPSHOT"
     } else if (isOfficial) {
         "$versionRoot.dev-$shortCommit"
     } else {
