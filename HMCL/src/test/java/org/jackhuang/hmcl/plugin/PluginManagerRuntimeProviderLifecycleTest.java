@@ -18,6 +18,9 @@
 package org.jackhuang.hmcl.plugin;
 
 import org.jackhuang.hmcl.FXThreadTestSupport;
+import org.jackhuang.hmcl.plugin.bridge.PluginCapabilitySession;
+import org.jackhuang.hmcl.plugin.bridge.PluginCapabilityToken;
+import org.jackhuang.hmcl.plugin.bridge.PluginPermissionAuthority;
 import org.jackhuang.hmcl.plugin.runtime.PluginAbi;
 import org.jackhuang.hmcl.plugin.runtime.PluginExecutionMode;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeFeature;
@@ -38,6 +41,7 @@ import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -47,6 +51,7 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
@@ -171,6 +176,119 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
                     "payload.load", "payload.enable", "payload.disable", "host.onDisable",
                     "host.onEnable", "payload.enable"
             ), events());
+        } finally {
+            clearFixture(registry);
+        }
+    }
+
+    /// Suspends retained payload capability issuance after disable and resumes a fresh generation before re-enable.
+    ///
+    /// @param temporaryDirectory isolated launcher home
+    /// @throws Exception if package creation, discovery, lifecycle changes, or cleanup fails
+    @Test
+    public void suspendPayloadCapabilitiesWhileDisabled(@TempDir Path temporaryDirectory) throws Exception {
+        Path localHome = temporaryDirectory.resolve("home");
+        RuntimeProviderRegistry registry = RuntimeProviderRegistry.processWide();
+        clearFixture(registry);
+        try {
+            PluginManager manager = loadEnabledPayload(localHome);
+            RuntimeProvider provider = registry.findById(PackagedRuntimeProviderPlugin.PROVIDER_ID).orElseThrow();
+
+            manager.disablePlugin(PAYLOAD_ID);
+
+            assertFalse(probePayloadCapability(provider));
+            assertTrue(manager.enablePlugin(PAYLOAD_ID));
+            assertTrue(probePayloadCapability(provider));
+        } finally {
+            clearFixture(registry);
+        }
+    }
+
+    /// Suspends capability issuance when payload enablement fails after obtaining a token.
+    ///
+    /// @param temporaryDirectory isolated launcher home
+    /// @throws Exception if package creation, discovery, lifecycle changes, or cleanup fails
+    @Test
+    public void suspendPayloadCapabilitiesAfterEnableFailure(@TempDir Path temporaryDirectory) throws Exception {
+        Path localHome = temporaryDirectory.resolve("home");
+        RuntimeProviderRegistry registry = RuntimeProviderRegistry.processWide();
+        clearFixture(registry);
+        try {
+            PluginManager manager = loadEnabledPayload(localHome);
+            RuntimeProvider provider = registry.findById(PackagedRuntimeProviderPlugin.PROVIDER_ID).orElseThrow();
+            manager.disablePlugin(PAYLOAD_ID);
+            System.setProperty(PackagedRuntimeProviderPlugin.FAIL_PAYLOAD_ENABLE_ONCE_PROPERTY, "true");
+
+            assertFalse(manager.enablePlugin(PAYLOAD_ID));
+
+            assertFalse(probePayloadCapability(provider));
+            assertTrue(manager.enablePlugin(PAYLOAD_ID));
+            assertTrue(probePayloadCapability(provider));
+        } finally {
+            clearFixture(registry);
+        }
+    }
+
+    /// Closes capability issuance permanently before the Provider receives payload unload.
+    ///
+    /// @param temporaryDirectory isolated launcher home
+    /// @throws Exception if package creation, discovery, unload, or cleanup fails
+    @Test
+    public void closePayloadCapabilitiesBeforeUnloadCallback(@TempDir Path temporaryDirectory) throws Exception {
+        Path localHome = temporaryDirectory.resolve("home");
+        RuntimeProviderRegistry registry = RuntimeProviderRegistry.processWide();
+        clearFixture(registry);
+        try {
+            PluginManager manager = loadEnabledPayload(localHome);
+            RuntimeProvider provider = registry.findById(PackagedRuntimeProviderPlugin.PROVIDER_ID).orElseThrow();
+
+            FXThreadTestSupport.runOnFxThread(() -> manager.unloadPlugin(PAYLOAD_ID));
+
+            assertEquals("true", System.getProperty(
+                    PackagedRuntimeProviderPlugin.UNLOAD_CAPABILITY_CLOSED_PROPERTY));
+            assertFalse(probePayloadCapability(provider));
+        } finally {
+            clearFixture(registry);
+        }
+    }
+
+    /// Rotates only the Manager-owned payload session when effective permissions change.
+    ///
+    /// @param temporaryDirectory isolated launcher home
+    /// @throws Exception if package creation, discovery, permission persistence, or reflection fails
+    @Test
+    public void isolatePermissionRotationFromConcurrentArtifactSession(
+            @TempDir Path temporaryDirectory
+    ) throws Exception {
+        Path localHome = temporaryDirectory.resolve("home");
+        RuntimeProviderRegistry registry = RuntimeProviderRegistry.processWide();
+        clearFixture(registry);
+        try {
+            PluginManager manager = loadEnabledPayload(localHome, "[\"launcher-core\"]");
+            PluginContainer payload = Objects.requireNonNull(manager.getPlugin(PAYLOAD_ID));
+            PluginArtifactIdentity identity = PluginArtifactIdentity.of(
+                    payload.getManifest(), payload.getContext().getArtifactSha256());
+            PluginPermissionAuthority authority = permissionAuthority(manager);
+            try (PluginCapabilitySession independentSession = authority.openSession(
+                    identity,
+                    PluginExecutionMode.EMBEDDED,
+                    () -> Set.of(PluginPermission.LAUNCHER_CORE),
+                    "runtime.payload",
+                    Duration.ofMinutes(1)
+            )) {
+                PluginCapabilityToken independentToken = independentSession.issue();
+
+                manager.setGrantedPermissions(PAYLOAD_ID, Set.of(PluginPermission.LAUNCHER_CORE));
+
+                assertDoesNotThrow(() -> authority.requirePermission(
+                        independentToken,
+                        PAYLOAD_ID,
+                        identity,
+                        PluginExecutionMode.EMBEDDED,
+                        PluginPermission.LAUNCHER_CORE,
+                        "runtime.payload"
+                ));
+            }
         } finally {
             clearFixture(registry);
         }
@@ -567,6 +685,60 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
         ));
     }
 
+    /// Creates and discovers one enabled Host with one bound enabled external payload.
+    ///
+    /// @param localHome isolated launcher home
+    /// @return manager containing both enabled plugin containers
+    /// @throws Exception if package creation, binding persistence, or discovery fails
+    private static PluginManager loadEnabledPayload(Path localHome) throws Exception {
+        return loadEnabledPayload(localHome, "[]");
+    }
+
+    /// Creates and discovers one enabled Host with a permission-configurable external payload.
+    ///
+    /// @param localHome isolated launcher home
+    /// @param permissionsJson payload manifest permission array
+    /// @return manager containing both enabled plugin containers
+    /// @throws Exception if package creation, binding persistence, or discovery fails
+    private static PluginManager loadEnabledPayload(
+            Path localHome,
+            String permissionsJson
+    ) throws Exception {
+        PluginManager manager = new PluginManager(localHome);
+        writePayloadPackage(manager.getPluginsDirectory().resolve("00-payload.npl"), permissionsJson);
+        writeHostPackage(manager.getPluginsDirectory().resolve("99-host.npl"));
+        writeBinding(localHome);
+        manager.enablePlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID);
+        manager.enablePlugin(PAYLOAD_ID);
+        FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
+        assertTrue(Objects.requireNonNull(manager.getPlugin(PAYLOAD_ID)).isEnabled());
+        return manager;
+    }
+
+    /// Returns the Manager's process-local permission authority for exact lifecycle integration verification.
+    ///
+    /// @param manager manager under test
+    /// @return manager-owned permission authority
+    /// @throws ReflectiveOperationException if the private implementation field cannot be accessed
+    private static PluginPermissionAuthority permissionAuthority(
+            PluginManager manager
+    ) throws ReflectiveOperationException {
+        var field = PluginManager.class.getDeclaredField("permissionAuthority");
+        field.setAccessible(true);
+        return (PluginPermissionAuthority) field.get(manager);
+    }
+
+    /// Probes the Provider's retained payload supplier through its process-global health callback.
+    ///
+    /// @param provider loaded package-owned runtime Provider
+    /// @return whether the retained supplier could issue a token
+    private static boolean probePayloadCapability(RuntimeProvider provider) throws IOException {
+        System.setProperty(PackagedRuntimeProviderPlugin.CHECK_PAYLOAD_CAPABILITY_PROPERTY, "true");
+        provider.healthCheck();
+        return Boolean.parseBoolean(System.getProperty(
+                PackagedRuntimeProviderPlugin.PAYLOAD_CAPABILITY_AVAILABLE_PROPERTY));
+    }
+
     /// Writes the Java bootstrap Host package with its runtime declaration.
     ///
     /// @param target Host package path
@@ -685,6 +857,15 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
     /// @param target payload package path
     /// @throws IOException if package creation fails
     private static void writePayloadPackage(Path target) throws IOException {
+        writePayloadPackage(target, "[]");
+    }
+
+    /// Writes an external payload package with a caller-selected optional permission list.
+    ///
+    /// @param target payload package path
+    /// @param permissionsJson manifest permission array
+    /// @throws IOException if package creation fails
+    private static void writePayloadPackage(Path target, String permissionsJson) throws IOException {
         String manifest = """
                 {
                   "schemaVersion": 5,
@@ -693,14 +874,14 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
                   "version": "1.0.0",
                   "type": "java",
                   "entrypoint": "payload/plugin.dll",
-                  "permissions": [],
+                  "permissions": %s,
                   "requiredPermissions": [],
                   "launcherVersion": "*",
                   "runtime": "rust",
                   "abi": 2,
                   "executionMode": "embedded"
                 }
-                """.formatted(PAYLOAD_ID);
+                """.formatted(PAYLOAD_ID, permissionsJson);
         writePackage(target, manifest, null, true);
     }
 
@@ -864,6 +1045,10 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
         System.clearProperty(PackagedRuntimeProviderPlugin.ACTIVE_INSTANCES_PROPERTY);
         System.clearProperty(PackagedRuntimeProviderPlugin.FAIL_UNLOAD_ONCE_PROPERTY);
         System.clearProperty(PackagedRuntimeProviderPlugin.FAIL_CLOSE_ONCE_PROPERTY);
+        System.clearProperty(PackagedRuntimeProviderPlugin.FAIL_PAYLOAD_ENABLE_ONCE_PROPERTY);
+        System.clearProperty(PackagedRuntimeProviderPlugin.CHECK_PAYLOAD_CAPABILITY_PROPERTY);
+        System.clearProperty(PackagedRuntimeProviderPlugin.PAYLOAD_CAPABILITY_AVAILABLE_PROPERTY);
+        System.clearProperty(PackagedRuntimeProviderPlugin.UNLOAD_CAPABILITY_CLOSED_PROPERTY);
         FXThreadTestSupport.runOnFxThread(
                 () -> PluginUIRegistry.unregisterAll(PackagedRuntimeProviderPlugin.PROVIDER_ID));
     }

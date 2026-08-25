@@ -24,6 +24,7 @@ import javafx.scene.image.Image;
 import org.jackhuang.hmcl.Metadata;
 import org.jackhuang.hmcl.plugin.internal.PluginPackageVersions;
 import org.jackhuang.hmcl.plugin.internal.VerifiedPluginPackage;
+import org.jackhuang.hmcl.plugin.bridge.PluginCapabilitySession;
 import org.jackhuang.hmcl.plugin.bridge.PluginPermissionAuthority;
 import org.jackhuang.hmcl.plugin.loader.JavaPluginLoader;
 import org.jackhuang.hmcl.plugin.loader.PluginLoader;
@@ -896,18 +897,23 @@ public final class PluginManager {
         Path dataDirectory = pluginStorageDirectory.resolve(pluginId);
         Files.createDirectories(dataDirectory);
 
+        boolean externalRuntimePayload = isExternalRuntimePayload(manifest);
+        @Nullable PluginCapabilitySession capabilitySession = externalRuntimePayload
+                ? permissionAuthority.openSession(
+                        pluginPackage.getIdentity(),
+                        manifest.getExecutionMode(),
+                        () -> permissionService.getGrantedPermissions(manifest, artifactSha256),
+                        "runtime.payload",
+                        Duration.ofSeconds(30)
+                )
+                : null;
         @Nullable PluginLoader loader;
-        if (isExternalRuntimePayload(manifest)) {
+        if (externalRuntimePayload) {
+            PluginCapabilitySession payloadCapabilitySession = Objects.requireNonNull(capabilitySession);
             loader = new RuntimePluginLoader(
                     runtimeSupervisor,
                     ignored -> dataDirectory,
-                    ignored -> () -> permissionAuthority.issue(
-                            pluginPackage.getIdentity(),
-                            manifest.getExecutionMode(),
-                            permissionService.getGrantedPermissions(manifest, artifactSha256),
-                            "runtime.payload",
-                            Duration.ofSeconds(30)
-                    )
+                    ignored -> payloadCapabilitySession::issue
             );
         } else {
             loader = loaders.get(manifest.getType());
@@ -922,8 +928,8 @@ public final class PluginManager {
                     () -> loader.load(manifest, pluginPackage, nplFile)
             );
         } catch (IOException | RuntimeException | Error exception) {
-            if (isExternalRuntimePayload(manifest)) {
-                permissionAuthority.revokeArtifact(pluginPackage.getIdentity());
+            if (capabilitySession != null) {
+                capabilitySession.close();
             }
             throw exception;
         }
@@ -940,7 +946,8 @@ public final class PluginManager {
                 artifactSha256,
                 () -> permissionService.getGrantedPermissions(manifest, artifactSha256),
                 provider -> runtimeSupervisor.register(pluginId, provider),
-                permissionAuthority
+                externalRuntimePayload ? null : permissionAuthority,
+                capabilitySession
         );
         return new PreparedPlugin(
                 plugin,
@@ -1147,6 +1154,7 @@ public final class PluginManager {
         try {
             if (pluginMap.containsKey(pluginId)) {
                 IllegalStateException exception = new IllegalStateException("Plugin already loaded: " + pluginId);
+                prepared.context.closeCapabilitySession();
                 prepared.context.revokeCapabilityTokens();
                 closeLoaderAfterFailure(prepared.plugin, prepared.context.getClassLoader());
                 throw exception;
@@ -1190,6 +1198,7 @@ public final class PluginManager {
             } catch (RuntimeException | Error cleanupException) {
                 exception.addSuppressed(cleanupException);
             }
+            container.closeCapabilitySession();
             container.revokeCapabilityTokens();
             try {
                 runPluginCallback(prepared.context.getClassLoader(), prepared.plugin::onUnload);
@@ -1404,6 +1413,7 @@ public final class PluginManager {
             return false;
         }
 
+        container.resumeCapabilitySession();
         try {
             runPluginCallback(
                     container.getContext().getClassLoader(),
@@ -1420,6 +1430,7 @@ public final class PluginManager {
             visiting.remove(pluginId);
             return true;
         } catch (RuntimeException | Error exception) {
+            container.suspendCapabilitySession();
             if (container.getManifest().getPluginKind() == PluginKind.RUNTIME_PROVIDER) {
                 runtimeSupervisor.hostDisabled(pluginId);
             }
@@ -1544,6 +1555,7 @@ public final class PluginManager {
             } catch (RuntimeException | Error exception) {
                 LOG.error("Failed to disable plugin: " + pluginId, exception);
             } finally {
+                container.suspendCapabilitySession();
                 if (container.getManifest().getPluginKind() == PluginKind.RUNTIME_PROVIDER) {
                     runtimeSupervisor.hostDisabled(pluginId);
                 }
@@ -1623,6 +1635,7 @@ public final class PluginManager {
             disablePluginLocked(pluginId);
         }
 
+        container.closeCapabilitySession();
         container.revokeCapabilityTokens();
         if (container.getManifest().getPluginKind() == PluginKind.RUNTIME_PROVIDER) {
             container.closeRuntimeProviderRegistrations();
@@ -1827,8 +1840,13 @@ public final class PluginManager {
                         loaded.getArtifact().getSha256()
                 );
         if (loaded != null && !loadedBefore.equals(loadedAfter)) {
-            permissionAuthority.revokeArtifact(PluginArtifactIdentity.of(
-                    loaded.getManifest(), loaded.getArtifact().getSha256()));
+            @Nullable PluginContainer loadedContainer = pluginMap.get(pluginId);
+            if (loadedContainer != null && isExternalRuntimePayload(loadedContainer.getManifest())) {
+                loadedContainer.rotateCapabilitySession();
+            } else {
+                permissionAuthority.revokeArtifact(PluginArtifactIdentity.of(
+                        loaded.getManifest(), loaded.getArtifact().getSha256()));
+            }
         }
         @Unmodifiable Set<PluginPermission> publishedAfter = permissionService.getGrantedPermissions(
                 published.getManifest(),

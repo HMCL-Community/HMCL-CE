@@ -36,6 +36,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
 /// Issues and verifies short-lived capabilities scoped to one exact plugin artifact and callback domain.
@@ -71,6 +72,31 @@ public final class PluginPermissionAuthority {
         this.secureRandom = Objects.requireNonNull(secureRandom, "secureRandom");
     }
 
+    /// Opens one independently revocable capability family for a runtime payload lifecycle.
+    ///
+    /// @param artifactIdentity exact package identity
+    /// @param executionMode current payload execution mode
+    /// @param grantedPermissionProvider dynamic source of current effective artifact grants
+    /// @param callbackDomain callback domain assigned to every root token
+    /// @param lifetime positive lifetime assigned to every token
+    /// @return initially active capability session
+    public PluginCapabilitySession openSession(
+            PluginArtifactIdentity artifactIdentity,
+            PluginExecutionMode executionMode,
+            Supplier<@Unmodifiable Set<PluginPermission>> grantedPermissionProvider,
+            String callbackDomain,
+            Duration lifetime
+    ) {
+        return new PluginCapabilitySession(
+                this,
+                artifactIdentity,
+                executionMode,
+                grantedPermissionProvider,
+                requireCallbackDomain(callbackDomain),
+                requirePositiveLifetime(lifetime)
+        );
+    }
+
     /// Issues one token expiring after a relative lifetime.
     ///
     /// @param artifactIdentity exact package identity
@@ -86,11 +112,9 @@ public final class PluginPermissionAuthority {
             String callbackDomain,
             Duration lifetime
     ) {
-        Objects.requireNonNull(lifetime, "lifetime");
-        if (lifetime.isZero() || lifetime.isNegative()) {
-            throw new IllegalArgumentException("Capability token lifetime must be positive");
-        }
-        return issue(artifactIdentity, executionMode, grantedPermissions, callbackDomain, clock.instant().plus(lifetime));
+        Duration validLifetime = requirePositiveLifetime(lifetime);
+        return issue(artifactIdentity, executionMode, grantedPermissions,
+                callbackDomain, clock.instant().plus(validLifetime));
     }
 
     /// Issues one token bound to exact package bytes, mode, grants, callback domain, and expiry.
@@ -120,14 +144,48 @@ public final class PluginPermissionAuthority {
             throw new IllegalArgumentException("jvm-raw capability requires embedded execution");
         }
 
-        PluginCapabilityToken token;
-        do {
-            byte[] identifier = new byte[PluginCapabilityToken.IDENTIFIER_BYTES];
-            secureRandom.nextBytes(identifier);
-            token = new PluginCapabilityToken(identifier);
-        } while (grants.containsKey(token));
-        grants.put(token, new Grant(identity, mode, permissions, domain, expiry, null));
-        return token;
+        return issueGrant(identity, mode, permissions, domain, expiry, null, 0, null);
+    }
+
+    /// Issues one token owned by an exact capability session generation.
+    ///
+    /// The caller must hold the session monitor before entering this synchronized authority method.
+    ///
+    /// @param session owning capability session
+    /// @param generation owning session generation
+    /// @param artifactIdentity exact package identity
+    /// @param executionMode current payload execution mode
+    /// @param grantedPermissions current effective artifact grants
+    /// @param callbackDomain current callback domain
+    /// @param lifetime positive token lifetime
+    /// @return opaque session-scoped capability token
+    synchronized PluginCapabilityToken issueForSession(
+            PluginCapabilitySession session,
+            long generation,
+            PluginArtifactIdentity artifactIdentity,
+            PluginExecutionMode executionMode,
+            Set<PluginPermission> grantedPermissions,
+            String callbackDomain,
+            Duration lifetime
+    ) {
+        PluginArtifactIdentity identity = Objects.requireNonNull(artifactIdentity, "artifactIdentity");
+        PluginExecutionMode mode = Objects.requireNonNull(executionMode, "executionMode");
+        @Unmodifiable Set<PluginPermission> permissions = immutablePermissions(grantedPermissions);
+        String domain = requireCallbackDomain(callbackDomain);
+        Instant expiry = clock.instant().plus(requirePositiveLifetime(lifetime));
+        if (mode != PluginExecutionMode.EMBEDDED && permissions.contains(PluginPermission.JVM_RAW)) {
+            throw new IllegalArgumentException("jvm-raw capability requires embedded execution");
+        }
+        return issueGrant(
+                identity,
+                mode,
+                permissions,
+                domain,
+                expiry,
+                Objects.requireNonNull(session, "session"),
+                generation,
+                null
+        );
     }
 
     /// Narrows an existing token to one equal or descendant callback domain and a non-extended expiry.
@@ -159,21 +217,16 @@ public final class PluginPermissionAuthority {
             throw new IllegalArgumentException("Narrowed token cannot extend its parent lifetime");
         }
 
-        PluginCapabilityToken child;
-        do {
-            byte[] identifier = new byte[PluginCapabilityToken.IDENTIFIER_BYTES];
-            secureRandom.nextBytes(identifier);
-            child = new PluginCapabilityToken(identifier);
-        } while (grants.containsKey(child));
-        grants.put(child, new Grant(
+        return issueGrant(
                 parentGrant.artifactIdentity,
                 parentGrant.executionMode,
                 parentGrant.grantedPermissions,
                 narrowedDomain,
                 narrowedExpiry,
+                parentGrant.session,
+                parentGrant.generation,
                 parent
-        ));
-        return child;
+        );
     }
 
     /// Requires one permission under every expected authorization dimension.
@@ -286,6 +339,57 @@ public final class PluginPermissionAuthority {
                 .forEach(grant -> grant.revoked = true);
     }
 
+    /// Revokes every root and narrowed token owned by one exact session generation.
+    ///
+    /// @param session owning capability session
+    /// @param generation owning session generation
+    synchronized void revokeFamily(PluginCapabilitySession session, long generation) {
+        Objects.requireNonNull(session, "session");
+        grants.values().stream()
+                .filter(grant -> grant.session == session && grant.generation == generation)
+                .forEach(grant -> grant.revoked = true);
+    }
+
+    /// Inserts one validated grant using a fresh opaque random identifier.
+    ///
+    /// @param artifactIdentity exact package identity
+    /// @param executionMode approved execution boundary
+    /// @param grantedPermissions immutable effective grants
+    /// @param callbackDomain exact callback domain
+    /// @param expiresAt exclusive expiry
+    /// @param session optional owning lifecycle session
+    /// @param generation owning session generation, or zero for standalone tokens
+    /// @param parent optional narrowed-token parent
+    /// @return newly generated opaque token
+    private PluginCapabilityToken issueGrant(
+            PluginArtifactIdentity artifactIdentity,
+            PluginExecutionMode executionMode,
+            @Unmodifiable Set<PluginPermission> grantedPermissions,
+            String callbackDomain,
+            Instant expiresAt,
+            @Nullable PluginCapabilitySession session,
+            long generation,
+            @Nullable PluginCapabilityToken parent
+    ) {
+        PluginCapabilityToken token;
+        do {
+            byte[] identifier = new byte[PluginCapabilityToken.IDENTIFIER_BYTES];
+            secureRandom.nextBytes(identifier);
+            token = new PluginCapabilityToken(identifier);
+        } while (grants.containsKey(token));
+        grants.put(token, new Grant(
+                artifactIdentity,
+                executionMode,
+                grantedPermissions,
+                callbackDomain,
+                expiresAt,
+                session,
+                generation,
+                parent
+        ));
+        return token;
+    }
+
     /// Returns a valid token record after plugin, artifact, mode, expiry, and revocation checks.
     ///
     /// @param token presented token
@@ -343,6 +447,18 @@ public final class PluginPermissionAuthority {
         return callbackDomain;
     }
 
+    /// Validates one positive capability-token lifetime.
+    ///
+    /// @param lifetime candidate relative lifetime
+    /// @return unchanged positive lifetime
+    private static Duration requirePositiveLifetime(Duration lifetime) {
+        Objects.requireNonNull(lifetime, "lifetime");
+        if (lifetime.isZero() || lifetime.isNegative()) {
+            throw new IllegalArgumentException("Capability token lifetime must be positive");
+        }
+        return lifetime;
+    }
+
     /// Copies a caller grant set into immutable stable enum order.
     ///
     /// @param permissions caller-supplied effective grants
@@ -384,6 +500,12 @@ public final class PluginPermissionAuthority {
         /// Exclusive token expiry.
         private final Instant expiresAt;
 
+        /// Optional lifecycle session owning this grant family.
+        private final @Nullable PluginCapabilitySession session;
+
+        /// Owning session generation, or zero for standalone grants.
+        private final long generation;
+
         /// Optional parent token when this scope was narrowed.
         private final @Nullable PluginCapabilityToken parent;
 
@@ -397,6 +519,8 @@ public final class PluginPermissionAuthority {
         /// @param grantedPermissions immutable effective grants
         /// @param callbackDomain exact callback domain
         /// @param expiresAt exclusive expiry
+        /// @param session owning lifecycle session or `null` for a standalone token
+        /// @param generation owning session generation or zero for a standalone token
         /// @param parent parent token or `null` for a root token
         private Grant(
                 PluginArtifactIdentity artifactIdentity,
@@ -404,6 +528,8 @@ public final class PluginPermissionAuthority {
                 @Unmodifiable Set<PluginPermission> grantedPermissions,
                 String callbackDomain,
                 Instant expiresAt,
+                @Nullable PluginCapabilitySession session,
+                long generation,
                 @Nullable PluginCapabilityToken parent
         ) {
             this.artifactIdentity = artifactIdentity;
@@ -411,6 +537,8 @@ public final class PluginPermissionAuthority {
             this.grantedPermissions = grantedPermissions;
             this.callbackDomain = callbackDomain;
             this.expiresAt = expiresAt;
+            this.session = session;
+            this.generation = generation;
             this.parent = parent;
         }
     }

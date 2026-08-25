@@ -17,6 +17,7 @@
  */
 package org.jackhuang.hmcl.plugin;
 
+import org.jackhuang.hmcl.plugin.bridge.PluginCapabilityToken;
 import org.jackhuang.hmcl.plugin.runtime.PluginAbi;
 import org.jackhuang.hmcl.plugin.runtime.PluginExecutionMode;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeFeature;
@@ -34,6 +35,7 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.Supplier;
 
 /// Package-owned runtime Provider Host fixture whose callbacks are recorded through process properties.
 @NotNullByDefault
@@ -71,11 +73,30 @@ public final class PackagedRuntimeProviderPlugin implements Plugin, RuntimeProvi
     /// Process property forcing the next Provider close to fail once when set to `true`.
     public static final String FAIL_CLOSE_ONCE_PROPERTY = "hmcl.test.runtime-provider.fail-close-once";
 
+    /// Process property forcing the next payload enable callback to fail once when set to `true`.
+    public static final String FAIL_PAYLOAD_ENABLE_ONCE_PROPERTY =
+            "hmcl.test.runtime-provider.fail-payload-enable-once";
+
+    /// Process property asking the next health check to probe the retained payload capability supplier.
+    public static final String CHECK_PAYLOAD_CAPABILITY_PROPERTY =
+            "hmcl.test.runtime-provider.check-payload-capability";
+
+    /// Process property recording whether the most recent retained-supplier probe could issue a token.
+    public static final String PAYLOAD_CAPABILITY_AVAILABLE_PROPERTY =
+            "hmcl.test.runtime-provider.payload-capability-available";
+
+    /// Process property recording whether payload unload observed its capability session already closed.
+    public static final String UNLOAD_CAPABILITY_CLOSED_PROPERTY =
+            "hmcl.test.runtime-provider.unload-capability-closed";
+
     /// Manifest received during Host loading, or `null` before registration.
     private @Nullable PluginManifest manifest;
 
     /// Persistent private data directory received during Host loading, or `null` before `onLoad`.
     private @Nullable Path dataDirectory;
+
+    /// Capability supplier retained from the most recently loaded payload context.
+    private @Nullable Supplier<PluginCapabilityToken> payloadCapabilityTokenSupplier;
 
     /// Creates the package-owned Host lifecycle.
     public PackagedRuntimeProviderPlugin() {
@@ -155,6 +176,13 @@ public final class PackagedRuntimeProviderPlugin implements Plugin, RuntimeProvi
     @Override
     public boolean healthCheck() {
         append("provider.health");
+        if (Boolean.getBoolean(CHECK_PAYLOAD_CAPABILITY_PROPERTY)) {
+            System.clearProperty(CHECK_PAYLOAD_CAPABILITY_PROPERTY);
+            System.setProperty(
+                    PAYLOAD_CAPABILITY_AVAILABLE_PROPERTY,
+                    Boolean.toString(canIssuePayloadCapability())
+            );
+        }
         if (Boolean.getBoolean(FAIL_HEALTH_PROPERTY)) {
             return false;
         }
@@ -171,6 +199,7 @@ public final class PackagedRuntimeProviderPlugin implements Plugin, RuntimeProvi
     @Override
     public RuntimePayloadHandle loadPayload(RuntimePayloadContext context) {
         append("payload.load");
+        payloadCapabilityTokenSupplier = context.capabilityTokenSupplier();
         return new RuntimePayloadHandle(
                 context.artifactIdentity().getPluginId(),
                 PROVIDER_ID,
@@ -180,19 +209,29 @@ public final class PackagedRuntimeProviderPlugin implements Plugin, RuntimeProvi
 
     /// Records payload enablement.
     @Override
-    public void enablePayload(RuntimePayloadHandle handle) {
+    public void enablePayload(RuntimePayloadHandle handle) throws IOException {
+        requirePayloadCapabilityTokenSupplier().get();
         append("payload.enable");
+        if (Boolean.getBoolean(FAIL_PAYLOAD_ENABLE_ONCE_PROPERTY)) {
+            System.clearProperty(FAIL_PAYLOAD_ENABLE_ONCE_PROPERTY);
+            throw new IOException("Configured one-shot payload enable failure");
+        }
     }
 
     /// Records payload disablement.
     @Override
     public void disablePayload(RuntimePayloadHandle handle) {
+        requirePayloadCapabilityTokenSupplier().get();
         append("payload.disable");
     }
 
     /// Records payload unloading.
     @Override
     public void unloadPayload(RuntimePayloadHandle handle) throws IOException {
+        System.setProperty(
+                UNLOAD_CAPABILITY_CLOSED_PROPERTY,
+                Boolean.toString(!canIssuePayloadCapability())
+        );
         append("payload.unload");
         if (Boolean.getBoolean(FAIL_UNLOAD_ONCE_PROPERTY)) {
             System.clearProperty(FAIL_UNLOAD_ONCE_PROPERTY);
@@ -208,6 +247,30 @@ public final class PackagedRuntimeProviderPlugin implements Plugin, RuntimeProvi
             System.clearProperty(FAIL_CLOSE_ONCE_PROPERTY);
             throw new IOException("Configured one-shot Provider close failure");
         }
+    }
+
+    /// Returns whether the retained payload supplier can currently issue a token.
+    ///
+    /// @return whether token issuance succeeded
+    private boolean canIssuePayloadCapability() {
+        try {
+            requirePayloadCapabilityTokenSupplier().get();
+            return true;
+        } catch (IllegalStateException exception) {
+            return false;
+        }
+    }
+
+    /// Returns the retained payload capability supplier after payload loading.
+    ///
+    /// @return retained capability supplier
+    /// @throws IllegalStateException if no payload was loaded
+    private Supplier<PluginCapabilityToken> requirePayloadCapabilityTokenSupplier() {
+        @Nullable Supplier<PluginCapabilityToken> supplier = payloadCapabilityTokenSupplier;
+        if (supplier == null) {
+            throw new IllegalStateException("No runtime payload capability supplier is retained");
+        }
+        return supplier;
     }
 
     /// Appends one callback marker to the process-global fixture log.

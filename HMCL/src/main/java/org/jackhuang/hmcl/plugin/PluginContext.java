@@ -20,6 +20,7 @@ package org.jackhuang.hmcl.plugin;
 import javafx.scene.Node;
 import javafx.stage.Stage;
 import org.jackhuang.hmcl.Metadata;
+import org.jackhuang.hmcl.plugin.bridge.PluginCapabilitySession;
 import org.jackhuang.hmcl.plugin.bridge.PluginCapabilityToken;
 import org.jackhuang.hmcl.plugin.bridge.PluginPermissionAuthority;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProvider;
@@ -71,6 +72,9 @@ public final class PluginContext {
     /// Exact package identity bound to tokens issued by this context.
     private final @Nullable PluginArtifactIdentity artifactIdentity;
 
+    /// Optional external-payload capability session owned by this exact loaded lifecycle.
+    private final @Nullable PluginCapabilitySession capabilitySession;
+
     /// Runtime Provider registrations owned by this exact Host context in registration order.
     private final List<RuntimeProviderRegistration> runtimeProviderRegistrations = new ArrayList<>();
 
@@ -88,7 +92,7 @@ public final class PluginContext {
     ) {
         this(manifest, packageDirectory, dataDirectory, classLoader, "", Set::of, provider -> {
             throw new IllegalStateException("Runtime Provider registration requires a manager-owned plugin context");
-        }, null);
+        }, null, null);
     }
 
     /// Creates a manager-owned context with dynamic artifact-bound permission decisions.
@@ -111,7 +115,7 @@ public final class PluginContext {
                 grantedPermissionProvider, provider -> {
                     throw new IllegalStateException(
                             "Runtime Provider registration requires a Supervisor-enabled plugin manager");
-                }, null);
+                }, null, null);
     }
 
     /// Creates a manager-owned context with dynamic permissions and Host-bound Provider registration.
@@ -140,6 +144,7 @@ public final class PluginContext {
                 artifactSha256,
                 grantedPermissionProvider,
                 runtimeProviderRegistrar,
+                null,
                 null
         );
     }
@@ -164,6 +169,41 @@ public final class PluginContext {
             Function<RuntimeProvider, RuntimeProviderRegistration> runtimeProviderRegistrar,
             @Nullable PluginPermissionAuthority permissionAuthority
     ) {
+        this(
+                manifest,
+                packageDirectory,
+                dataDirectory,
+                classLoader,
+                artifactSha256,
+                grantedPermissionProvider,
+                runtimeProviderRegistrar,
+                permissionAuthority,
+                null
+        );
+    }
+
+    /// Creates a manager-owned context with optional standalone and external-payload capability ownership.
+    ///
+    /// @param manifest package manifest
+    /// @param packageDirectory extracted package directory
+    /// @param dataDirectory persistent plugin data directory
+    /// @param classLoader plugin class loader
+    /// @param artifactSha256 exact `.npl` package digest
+    /// @param grantedPermissionProvider dynamic user-grant provider
+    /// @param runtimeProviderRegistrar Host-bound Provider registration callback
+    /// @param permissionAuthority optional authority for standalone JVM-context token issuance
+    /// @param capabilitySession optional external-payload lifecycle session
+    PluginContext(
+            PluginManifest manifest,
+            Path packageDirectory,
+            Path dataDirectory,
+            ClassLoader classLoader,
+            String artifactSha256,
+            Supplier<@Unmodifiable Set<PluginPermission>> grantedPermissionProvider,
+            Function<RuntimeProvider, RuntimeProviderRegistration> runtimeProviderRegistrar,
+            @Nullable PluginPermissionAuthority permissionAuthority,
+            @Nullable PluginCapabilitySession capabilitySession
+    ) {
         this.manifest = manifest;
         this.packageDirectory = packageDirectory;
         this.dataDirectory = dataDirectory;
@@ -172,6 +212,7 @@ public final class PluginContext {
         this.grantedPermissionProvider = grantedPermissionProvider;
         this.runtimeProviderRegistrar = runtimeProviderRegistrar;
         this.permissionAuthority = permissionAuthority;
+        this.capabilitySession = capabilitySession;
         this.artifactIdentity = permissionAuthority == null
                 ? null
                 : new PluginArtifactIdentity(manifest.getId(), manifest.getVersion(), artifactSha256);
@@ -205,6 +246,38 @@ public final class PluginContext {
         @Nullable PluginArtifactIdentity identity = artifactIdentity;
         if (authority != null && identity != null) {
             authority.revokeArtifact(identity);
+        }
+    }
+
+    /// Resumes external payload capability issuance in a fresh generation when currently suspended.
+    void resumeCapabilitySession() {
+        @Nullable PluginCapabilitySession session = capabilitySession;
+        if (session != null) {
+            session.resume();
+        }
+    }
+
+    /// Suspends external payload capability issuance and revokes its current generation.
+    void suspendCapabilitySession() {
+        @Nullable PluginCapabilitySession session = capabilitySession;
+        if (session != null) {
+            session.suspend();
+        }
+    }
+
+    /// Rotates the external payload capability generation after an effective permission change.
+    void rotateCapabilitySession() {
+        @Nullable PluginCapabilitySession session = capabilitySession;
+        if (session != null) {
+            session.rotate();
+        }
+    }
+
+    /// Permanently closes external payload capability issuance before lifecycle unloading.
+    void closeCapabilitySession() {
+        @Nullable PluginCapabilitySession session = capabilitySession;
+        if (session != null) {
+            session.close();
         }
     }
 
