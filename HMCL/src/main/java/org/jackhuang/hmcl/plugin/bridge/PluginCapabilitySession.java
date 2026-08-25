@@ -31,6 +31,9 @@ import java.util.function.Supplier;
 /// Owns one independently revocable family of capability-token generations for a runtime payload lifecycle.
 @NotNullByDefault
 public final class PluginCapabilitySession implements AutoCloseable {
+    /// Maximum permission-snapshot attempts before continuous generation churn fails closed.
+    private static final int MAX_ISSUE_ATTEMPTS = 8;
+
     /// Launcher authority which stores the opaque token grants.
     private final PluginPermissionAuthority authority;
 
@@ -82,21 +85,41 @@ public final class PluginCapabilitySession implements AutoCloseable {
 
     /// Issues one token in the current active generation using the latest effective permissions.
     ///
-    /// Holding the session monitor through authority insertion makes suspension and closure linearizable with issue.
+    /// Permission retrieval runs outside the session monitor so permission mutation can rotate this session without
+    /// reversing the mutation-lock order. The generation is rechecked under the session monitor before authority
+    /// insertion, which keeps suspension, closure, and rotation linearizable with issuance.
     ///
     /// @return opaque token bound to this session and generation
-    /// @throws IllegalStateException if the session is suspended or permanently closed
-    public synchronized PluginCapabilityToken issue() {
-        requireActive();
-        return authority.issueForSession(
-                this,
-                generation,
-                artifactIdentity,
-                executionMode,
-                grantedPermissionProvider.get(),
-                callbackDomain,
-                lifetime
-        );
+    /// @throws IllegalStateException if the session is unavailable or changes continuously during permission reads
+    public PluginCapabilityToken issue() {
+        for (int attempt = 0; attempt < MAX_ISSUE_ATTEMPTS; attempt++) {
+            long expectedGeneration;
+            synchronized (this) {
+                requireActive();
+                expectedGeneration = generation;
+            }
+
+            @Unmodifiable Set<PluginPermission> permissions = Objects.requireNonNull(
+                    grantedPermissionProvider.get(), "grantedPermissionProvider result");
+
+            synchronized (this) {
+                requireActive();
+                if (generation != expectedGeneration) {
+                    continue;
+                }
+                return authority.issueForSession(
+                        this,
+                        generation,
+                        artifactIdentity,
+                        executionMode,
+                        permissions,
+                        callbackDomain,
+                        lifetime
+                );
+            }
+        }
+        throw new IllegalStateException(
+                "Capability session changed continuously during permission snapshot");
     }
 
     /// Prevents new issuance and revokes every token in the current generation.

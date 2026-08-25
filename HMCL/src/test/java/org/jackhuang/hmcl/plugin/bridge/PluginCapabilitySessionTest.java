@@ -21,6 +21,8 @@ import org.jackhuang.hmcl.plugin.PluginArtifactIdentity;
 import org.jackhuang.hmcl.plugin.PluginPermission;
 import org.jackhuang.hmcl.plugin.runtime.PluginExecutionMode;
 import org.jetbrains.annotations.NotNullByDefault;
+import org.jetbrains.annotations.Unmodifiable;
+import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 
 import java.security.SecureRandom;
@@ -30,13 +32,19 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Supplier;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -130,6 +138,118 @@ public final class PluginCapabilitySessionTest {
         secondSession.close();
     }
 
+    /// Avoids the session-to-permission-lock inversion while a permission mutation rotates the current generation.
+    ///
+    /// @throws Exception if concurrent test coordination times out
+    @RepeatedTest(20)
+    public void issueDoesNotDeadlockWithPermissionMutationRotation() throws Exception {
+        PluginPermissionAuthority authority = new PluginPermissionAuthority(
+                Clock.fixed(NOW, ZoneOffset.UTC), new SecureRandom());
+        CoordinatedPermissionProvider permissions = new CoordinatedPermissionProvider();
+        PluginCapabilitySession session = authority.openSession(
+                IDENTITY,
+                PluginExecutionMode.EMBEDDED,
+                permissions,
+                "runtime.payload",
+                Duration.ofMinutes(1)
+        );
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> mutation = executor.submit(() -> permissions.mutateAndRotate(session));
+            assertTrue(permissions.mutationHeld.await(5, TimeUnit.SECONDS));
+            Future<PluginCapabilityToken> issuing = executor.submit(session::issue);
+
+            PluginCapabilityToken token = issuing.get(2, TimeUnit.SECONDS);
+            mutation.get(2, TimeUnit.SECONDS);
+
+            assertDenied(authority, token);
+        } finally {
+            permissions.abort();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    /// Makes closure complete during a permission snapshot and rejects the in-flight issuance afterward.
+    ///
+    /// @throws Exception if concurrent test coordination times out
+    @Test
+    public void closeDuringPermissionSnapshotPreventsIssuance() throws Exception {
+        assertLifecycleChangeDuringPermissionSnapshot(PluginCapabilitySession::close);
+    }
+
+    /// Makes suspension complete during a permission snapshot and rejects the in-flight issuance afterward.
+    ///
+    /// @throws Exception if concurrent test coordination times out
+    @Test
+    public void suspendDuringPermissionSnapshotPreventsIssuance() throws Exception {
+        assertLifecycleChangeDuringPermissionSnapshot(PluginCapabilitySession::suspend);
+    }
+
+    /// Fails closed after bounded retries when every permission snapshot races a generation rotation.
+    @Test
+    public void failClosedWhenGenerationChangesContinuously() {
+        PluginPermissionAuthority authority = new PluginPermissionAuthority(
+                Clock.fixed(NOW, ZoneOffset.UTC), new SecureRandom());
+        AtomicReference<PluginCapabilitySession> sessionReference = new AtomicReference<>();
+        AtomicInteger attempts = new AtomicInteger();
+        PluginCapabilitySession session = authority.openSession(
+                IDENTITY,
+                PluginExecutionMode.EMBEDDED,
+                () -> {
+                    attempts.incrementAndGet();
+                    sessionReference.get().rotate();
+                    return Set.of(PluginPermission.LAUNCHER_CORE);
+                },
+                "runtime.payload",
+                Duration.ofMinutes(1)
+        );
+        sessionReference.set(session);
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class, session::issue);
+
+        assertEquals("Capability session changed continuously during permission snapshot", failure.getMessage());
+        assertEquals(8, attempts.get());
+        session.close();
+    }
+
+    /// Verifies one lifecycle transition linearizes before a blocked permission provider is released.
+    ///
+    /// @param lifecycleChange close or suspend operation under test
+    /// @throws Exception if concurrent test coordination times out
+    private static void assertLifecycleChangeDuringPermissionSnapshot(
+            java.util.function.Consumer<PluginCapabilitySession> lifecycleChange
+    ) throws Exception {
+        PluginPermissionAuthority authority = new PluginPermissionAuthority(
+                Clock.fixed(NOW, ZoneOffset.UTC), new SecureRandom());
+        BlockingPermissionProvider permissions = new BlockingPermissionProvider();
+        PluginCapabilitySession session = authority.openSession(
+                IDENTITY,
+                PluginExecutionMode.EMBEDDED,
+                permissions,
+                "runtime.payload",
+                Duration.ofMinutes(1)
+        );
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<PluginCapabilityToken> issuing = executor.submit(session::issue);
+            assertTrue(permissions.entered.await(5, TimeUnit.SECONDS));
+            Future<?> changing = executor.submit(() -> lifecycleChange.accept(session));
+
+            changing.get(2, TimeUnit.SECONDS);
+            permissions.release.countDown();
+            ExecutionException failure = assertThrows(
+                    ExecutionException.class,
+                    () -> issuing.get(2, TimeUnit.SECONDS)
+            );
+            assertTrue(failure.getCause() instanceof IllegalStateException);
+        } finally {
+            permissions.release.countDown();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
     /// Creates one active embedded capability session.
     ///
     /// @param authority launcher-owned authority
@@ -208,6 +328,105 @@ public final class PluginCapabilitySessionTest {
                 throw new IllegalStateException("Token generation interrupted", exception);
             }
             java.util.Arrays.fill(bytes, (byte) 7);
+        }
+    }
+
+    /// Permission provider that blocks until a lifecycle transition has completed.
+    @NotNullByDefault
+    private static final class BlockingPermissionProvider
+            implements Supplier<@Unmodifiable Set<PluginPermission>> {
+        /// Signals that permission retrieval started outside the session monitor.
+        private final CountDownLatch entered = new CountDownLatch(1);
+
+        /// Releases the permission result after the lifecycle transition completes.
+        private final CountDownLatch release = new CountDownLatch(1);
+
+        /// Waits for test coordination and returns one launcher-core grant.
+        ///
+        /// @return immutable permission snapshot
+        @Override
+        public @Unmodifiable Set<PluginPermission> get() {
+            entered.countDown();
+            try {
+                if (!release.await(5, TimeUnit.SECONDS)) {
+                    throw new IllegalStateException("Timed out waiting to release permission retrieval");
+                }
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Permission retrieval interrupted", exception);
+            }
+            return Set.of(PluginPermission.LAUNCHER_CORE);
+        }
+    }
+
+    /// Simulates permission storage mutation and its generation rotation under an external mutation lock.
+    @NotNullByDefault
+    private static final class CoordinatedPermissionProvider
+            implements Supplier<@Unmodifiable Set<PluginPermission>> {
+        /// Simulated permission-store mutation lock.
+        private final ReentrantLock mutationLock = new ReentrantLock();
+
+        /// Signals that mutation owns its lock before issuance begins.
+        private final CountDownLatch mutationHeld = new CountDownLatch(1);
+
+        /// Signals that issuance reached permission retrieval.
+        private final CountDownLatch readAttempted = new CountDownLatch(1);
+
+        /// Allows failed-test cleanup to break the intentionally reproduced lock cycle.
+        private final AtomicBoolean aborted = new AtomicBoolean();
+
+        /// Current immutable effective permission snapshot.
+        private final AtomicReference<@Unmodifiable Set<PluginPermission>> grants = new AtomicReference<>(
+                Set.of(PluginPermission.LAUNCHER_CORE));
+
+        /// Waits for the mutation lock without retaining an uninterruptible deadlock after a failed assertion.
+        ///
+        /// @return current immutable permission snapshot
+        @Override
+        public @Unmodifiable Set<PluginPermission> get() {
+            readAttempted.countDown();
+            while (!aborted.get()) {
+                try {
+                    if (mutationLock.tryLock(25, TimeUnit.MILLISECONDS)) {
+                        try {
+                            return grants.get();
+                        } finally {
+                            mutationLock.unlock();
+                        }
+                    }
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("Permission retrieval interrupted", exception);
+                }
+            }
+            throw new IllegalStateException("Permission retrieval aborted after test timeout");
+        }
+
+        /// Holds the mutation lock, publishes reduced grants, and rotates the owning session before releasing it.
+        ///
+        /// @param session Manager-owned session whose permissions changed
+        private void mutateAndRotate(PluginCapabilitySession session) {
+            mutationLock.lock();
+            try {
+                mutationHeld.countDown();
+                try {
+                    if (!readAttempted.await(5, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("Timed out waiting for permission retrieval");
+                    }
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("Permission mutation interrupted", exception);
+                }
+                grants.set(Set.of());
+                session.rotate();
+            } finally {
+                mutationLock.unlock();
+            }
+        }
+
+        /// Releases a permission retrieval blocked by the intentionally reproduced old lock order.
+        private void abort() {
+            aborted.set(true);
         }
     }
 }
