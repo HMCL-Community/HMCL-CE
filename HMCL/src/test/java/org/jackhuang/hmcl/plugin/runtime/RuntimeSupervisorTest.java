@@ -23,11 +23,18 @@ import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import java.io.IOException;
+import java.lang.management.LockInfo;
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadInfo;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
@@ -388,6 +395,73 @@ public final class RuntimeSupervisorTest {
         }
     }
 
+    /// Rejects an operation which captured an old registration before an identical handle was reissued.
+    ///
+    /// @param mutation stale payload operation to exercise
+    /// @param temporaryDirectory isolated payload paths
+    /// @throws Exception if fixture setup, synchronization, replacement, or cleanup fails
+    @ParameterizedTest
+    @EnumSource(PayloadMutation.class)
+    public void rejectReissuedPayloadHandleFromOldRegistration(
+            PayloadMutation mutation,
+            @TempDir Path temporaryDirectory
+    ) throws Exception {
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        RuntimeSupervisor supervisor = new RuntimeSupervisor(registry);
+        RecordingProvider originalProvider = new RecordingProvider("dev.host.rust", true);
+        advanceToBootstrap(supervisor, "dev.host.rust");
+        RuntimeProviderRegistration originalRegistration = supervisor.register("dev.host.rust", originalProvider);
+        supervisor.activate(originalRegistration);
+        registry.bind("dev.plugin.loaded", requirement("rust"));
+        RuntimePayloadHandle handle = supervisor.loadPayload(
+                "dev.plugin.loaded", payloadContext("dev.plugin.loaded", temporaryDirectory));
+        if (mutation == PayloadMutation.DISABLE) {
+            supervisor.enablePayload(handle);
+        }
+
+        CompletableFuture<Thread> workerThread = new CompletableFuture<>();
+        ExecutorService executor = Executors.newSingleThreadExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "runtime-supervisor-stale-handle");
+            workerThread.complete(thread);
+            return thread;
+        });
+        try {
+            Future<Void> staleMutation;
+            RecordingProvider replacementProvider;
+            RuntimeProviderRegistration replacementRegistration;
+            synchronized (originalRegistration.lifecycleLock()) {
+                staleMutation = executor.submit(() -> {
+                    mutation.invoke(supervisor, handle);
+                    return null;
+                });
+                awaitBlockedOn(
+                        workerThread.get(5, TimeUnit.SECONDS),
+                        originalRegistration.lifecycleLock()
+                );
+
+                originalRegistration.close();
+                replacementProvider = new RecordingProvider("dev.host.rust", true);
+                advanceToBootstrap(supervisor, "dev.host.rust");
+                replacementRegistration = supervisor.register("dev.host.rust", replacementProvider);
+                supervisor.activate(replacementRegistration);
+                registry.bind("dev.plugin.loaded", requirement("rust"));
+                assertEquals(handle, supervisor.loadPayload(
+                        "dev.plugin.loaded", payloadContext("dev.plugin.loaded", temporaryDirectory)));
+            }
+
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> staleMutation.get(5, TimeUnit.SECONDS));
+            assertTrue(failure.getCause() instanceof IllegalStateException);
+            assertTrue(Objects.requireNonNull(failure.getCause().getMessage()).contains("stale runtime payload handle"));
+            assertFalse(replacementProvider.events.contains(mutation.providerEvent()));
+
+            replacementRegistration.close();
+            assertTrue(replacementRegistration.isClosed());
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
     /// Restores the previous Host registration after a replacement fails health negotiation.
     @Test
     public void restorePreviousHostAfterFailedUpdate() throws Exception {
@@ -461,6 +535,69 @@ public final class RuntimeSupervisorTest {
                     || !ioException.getMessage().contains("Unknown runtime payload handle")) {
                 throw exception;
             }
+        }
+    }
+
+    /// Waits until one worker has completed its initial payload lookup and is blocked on an exact lifecycle monitor.
+    ///
+    /// @param thread payload mutation worker
+    /// @param monitor expected lifecycle monitor
+    /// @throws InterruptedException if the test thread is interrupted
+    private static void awaitBlockedOn(Thread thread, Object monitor) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        int expectedMonitorIdentity = System.identityHashCode(monitor);
+        while (true) {
+            @Nullable ThreadInfo threadInfo = ManagementFactory.getThreadMXBean().getThreadInfo(thread.getId());
+            @Nullable LockInfo lockInfo = threadInfo == null ? null : threadInfo.getLockInfo();
+            if (thread.getState() == Thread.State.BLOCKED
+                    && lockInfo != null
+                    && lockInfo.getIdentityHashCode() == expectedMonitorIdentity) {
+                return;
+            }
+            if (!thread.isAlive()) {
+                throw new AssertionError("Payload mutation worker exited before blocking on the lifecycle monitor");
+            }
+            if (System.nanoTime() >= deadline) {
+                throw new AssertionError("Payload mutation worker did not block on the lifecycle monitor");
+            }
+            Thread.sleep(10);
+        }
+    }
+
+    /// Payload operation whose old-registration race is exercised by the parameterized concurrency test.
+    @NotNullByDefault
+    private enum PayloadMutation {
+        /// Enables a disabled payload.
+        ENABLE,
+
+        /// Disables an enabled payload.
+        DISABLE,
+
+        /// Unloads a payload and removes its binding.
+        UNLOAD;
+
+        /// Invokes this operation on one exact handle.
+        ///
+        /// @param supervisor lifecycle owner
+        /// @param handle payload handle
+        /// @throws IOException if the Supervisor rejects or cannot complete the operation
+        private void invoke(RuntimeSupervisor supervisor, RuntimePayloadHandle handle) throws IOException {
+            switch (this) {
+                case ENABLE -> supervisor.enablePayload(handle);
+                case DISABLE -> supervisor.disablePayload(handle);
+                case UNLOAD -> supervisor.unloadPayload(handle);
+            }
+        }
+
+        /// Returns the callback marker which must not reach the replacement Provider.
+        ///
+        /// @return replacement Provider callback marker
+        private String providerEvent() {
+            return switch (this) {
+                case ENABLE -> "enable:dev.plugin.loaded";
+                case DISABLE -> "disable:dev.plugin.loaded";
+                case UNLOAD -> "unload:dev.plugin.loaded";
+            };
         }
     }
 

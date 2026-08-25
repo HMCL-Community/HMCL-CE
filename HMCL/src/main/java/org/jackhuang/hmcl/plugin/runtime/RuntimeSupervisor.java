@@ -271,7 +271,7 @@ public final class RuntimeSupervisor {
         synchronized (initial.registration.lifecycleLock()) {
             PayloadRecord record;
             synchronized (this) {
-                record = requirePayload(handle);
+                record = requirePayloadForRegistration(handle, initial.registration);
                 requireReady(handle.providerId());
                 if (record.enabled) {
                     return;
@@ -279,7 +279,7 @@ public final class RuntimeSupervisor {
             }
             record.registration.provider().enablePayload(handle);
             synchronized (this) {
-                requirePayload(handle).enabled = true;
+                requirePayloadForRegistration(handle, initial.registration).enabled = true;
             }
         }
     }
@@ -296,14 +296,14 @@ public final class RuntimeSupervisor {
         synchronized (initial.registration.lifecycleLock()) {
             PayloadRecord record;
             synchronized (this) {
-                record = requirePayload(handle);
+                record = requirePayloadForRegistration(handle, initial.registration);
                 if (!record.enabled) {
                     return;
                 }
             }
             record.registration.provider().disablePayload(handle);
             synchronized (this) {
-                requirePayload(handle).enabled = false;
+                requirePayloadForRegistration(handle, initial.registration).enabled = false;
             }
         }
     }
@@ -318,10 +318,13 @@ public final class RuntimeSupervisor {
             initial = requirePayload(handle);
         }
         synchronized (initial.registration.lifecycleLock()) {
+            synchronized (this) {
+                requirePayloadForRegistration(handle, initial.registration);
+            }
             disablePayload(handle);
             PayloadRecord record;
             synchronized (this) {
-                record = requirePayload(handle);
+                record = requirePayloadForRegistration(handle, initial.registration);
             }
             record.registration.provider().unloadPayload(handle);
             synchronized (this) {
@@ -473,6 +476,25 @@ public final class RuntimeSupervisor {
         @Nullable PayloadRecord record = payloads.get(handle);
         if (record == null) {
             throw new IOException("Unknown runtime payload handle: " + handle.payloadId());
+        }
+        return record;
+    }
+
+    /// Returns one payload only when it still belongs to the registration captured before lifecycle locking.
+    ///
+    /// @param handle Provider-issued handle
+    /// @param expectedRegistration registration captured before acquiring its lifecycle monitor
+    /// @return active payload record owned by the expected registration
+    /// @throws IOException if the handle is no longer loaded
+    /// @throws IllegalStateException if a replacement registration reissued an equal handle
+    private synchronized PayloadRecord requirePayloadForRegistration(
+            RuntimePayloadHandle handle,
+            RuntimeProviderRegistration expectedRegistration
+    ) throws IOException {
+        PayloadRecord record = requirePayload(handle);
+        if (record.registration != expectedRegistration) {
+            throw new IllegalStateException("Rejected stale runtime payload handle reissued by a replacement Provider: "
+                    + handle.payloadId());
         }
         return record;
     }
