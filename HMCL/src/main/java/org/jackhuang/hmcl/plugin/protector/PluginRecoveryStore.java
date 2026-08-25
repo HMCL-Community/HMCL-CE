@@ -35,7 +35,6 @@ import java.nio.channels.FileChannel;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
-import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.NoSuchFileException;
@@ -45,24 +44,94 @@ import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.FileTime;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.regex.Pattern;
 
 /// Loads and durably replaces one bounded startup recovery document, using atomic publication when supported.
 @NotNullByDefault
 public final class PluginRecoveryStore {
-    /// Describes which filesystem durability barriers completed after a successful publication.
+    /// Describes whether one save definitely published, definitely did not publish, or cannot be classified.
+    @NotNullByDefault
+    public enum PublicationOutcome {
+        /// The requested record is the exact current recovery target.
+        PUBLISHED,
+
+        /// The requested record was not published and the exact previous target state was retained or repaired.
+        NOT_PUBLISHED,
+
+        /// Target or launcher-home state could not be classified or restored after a possible publication.
+        INDETERMINATE
+    }
+
+    /// Describes which filesystem durability barriers are known to have completed for one outcome.
     @NotNullByDefault
     public enum PublicationDurability {
+        /// Durability does not apply because the requested record was definitely not published.
+        NOT_APPLICABLE,
+
+        /// Durability is unknown because target identity or repair state is indeterminate.
+        UNKNOWN,
+
         /// Both file content and parent-directory metadata were forced to stable storage.
         FILE_AND_DIRECTORY_FORCED,
 
         /// File content was forced, but the provider could not force parent-directory metadata.
         FILE_FORCED_ONLY
+    }
+
+    /// Typed publication state returned or attached to a save failure.
+    ///
+    /// @param outcome publication classification
+    /// @param durability completed durability barriers for that classification
+    @NotNullByDefault
+    public record PublicationResult(PublicationOutcome outcome, PublicationDurability durability) {
+        /// Validates one coherent publication classification.
+        public PublicationResult {
+            boolean valid = switch (outcome) {
+                case PUBLISHED -> durability == PublicationDurability.FILE_AND_DIRECTORY_FORCED
+                        || durability == PublicationDurability.FILE_FORCED_ONLY;
+                case NOT_PUBLISHED -> durability == PublicationDurability.NOT_APPLICABLE;
+                case INDETERMINATE -> durability == PublicationDurability.UNKNOWN;
+            };
+            if (!valid) {
+                throw new IllegalArgumentException("Publication outcome and durability are inconsistent");
+            }
+        }
+    }
+
+    /// Save failure carrying an explicit publication classification for safe caller recovery.
+    ///
+    /// Task 10 may retry only a `NOT_PUBLISHED` result. `PUBLISHED` and `INDETERMINATE` must be treated as already
+    /// published on the safe side so a retry cannot overwrite a record that may already be durable.
+    @NotNullByDefault
+    public static final class PublicationException extends IOException {
+        /// Explicit publication classification at the failure boundary.
+        private final PublicationResult result;
+
+        /// Creates one classified save failure without exposing record content.
+        ///
+        /// @param message fixed safe diagnostic
+        /// @param result explicit publication classification
+        /// @param cause filesystem failure
+        private PublicationException(String message, PublicationResult result, IOException cause) {
+            super(message, cause);
+            this.result = result;
+        }
+
+        /// Returns the publication classification callers must use for retry decisions.
+        ///
+        /// @return explicit publication classification
+        public PublicationResult result() {
+            return result;
+        }
     }
 
     /// Launcher-local recovery document filename.
@@ -83,6 +152,21 @@ public final class PluginRecoveryStore {
     /// Compact JSON encoder preserving explicit field insertion order.
     private static final Gson GSON = new GsonBuilder().serializeNulls().create();
 
+    /// Stable JVM-wide operation locks keyed by validated no-follow launcher-home real paths.
+    private static final ConcurrentMap<Path, ReentrantLock> HOME_LOCKS = new ConcurrentHashMap<>();
+
+    /// Definite non-publication result used for all pre-publication and successfully repaired failures.
+    private static final PublicationResult NOT_PUBLISHED = new PublicationResult(
+            PublicationOutcome.NOT_PUBLISHED,
+            PublicationDurability.NOT_APPLICABLE
+    );
+
+    /// Indeterminate result used when publication or repair cannot be classified safely.
+    private static final PublicationResult INDETERMINATE = new PublicationResult(
+            PublicationOutcome.INDETERMINATE,
+            PublicationDurability.UNKNOWN
+    );
+
     /// Normalized launcher-local directory containing the exact recovery targets.
     private final Path launcherHome;
 
@@ -91,9 +175,6 @@ public final class PluginRecoveryStore {
 
     /// Injectable filesystem operations used for path identity and durable publication.
     private final FileOperations fileOperations;
-
-    /// Per-store publication lock that serializes Windows replacement while allowing concurrent temporary writes.
-    private final Object publicationLock = new Object();
 
     /// Creates a recovery store rooted at one launcher-local directory.
     ///
@@ -130,27 +211,63 @@ public final class PluginRecoveryStore {
         return Optional.of(parseRecord(json));
     }
 
-    /// Forces one complete record to a sibling file and replaces the recovery document.
+    /// Forces one complete record to a sibling file and replaces the recovery document with explicit outcome state.
     ///
     /// The successful move is the publication boundary. Atomic replacement is preferred and ordinary replacement is
-    /// used only when the provider explicitly reports that atomic moves are unsupported. A failure before the move
-    /// preserves the prior record. A failure while validating path identity after the move leaves publication state
-    /// indeterminate. Parent-directory metadata forcing occurs after publication and is reported in the return value.
+    /// used only when the provider explicitly reports that atomic moves are unsupported. Move failures are reconciled
+    /// against exact bounded snapshots of the prior and requested bytes. An ambiguous target is repaired atomically
+    /// from the prior snapshot when possible. Parent-directory metadata forcing occurs after publication.
+    ///
+    /// A normal return is always `PUBLISHED`. A `PublicationException` explicitly reports `NOT_PUBLISHED`,
+    /// `PUBLISHED`, or `INDETERMINATE`. Task 10 may retry only `NOT_PUBLISHED`; it must treat `PUBLISHED` and
+    /// `INDETERMINATE` as already published so a retry cannot destroy a record that may have reached the target.
     ///
     /// @param record complete validated record
-    /// @return completed durability barriers for the published record
-    /// @throws IOException if serialization, forcing, or replacement fails
-    public PublicationDurability save(PluginRecoveryRecord record) throws IOException {
+    /// @return explicit published outcome and completed durability barriers
+    /// @throws PublicationException if publication fails or cannot be classified safely
+    public PublicationResult save(PluginRecoveryRecord record) throws PublicationException {
         byte @Unmodifiable [] bytes = encodeRecord(record).getBytes(StandardCharsets.UTF_8);
         if (bytes.length > MAX_RECOVERY_BYTES) {
-            throw new IOException("Plugin recovery document is too large");
+            throw publicationFailure(NOT_PUBLISHED, "Plugin recovery document is too large", new IOException());
         }
-        @Nullable HomeIdentity homeIdentity = requireSafeLauncherHome(true);
+        @Nullable HomeIdentity homeIdentity;
+        try {
+            homeIdentity = requireSafeLauncherHome(true);
+        } catch (IOException failure) {
+            throw publicationFailure(NOT_PUBLISHED, "Plugin recovery directory is unavailable", failure);
+        }
         if (homeIdentity == null) {
-            throw new IOException("Plugin recovery directory could not be created safely");
+            throw publicationFailure(
+                    NOT_PUBLISHED,
+                    "Plugin recovery directory could not be created safely",
+                    new IOException()
+            );
         }
-        verifyHomeIdentity(homeIdentity);
+        ReentrantLock operationLock = operationLock(homeIdentity);
+        operationLock.lock();
+        try {
+            return saveLocked(bytes, homeIdentity);
+        } finally {
+            operationLock.unlock();
+        }
+    }
 
+    /// Publishes one encoded record while holding the stable JVM-wide launcher-home operation lock.
+    ///
+    /// @param bytes bounded encoded recovery document
+    /// @param homeIdentity validated launcher-home identity
+    /// @return explicit published outcome and completed durability barriers
+    /// @throws PublicationException if publication fails or cannot be classified safely
+    private PublicationResult saveLocked(byte @Unmodifiable [] bytes, HomeIdentity homeIdentity)
+            throws PublicationException {
+        TargetSnapshot previous;
+        try {
+            verifyHomeIdentity(homeIdentity);
+            previous = readTargetSnapshot();
+            verifyHomeIdentity(homeIdentity);
+        } catch (IOException failure) {
+            throw publicationFailure(NOT_PUBLISHED, "Plugin recovery target could not be inspected", failure);
+        }
         Path temporaryFile = launcherHome.resolve(TEMP_FILE_PREFIX + UUID.randomUUID());
         boolean createdTemporaryFile = false;
         try {
@@ -162,30 +279,200 @@ public final class PluginRecoveryStore {
                 }
                 fileOperations.forceTemporary(channel);
             }
-            synchronized (publicationLock) {
-                verifyHomeIdentity(homeIdentity);
-                try {
-                    fileOperations.atomicReplace(temporaryFile, recoveryFile);
-                } catch (AtomicMoveNotSupportedException ignored) {
-                    fileOperations.replace(temporaryFile, recoveryFile);
-                }
-                createdTemporaryFile = false;
-                verifyHomeIdentity(homeIdentity);
-            }
+            verifyHomeIdentity(homeIdentity);
         } catch (IOException failure) {
-            if (createdTemporaryFile) {
-                try {
-                    fileOperations.deleteOwnedTemporary(temporaryFile);
-                } catch (IOException cleanupFailure) {
-                    failure.addSuppressed(cleanupFailure);
-                }
-            }
-            throw failure;
+            PublicationException exception = publicationFailure(
+                    NOT_PUBLISHED,
+                    "Plugin recovery publication failed before replacement",
+                    failure
+            );
+            cleanupOwnedTemporary(temporaryFile, createdTemporaryFile, exception);
+            throw exception;
         }
-        return forceParentDirectoryBestEffort(launcherHome);
+
+        try {
+            try {
+                fileOperations.atomicReplace(temporaryFile, recoveryFile);
+            } catch (AtomicMoveNotSupportedException ignored) {
+                fileOperations.replace(temporaryFile, recoveryFile);
+            }
+            createdTemporaryFile = false;
+        } catch (IOException moveFailure) {
+            return reconcileMoveFailure(bytes, previous, temporaryFile, createdTemporaryFile, homeIdentity, moveFailure);
+        }
+
+        try {
+            verifyHomeIdentity(homeIdentity);
+        } catch (IOException failure) {
+            throw publicationFailure(
+                    INDETERMINATE,
+                    "Plugin recovery publication completed but home identity is indeterminate",
+                    failure
+            );
+        }
+        return publishedResult(forceParentDirectoryBestEffort(launcherHome));
     }
 
-    /// Removes only the exact recovery document and managed regular temporary siblings.
+    /// Reconciles an exception from a move that may have changed the target before reporting failure.
+    ///
+    /// @param requested exact requested bytes
+    /// @param previous exact bounded target snapshot before the move
+    /// @param temporaryFile exact temporary path owned by this save
+    /// @param createdTemporaryFile whether this save created its temporary path
+    /// @param homeIdentity validated launcher-home identity
+    /// @param moveFailure ambiguous move failure
+    /// @return published result when the target contains the exact requested bytes
+    /// @throws PublicationException when the prior state is retained, repaired, or cannot be restored safely
+    private PublicationResult reconcileMoveFailure(
+            byte @Unmodifiable [] requested,
+            TargetSnapshot previous,
+            Path temporaryFile,
+            boolean createdTemporaryFile,
+            HomeIdentity homeIdentity,
+            IOException moveFailure
+    ) throws PublicationException {
+        TargetSnapshot current;
+        try {
+            verifyHomeIdentity(homeIdentity);
+            current = readTargetSnapshot();
+            verifyHomeIdentity(homeIdentity);
+        } catch (IOException inspectionFailure) {
+            PublicationException exception = publicationFailure(
+                    INDETERMINATE,
+                    "Plugin recovery target is indeterminate after replacement failure",
+                    moveFailure
+            );
+            exception.addSuppressed(inspectionFailure);
+            cleanupOwnedTemporary(temporaryFile, createdTemporaryFile, exception);
+            throw exception;
+        }
+
+        if (current.matches(requested)) {
+            PublicationResult result = publishedResult(forceParentDirectoryBestEffort(launcherHome));
+            try {
+                if (createdTemporaryFile) {
+                    fileOperations.deleteOwnedTemporary(temporaryFile);
+                }
+            } catch (IOException cleanupFailure) {
+                PublicationException exception = publicationFailure(
+                        result,
+                        "Plugin recovery record was published but temporary cleanup failed",
+                        cleanupFailure
+                );
+                exception.addSuppressed(moveFailure);
+                throw exception;
+            }
+            return result;
+        }
+
+        if (current.equalsContent(previous)) {
+            PublicationException exception = publicationFailure(
+                    NOT_PUBLISHED,
+                    "Plugin recovery replacement did not publish the requested record",
+                    moveFailure
+            );
+            cleanupOwnedTemporary(temporaryFile, createdTemporaryFile, exception);
+            throw exception;
+        }
+
+        try {
+            repairPreviousSnapshot(previous, homeIdentity);
+        } catch (IOException repairFailure) {
+            PublicationException exception = publicationFailure(
+                    INDETERMINATE,
+                    "Plugin recovery target could not be restored after replacement failure",
+                    moveFailure
+            );
+            exception.addSuppressed(repairFailure);
+            cleanupOwnedTemporary(temporaryFile, createdTemporaryFile, exception);
+            throw exception;
+        }
+
+        PublicationException exception = publicationFailure(
+                NOT_PUBLISHED,
+                "Plugin recovery target was restored after replacement failure",
+                moveFailure
+        );
+        cleanupOwnedTemporary(temporaryFile, createdTemporaryFile, exception);
+        throw exception;
+    }
+
+    /// Restores the exact bounded target snapshot using atomic replacement when prior bytes existed.
+    ///
+    /// An absent prior target is restored by deleting only the exact regular or symbolic-link target. Existing bytes
+    /// are written and forced through another uniquely owned sibling, then moved atomically without a weaker fallback.
+    ///
+    /// @param previous exact target state before the failed publication
+    /// @param homeIdentity validated launcher-home identity
+    /// @throws IOException if repair, atomic movement, identity validation, or exact verification fails
+    private void repairPreviousSnapshot(TargetSnapshot previous, HomeIdentity homeIdentity) throws IOException {
+        if (!previous.present()) {
+            deleteExactTarget(recoveryFile);
+            verifyHomeIdentity(homeIdentity);
+        } else {
+            Path repairFile = launcherHome.resolve(TEMP_FILE_PREFIX + UUID.randomUUID());
+            boolean createdRepairFile = false;
+            @Nullable IOException failure = null;
+            try {
+                try (FileChannel channel = fileOperations.createNewWritable(repairFile)) {
+                    createdRepairFile = true;
+                    ByteBuffer buffer = ByteBuffer.wrap(previous.bytes());
+                    while (buffer.hasRemaining()) {
+                        channel.write(buffer);
+                    }
+                    fileOperations.forceTemporary(channel);
+                }
+                verifyHomeIdentity(homeIdentity);
+                fileOperations.atomicReplace(repairFile, recoveryFile);
+                createdRepairFile = false;
+                verifyHomeIdentity(homeIdentity);
+            } catch (IOException repairFailure) {
+                failure = repairFailure;
+                throw repairFailure;
+            } finally {
+                if (createdRepairFile) {
+                    try {
+                        fileOperations.deleteOwnedTemporary(repairFile);
+                    } catch (IOException cleanupFailure) {
+                        if (failure != null) {
+                            failure.addSuppressed(cleanupFailure);
+                        } else {
+                            throw cleanupFailure;
+                        }
+                    }
+                }
+            }
+        }
+
+        TargetSnapshot repaired = readTargetSnapshot();
+        verifyHomeIdentity(homeIdentity);
+        if (!repaired.equalsContent(previous)) {
+            throw new IOException("Plugin recovery target repair could not be verified");
+        }
+        forceParentDirectoryBestEffort(launcherHome);
+    }
+
+    /// Adds owned-temporary cleanup failure to an already classified publication failure.
+    ///
+    /// @param temporaryFile exact temporary path owned by this save
+    /// @param createdTemporaryFile whether this save created its temporary path
+    /// @param exception classified primary failure
+    private void cleanupOwnedTemporary(
+            Path temporaryFile,
+            boolean createdTemporaryFile,
+            PublicationException exception
+    ) {
+        if (!createdTemporaryFile) {
+            return;
+        }
+        try {
+            fileOperations.deleteOwnedTemporary(temporaryFile);
+        } catch (IOException cleanupFailure) {
+            exception.addSuppressed(cleanupFailure);
+        }
+    }
+
+    /// Removes only the exact recovery document and never scans or claims residual temporary-looking siblings.
     ///
     /// Parent-directory metadata is forced when the filesystem provider supports directory channels; failure of that
     /// post-removal durability barrier is best effort and does not turn an already completed removal into a failure.
@@ -196,28 +483,29 @@ public final class PluginRecoveryStore {
         if (homeIdentity == null) {
             return;
         }
-        verifyHomeIdentity(homeIdentity);
-        deleteExactTarget(recoveryFile);
-        deleteStaleTemporaryFiles();
-        verifyHomeIdentity(homeIdentity);
-        forceParentDirectoryBestEffort(launcherHome);
+        ReentrantLock operationLock = operationLock(homeIdentity);
+        operationLock.lock();
+        try {
+            verifyHomeIdentity(homeIdentity);
+            deleteExactTarget(recoveryFile);
+            verifyHomeIdentity(homeIdentity);
+            forceParentDirectoryBestEffort(launcherHome);
+        } finally {
+            operationLock.unlock();
+        }
     }
 
-    /// Deletes only no-follow regular siblings carrying this store's reserved temporary prefix.
+    /// Returns the permanent JVM-wide lock for one validated launcher-home real path.
     ///
-    /// Directories and symbolic links are retained because this process cannot prove ownership of their contents or
-    /// targets. Each save independently owns and cleans its unique path, while this scan recovers regular files left
-    /// by a process crash.
+    /// Keys are intentionally retained for process lifetime so removing an idle lock cannot split synchronization
+    /// identity from a thread that has resolved the same lock but has not yet acquired it.
     ///
-    /// @throws IOException if enumeration or deletion of a controlled regular temporary file fails
-    private void deleteStaleTemporaryFiles() throws IOException {
-        try (DirectoryStream<Path> entries = Files.newDirectoryStream(launcherHome, TEMP_FILE_PREFIX + "*")) {
-            for (Path entry : entries) {
-                if (Files.isRegularFile(entry, LinkOption.NOFOLLOW_LINKS)) {
-                    Files.delete(entry);
-                }
-            }
-        }
+    /// @param homeIdentity validated launcher-home identity
+    /// @return shared operation lock
+    private static ReentrantLock operationLock(HomeIdentity homeIdentity) {
+        List<ComponentIdentity> components = homeIdentity.components();
+        Path realHome = components.get(components.size() - 1).realPath();
+        return HOME_LOCKS.computeIfAbsent(realHome, ignored -> new ReentrantLock());
     }
 
     /// Validates every existing launcher-home component without following links or observable reparse redirects.
@@ -256,13 +544,18 @@ public final class PluginRecoveryStore {
 
         Path component = root;
         List<ComponentIdentity> components = new ArrayList<>();
-        components.add(captureDirectDirectory(component));
+        try {
+            components.add(captureDirectDirectory(component));
+        } catch (NoSuchFileException ignored) {
+            return null;
+        }
         for (Path name : root.relativize(launcherHome)) {
             component = component.resolve(name);
-            if (!Files.exists(component, LinkOption.NOFOLLOW_LINKS)) {
+            try {
+                components.add(captureDirectDirectory(component));
+            } catch (NoSuchFileException ignored) {
                 return null;
             }
-            components.add(captureDirectDirectory(component));
         }
         return new HomeIdentity(List.copyOf(components));
     }
@@ -328,6 +621,35 @@ public final class PluginRecoveryStore {
                     .toString();
         } catch (NoSuchFileException ignored) {
             return null;
+        }
+    }
+
+    /// Reads an exact bounded target snapshot through one no-follow handle without parsing its content.
+    ///
+    /// @return present exact bytes or a definite absent snapshot
+    /// @throws IOException if the direct target is unsafe, oversized, unstable, or unreadable
+    private TargetSnapshot readTargetSnapshot() throws IOException {
+        try (FileChannel channel = FileChannel.open(
+                recoveryFile,
+                StandardOpenOption.READ,
+                LinkOption.NOFOLLOW_LINKS
+        )) {
+            if (channel.size() > MAX_RECOVERY_BYTES) {
+                throw new IOException("Plugin recovery document is too large to snapshot");
+            }
+            ByteBuffer buffer = ByteBuffer.allocate(MAX_RECOVERY_BYTES + 1);
+            while (buffer.hasRemaining() && channel.read(buffer) != -1) {
+                // The sentinel byte detects growth through the already-open no-follow handle.
+            }
+            if (buffer.position() > MAX_RECOVERY_BYTES) {
+                throw new IOException("Plugin recovery document is too large to snapshot");
+            }
+            byte[] bytes = new byte[buffer.position()];
+            buffer.flip();
+            buffer.get(bytes);
+            return new TargetSnapshot(true, bytes);
+        } catch (NoSuchFileException ignored) {
+            return TargetSnapshot.absent();
         }
     }
 
@@ -573,6 +895,28 @@ public final class PluginRecoveryStore {
         }
     }
 
+    /// Creates one successful publication result from completed durability barriers.
+    ///
+    /// @param durability completed published-record durability barriers
+    /// @return explicit published result
+    private static PublicationResult publishedResult(PublicationDurability durability) {
+        return new PublicationResult(PublicationOutcome.PUBLISHED, durability);
+    }
+
+    /// Creates one fixed classified publication failure without exposing record bytes or paths.
+    ///
+    /// @param result explicit publication classification
+    /// @param message fixed safe diagnostic
+    /// @param cause filesystem failure
+    /// @return classified save exception
+    private static PublicationException publicationFailure(
+            PublicationResult result,
+            String message,
+            IOException cause
+    ) {
+        return new PublicationException(message, result, cause);
+    }
+
     /// Creates a fixed diagnostic that contains no hostile record content.
     ///
     /// @return safe recovery exception
@@ -704,6 +1048,44 @@ public final class PluginRecoveryStore {
     ) {
         /// Captures one validated direct directory component.
         private ComponentIdentity {
+        }
+    }
+
+    /// Exact bounded recovery target content captured before or after an ambiguous move.
+    ///
+    /// @param present whether the exact target existed at handle acquisition
+    /// @param bytes exact bounded target bytes, empty when absent
+    @NotNullByDefault
+    private record TargetSnapshot(boolean present, byte @Unmodifiable [] bytes) {
+        /// Copies exact target bytes so snapshot state cannot change after capture.
+        private TargetSnapshot {
+            bytes = bytes.clone();
+            if (!present && bytes.length != 0) {
+                throw new IllegalArgumentException("An absent target snapshot cannot contain bytes");
+            }
+        }
+
+        /// Creates one definite absent target snapshot.
+        ///
+        /// @return absent snapshot
+        private static TargetSnapshot absent() {
+            return new TargetSnapshot(false, new byte[0]);
+        }
+
+        /// Returns whether this snapshot exactly equals requested bytes.
+        ///
+        /// @param requested requested recovery bytes
+        /// @return whether the present target exactly matches
+        private boolean matches(byte @Unmodifiable [] requested) {
+            return present && Arrays.equals(bytes, requested);
+        }
+
+        /// Returns whether two snapshots have identical presence and exact bytes.
+        ///
+        /// @param other comparison snapshot
+        /// @return whether both target states are exact matches
+        private boolean equalsContent(TargetSnapshot other) {
+            return present == other.present && Arrays.equals(bytes, other.bytes);
         }
     }
 }

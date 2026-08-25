@@ -22,14 +22,21 @@ import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
 import org.junit.jupiter.api.Test;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.SequenceInputStream;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -231,7 +238,7 @@ public final class ProtectorProtocolTest {
         assertRejected(valid.substring(0, valid.length() - 1) + "\r\n");
     }
 
-    /// Rejects negative and regressing monotonic timestamps while accepting equal timestamps.
+    /// Rejects negative, replayed, and regressing monotonic timestamps.
     ///
     /// @throws Exception if fixture encoding fails
     @Test
@@ -245,7 +252,14 @@ public final class ProtectorProtocolTest {
                 ProtectorStage.JVM_STARTED
         )).replace("\"timestampNanos\":1", "\"timestampNanos\":-1"));
         decoder.decode(encoder.encode(message(ProtectorMessage.Kind.HEARTBEAT, 10L, ProtectorStage.JVM_STARTED)));
-        decoder.decode(encoder.encode(message(ProtectorMessage.Kind.STAGE, 10L, ProtectorStage.CORE_READY)));
+        assertThrows(
+                IOException.class,
+                () -> decoder.decode(encoder.encode(message(
+                        ProtectorMessage.Kind.STAGE,
+                        10L,
+                        ProtectorStage.CORE_READY
+                )))
+        );
         assertThrows(
                 IOException.class,
                 () -> decoder.decode(encoder.encode(message(
@@ -254,6 +268,59 @@ public final class ProtectorProtocolTest {
                         ProtectorStage.CORE_READY
                 )))
         );
+    }
+
+    /// Reads exactly one LF or CRLF frame without consuming the following frame.
+    ///
+    /// @throws Exception if bounded transport decoding fails
+    @Test
+    public void readOneNormalizedTransportLineAtATime() throws Exception {
+        String first = validLine();
+        String second = first.replace("\"timestampNanos\":1", "\"timestampNanos\":2");
+        String transport = first.substring(0, first.length() - 1) + "\r\n" + second;
+        InputStream input = chunked(transport.getBytes(StandardCharsets.UTF_8), 3);
+
+        assertEquals(first, ProtectorProtocol.readLine(input));
+        assertEquals(second, ProtectorProtocol.readLine(input));
+        assertNull(ProtectorProtocol.readLine(input));
+    }
+
+    /// Distinguishes clean EOF from a truncated frame and rejects forbidden control bytes.
+    @Test
+    public void rejectTruncatedAndControlByteTransportFrames() {
+        assertNull(assertDoesNotThrowRead(new byte[0]));
+        assertThrows(IOException.class, () -> ProtectorProtocol.readLine(bytes("unterminated")));
+        assertThrows(IOException.class, () -> ProtectorProtocol.readLine(bytes("nul\0byte\n")));
+        assertThrows(IOException.class, () -> ProtectorProtocol.readLine(bytes("bare\rcarriage\n")));
+    }
+
+    /// Rejects malformed UTF-8 before constructing a Java protocol line.
+    @Test
+    public void rejectMalformedUtf8TransportFrame() {
+        byte[] malformed = {(byte) 0xc3, (byte) 0x28, (byte) '\n'};
+
+        assertThrows(IOException.class, () -> ProtectorProtocol.readLine(new ByteArrayInputStream(malformed)));
+    }
+
+    /// Accepts the exact byte bound and reads only one byte beyond it to reject an oversized stream.
+    ///
+    /// @throws Exception if exact-bound framing fails
+    @Test
+    public void enforceBoundedTransportReadBeforeAllocation() throws Exception {
+        byte[] exact = new byte[ProtectorProtocol.MAX_MESSAGE_BYTES];
+        java.util.Arrays.fill(exact, (byte) 'x');
+        exact[exact.length - 1] = (byte) '\n';
+        assertEquals(ProtectorProtocol.MAX_MESSAGE_BYTES, ProtectorProtocol.readLine(
+                new ByteArrayInputStream(exact)
+        ).length());
+
+        byte[] oversized = new byte[ProtectorProtocol.MAX_MESSAGE_BYTES + 2];
+        java.util.Arrays.fill(oversized, (byte) 'x');
+        oversized[oversized.length - 1] = (byte) '\n';
+        CountingInputStream input = new CountingInputStream(oversized);
+
+        assertThrows(IOException.class, () -> ProtectorProtocol.readLine(input));
+        assertEquals(ProtectorProtocol.MAX_MESSAGE_BYTES + 1, input.readCount());
     }
 
     /// Accepts canonical active identities only on their matching loading stages.
@@ -424,6 +491,82 @@ public final class ProtectorProtocolTest {
                 () -> new ProtectorProtocol(NONCE).decode(hostile)
         );
         assertFalse(exception.getMessage().contains(hostile));
+    }
+
+    /// Creates a byte stream from ASCII-compatible test content.
+    ///
+    /// @param value test content
+    /// @return byte stream
+    private static InputStream bytes(String value) {
+        return new ByteArrayInputStream(value.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /// Splits bytes across real component streams to model arbitrarily chunked transport delivery.
+    ///
+    /// @param value complete transport bytes
+    /// @param chunkSize maximum bytes in each component stream
+    /// @return sequential chunked stream
+    private static InputStream chunked(byte @Unmodifiable [] value, int chunkSize) {
+        List<InputStream> chunks = new ArrayList<>();
+        for (int offset = 0; offset < value.length; offset += chunkSize) {
+            chunks.add(new ByteArrayInputStream(
+                    value,
+                    offset,
+                    Math.min(chunkSize, value.length - offset)
+            ));
+        }
+        return new SequenceInputStream(Collections.enumeration(chunks));
+    }
+
+    /// Reads one fixture while converting an unexpected checked failure into an assertion failure.
+    ///
+    /// @param value fixture bytes
+    /// @return decoded line or `null` at clean EOF
+    private static @Nullable String assertDoesNotThrowRead(byte @Unmodifiable [] value) {
+        try {
+            return ProtectorProtocol.readLine(new ByteArrayInputStream(value));
+        } catch (IOException exception) {
+            throw new AssertionError(exception);
+        }
+    }
+
+    /// Input stream that counts bounded single-byte reads.
+    @NotNullByDefault
+    private static final class CountingInputStream extends InputStream {
+        /// Complete source bytes.
+        private final byte @Unmodifiable [] source;
+
+        /// Current source offset.
+        private int position;
+
+        /// Number of bytes returned to the reader.
+        private int readCount;
+
+        /// Creates one counted source.
+        ///
+        /// @param source complete source bytes
+        private CountingInputStream(byte @Unmodifiable [] source) {
+            this.source = source.clone();
+        }
+
+        /// Returns the next source byte.
+        ///
+        /// @return unsigned byte, or `-1` at EOF
+        @Override
+        public int read() {
+            if (position >= source.length) {
+                return -1;
+            }
+            readCount++;
+            return source[position++] & 0xff;
+        }
+
+        /// Returns the number of bytes exposed to the reader.
+        ///
+        /// @return byte read count
+        private int readCount() {
+            return readCount;
+        }
     }
 
     /// Asserts one provider ID is rejected by the canonical identity boundary.

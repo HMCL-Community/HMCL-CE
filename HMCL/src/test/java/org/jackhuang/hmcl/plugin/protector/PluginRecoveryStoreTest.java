@@ -26,19 +26,22 @@ import java.io.OutputStream;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.AccessDeniedException;
 import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.List;
-import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -115,6 +118,71 @@ public final class PluginRecoveryStoreTest {
         assertThrows(IllegalArgumentException.class, () -> recordWithLog("logs/" + "x".repeat(600)));
         assertThrows(IllegalArgumentException.class, () -> recordWithLog("logs/Authorization=Bearer-secret.log"));
         assertThrows(IllegalArgumentException.class, () -> recordWithLog("logs/{\"token\":\"secret\"}.log"));
+        for (String reserved : List.of(
+                "CON",
+                "con.txt",
+                "logs/PrN.log",
+                "AUX",
+                "nul.dump",
+                "COM1",
+                "com9.txt",
+                "LPT1",
+                "lPt9.log"
+        )) {
+            assertThrows(IllegalArgumentException.class, () -> recordWithLog(reserved));
+        }
+        assertThrows(IllegalArgumentException.class, () -> recordWithLog("logs/file."));
+        assertThrows(IllegalArgumentException.class, () -> recordWithLog("logs/file "));
+        assertThrows(IllegalArgumentException.class, () -> recordWithLog("logs/file.txt:secret"));
+        assertThrows(IllegalArgumentException.class, () -> recordWithLog("logs/./file.log"));
+        assertThrows(IllegalArgumentException.class, () -> recordWithLog("logs/../file.log"));
+        assertThrows(IllegalArgumentException.class, () -> recordWithLog("logs//file.log"));
+    }
+
+    /// Enforces the complete failure-reason, pre-ready stage, and active-identity matrix in constructors and JSON.
+    ///
+    /// @param temporaryDirectory isolated launcher-local home
+    /// @throws Exception if fixture persistence fails
+    @Test
+    public void enforceRecoverySemanticMatrixConsistently(@TempDir Path temporaryDirectory) throws Exception {
+        List<ActiveIdentities> identities = List.of(
+                new ActiveIdentities(null, null),
+                new ActiveIdentities("org.example.provider", null),
+                new ActiveIdentities(null, "org.example.plugin"),
+                new ActiveIdentities("org.example.provider", "org.example.plugin")
+        );
+        PluginRecoveryStore store = new PluginRecoveryStore(temporaryDirectory);
+        Path recoveryFile = temporaryDirectory.resolve(PluginRecoveryStore.FILE_NAME);
+
+        for (PluginRecoveryRecord.FailureReason reason : PluginRecoveryRecord.FailureReason.values()) {
+            for (ProtectorStage stage : ProtectorStage.values()) {
+                for (ActiveIdentities active : identities) {
+                    boolean legal = isLegalRecoveryCombination(reason, stage, active);
+                    if (legal) {
+                        PluginRecoveryRecord expected = assertDoesNotThrow(
+                                () -> recoveryRecord(reason, stage, active)
+                        );
+                        Files.writeString(
+                                recoveryFile,
+                                recoveryDocument(reason, stage, active),
+                                StandardCharsets.UTF_8
+                        );
+                        assertEquals(expected, store.load().orElseThrow());
+                    } else {
+                        assertThrows(
+                                IllegalArgumentException.class,
+                                () -> recoveryRecord(reason, stage, active)
+                        );
+                        Files.writeString(
+                                recoveryFile,
+                                recoveryDocument(reason, stage, active),
+                                StandardCharsets.UTF_8
+                        );
+                        assertThrows(IOException.class, store::load);
+                    }
+                }
+            }
+        }
     }
 
     /// Rejects invalid timestamps and active IDs that do not match the recorded stage.
@@ -192,6 +260,39 @@ public final class PluginRecoveryStoreTest {
                 "\"failureReason\":\"unexpected-process-exit\"",
                 "\"failureReason\":null"
         ));
+    }
+
+    /// Uses no-follow attributes to establish absence and propagates every uncertain attribute failure.
+    ///
+    /// @param temporaryDirectory isolated filesystem root
+    /// @throws Exception if fixture setup fails
+    @Test
+    public void inspectHomeAbsenceAndFailClosedForUncertainAttributes(@TempDir Path temporaryDirectory)
+            throws Exception {
+        Path absentHome = temporaryDirectory.resolve("absent-home");
+        AttributeFailureOperations missing = new AttributeFailureOperations(absentHome, true, false);
+        assertTrue(new PluginRecoveryStore(absentHome, missing).load().isEmpty());
+        assertEquals(1, missing.targetInspections);
+
+        Path deniedHome = temporaryDirectory.resolve("denied-home");
+        Files.createDirectories(deniedHome);
+        assertThrows(
+                AccessDeniedException.class,
+                () -> new PluginRecoveryStore(
+                        deniedHome,
+                        new AttributeFailureOperations(deniedHome, false, true)
+                ).load()
+        );
+
+        Path uncertainHome = temporaryDirectory.resolve("uncertain-home");
+        Files.createDirectories(uncertainHome);
+        assertThrows(
+                IOException.class,
+                () -> new PluginRecoveryStore(
+                        uncertainHome,
+                        new AttributeFailureOperations(uncertainHome, false, false)
+                ).load()
+        );
     }
 
     /// Rejects arbitrary exception text and secret-shaped reason values without echoing them through errors.
@@ -399,7 +500,7 @@ public final class PluginRecoveryStoreTest {
         assertEquals("retain", Files.readString(temporaryFile.resolve("sentinel"), StandardCharsets.UTF_8));
     }
 
-    /// Clears only the exact recovery document and regular stale siblings with the controlled temporary prefix.
+    /// Clears only the exact recovery document and never claims ownership of residual temporary-looking siblings.
     ///
     /// @param temporaryDirectory isolated launcher-local home
     /// @throws Exception if fixture setup or clearing fails
@@ -407,8 +508,14 @@ public final class PluginRecoveryStoreTest {
     public void clearOnlyExactRecoveryTargets(@TempDir Path temporaryDirectory) throws Exception {
         PluginRecoveryStore store = new PluginRecoveryStore(temporaryDirectory);
         store.save(record(PluginRecoveryRecord.FailureReason.UNEXPECTED_PROCESS_EXIT, 100L));
-        Path staleTemporaryFile = temporaryDirectory.resolve(PluginRecoveryStore.FILE_NAME + ".tmp-stale-owned");
-        Files.writeString(staleTemporaryFile, "stale", StandardCharsets.UTF_8);
+        Path exactUuidTemporary = temporaryDirectory.resolve(
+                PluginRecoveryStore.FILE_NAME + ".tmp-00000000-0000-0000-0000-000000000000"
+        );
+        Files.writeString(exactUuidTemporary, "retain-exact", StandardCharsets.UTF_8);
+        Path prefixCollision = temporaryDirectory.resolve(
+                PluginRecoveryStore.FILE_NAME + ".tmp-00000000-0000-0000-0000-000000000000.extra"
+        );
+        Files.writeString(prefixCollision, "retain-collision", StandardCharsets.UTF_8);
         Path unrelatedFixedTemporary = temporaryDirectory.resolve(PluginRecoveryStore.FILE_NAME + ".tmp");
         Files.writeString(unrelatedFixedTemporary, "retain-fixed", StandardCharsets.UTF_8);
         Path staleTemporaryDirectory = temporaryDirectory.resolve(
@@ -422,7 +529,8 @@ public final class PluginRecoveryStoreTest {
         store.clear();
 
         assertTrue(store.load().isEmpty());
-        assertFalse(Files.exists(staleTemporaryFile));
+        assertEquals("retain-exact", Files.readString(exactUuidTemporary, StandardCharsets.UTF_8));
+        assertEquals("retain-collision", Files.readString(prefixCollision, StandardCharsets.UTF_8));
         assertEquals("retain-fixed", Files.readString(unrelatedFixedTemporary, StandardCharsets.UTF_8));
         assertEquals(
                 "retain-directory",
@@ -431,14 +539,16 @@ public final class PluginRecoveryStoreTest {
         assertEquals("retain", Files.readString(unrelated, StandardCharsets.UTF_8));
     }
 
-    /// Publishes concurrent saves through distinct owned temporary siblings without collisions or residue.
+    /// Serializes two store instances for the same real home before the second can create an owned temporary file.
     ///
     /// @param temporaryDirectory isolated launcher-local home
     /// @throws Exception if concurrent persistence or verification fails
     @Test
     public void publishConcurrentSavesThroughUniqueTemporaryFiles(@TempDir Path temporaryDirectory) throws Exception {
-        ConcurrentCreateOperations operations = new ConcurrentCreateOperations();
-        PluginRecoveryStore store = new PluginRecoveryStore(temporaryDirectory, operations);
+        BlockingTemporaryForceOperations firstOperations = new BlockingTemporaryForceOperations();
+        ObservingCreateOperations secondOperations = new ObservingCreateOperations();
+        PluginRecoveryStore firstStore = new PluginRecoveryStore(temporaryDirectory, firstOperations);
+        PluginRecoveryStore secondStore = new PluginRecoveryStore(temporaryDirectory, secondOperations);
         PluginRecoveryRecord first = record(
                 PluginRecoveryRecord.FailureReason.UNEXPECTED_PROCESS_EXIT,
                 100L
@@ -449,20 +559,56 @@ public final class PluginRecoveryStoreTest {
         );
         ExecutorService executor = Executors.newFixedThreadPool(2);
         try {
-            Future<?> firstSave = executor.submit(() -> saveUnchecked(store, first));
-            Future<?> secondSave = executor.submit(() -> saveUnchecked(store, second));
+            Future<?> firstSave = executor.submit(() -> saveUnchecked(firstStore, first));
+            assertTrue(firstOperations.forceStarted.await(5L, TimeUnit.SECONDS));
+            Future<?> secondSave = executor.submit(() -> saveUnchecked(secondStore, second));
 
+            assertFalse(secondOperations.created.await(250L, TimeUnit.MILLISECONDS));
+            firstOperations.allowForce.countDown();
             firstSave.get(10L, TimeUnit.SECONDS);
             secondSave.get(10L, TimeUnit.SECONDS);
 
-            assertTrue(Set.of(first, second).contains(store.load().orElseThrow()));
-            try (java.nio.file.DirectoryStream<Path> entries = Files.newDirectoryStream(
-                    temporaryDirectory,
-                    PluginRecoveryStore.TEMP_FILE_PREFIX + "*"
-            )) {
-                assertFalse(entries.iterator().hasNext());
-            }
+            assertEquals(second, secondStore.load().orElseThrow());
+            assertCanonicalTemporaryName(firstOperations.createdPath);
+            assertCanonicalTemporaryName(secondOperations.createdPath);
+            assertNoControlledTemporaryFiles(temporaryDirectory);
         } finally {
+            firstOperations.allowForce.countDown();
+            executor.shutdownNow();
+        }
+    }
+
+    /// Serializes clear behind an active save from another store instance so clear wins deterministically.
+    ///
+    /// @param temporaryDirectory isolated launcher-local home
+    /// @throws Exception if concurrent persistence or verification fails
+    @Test
+    public void serializeCrossInstanceSaveAndClear(@TempDir Path temporaryDirectory) throws Exception {
+        new PluginRecoveryStore(temporaryDirectory).save(record(
+                PluginRecoveryRecord.FailureReason.UNEXPECTED_PROCESS_EXIT,
+                100L
+        ));
+        BlockingTemporaryForceOperations operations = new BlockingTemporaryForceOperations();
+        PluginRecoveryStore savingStore = new PluginRecoveryStore(temporaryDirectory, operations);
+        PluginRecoveryStore clearingStore = new PluginRecoveryStore(temporaryDirectory);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> save = executor.submit(() -> saveUnchecked(savingStore, record(
+                    PluginRecoveryRecord.FailureReason.UNEXPECTED_PROCESS_EXIT,
+                    200L
+            )));
+            assertTrue(operations.forceStarted.await(5L, TimeUnit.SECONDS));
+            Future<?> clear = executor.submit(() -> clearUnchecked(clearingStore));
+
+            assertThrows(TimeoutException.class, () -> clear.get(250L, TimeUnit.MILLISECONDS));
+            operations.allowForce.countDown();
+            save.get(10L, TimeUnit.SECONDS);
+            clear.get(10L, TimeUnit.SECONDS);
+
+            assertTrue(clearingStore.load().isEmpty());
+            assertNoControlledTemporaryFiles(temporaryDirectory);
+        } finally {
+            operations.allowForce.countDown();
             executor.shutdownNow();
         }
     }
@@ -541,11 +687,12 @@ public final class PluginRecoveryStoreTest {
         FaultInjectingOperations operations = new FaultInjectingOperations();
         operations.failDirectoryForce = true;
 
-        PluginRecoveryStore.PublicationDurability durability =
+        PluginRecoveryStore.PublicationResult result =
                 new PluginRecoveryStore(temporaryDirectory, operations).save(replacement);
 
         assertEquals(1, operations.directoryForces);
-        assertEquals(PluginRecoveryStore.PublicationDurability.FILE_FORCED_ONLY, durability);
+        assertEquals(PluginRecoveryStore.PublicationOutcome.PUBLISHED, result.outcome());
+        assertEquals(PluginRecoveryStore.PublicationDurability.FILE_FORCED_ONLY, result.durability());
         assertEquals(replacement, new PluginRecoveryStore(temporaryDirectory).load().orElseThrow());
         assertNoControlledTemporaryFiles(temporaryDirectory);
     }
@@ -565,17 +712,126 @@ public final class PluginRecoveryStoreTest {
         operations.failAtomicMove = true;
         operations.failCleanup = true;
 
-        IOException exception = assertThrows(
-                IOException.class,
+        PluginRecoveryStore.PublicationException exception = assertThrows(
+                PluginRecoveryStore.PublicationException.class,
                 () -> new PluginRecoveryStore(temporaryDirectory, operations).save(record(
                         PluginRecoveryRecord.FailureReason.UNEXPECTED_PROCESS_EXIT,
                         200L
                 ))
         );
 
+        assertEquals(PluginRecoveryStore.PublicationOutcome.NOT_PUBLISHED, exception.result().outcome());
         assertEquals(1, exception.getSuppressed().length);
         assertEquals(previous, new PluginRecoveryStore(temporaryDirectory).load().orElseThrow());
         assertEquals(1L, countControlledTemporaryFiles(temporaryDirectory));
+    }
+
+    /// Reconciles real atomic and fallback moves that publish successfully before their wrappers throw.
+    ///
+    /// @param temporaryDirectory isolated launcher-local home
+    /// @throws Exception if fixture setup or reconciliation fails
+    @Test
+    public void recognizePublishedRecordWhenMoveThrowsAfterCompletion(@TempDir Path temporaryDirectory)
+            throws Exception {
+        for (AmbiguousMoveMode mode : List.of(
+                AmbiguousMoveMode.ATOMIC_MOVE_THEN_THROW,
+                AmbiguousMoveMode.FALLBACK_MOVE_THEN_THROW
+        )) {
+            Path home = temporaryDirectory.resolve(mode.name());
+            PluginRecoveryRecord previous = record(
+                    PluginRecoveryRecord.FailureReason.UNEXPECTED_PROCESS_EXIT,
+                    100L
+            );
+            PluginRecoveryRecord replacement = record(
+                    PluginRecoveryRecord.FailureReason.UNEXPECTED_PROCESS_EXIT,
+                    200L
+            );
+            new PluginRecoveryStore(home).save(previous);
+
+            PluginRecoveryStore.PublicationResult result = new PluginRecoveryStore(
+                    home,
+                    new AmbiguousMoveOperations(home, mode)
+            ).save(replacement);
+
+            assertEquals(PluginRecoveryStore.PublicationOutcome.PUBLISHED, result.outcome());
+            assertTrue(result.durability() == PluginRecoveryStore.PublicationDurability.FILE_FORCED_ONLY
+                    || result.durability() == PluginRecoveryStore.PublicationDurability.FILE_AND_DIRECTORY_FORCED);
+            assertEquals(replacement, new PluginRecoveryStore(home).load().orElseThrow());
+            assertNoControlledTemporaryFiles(home);
+        }
+    }
+
+    /// Repairs partial, missing, and corrupt fallback targets to the exact previous bounded snapshot.
+    ///
+    /// @param temporaryDirectory isolated launcher-local home
+    /// @throws Exception if fixture setup or repair verification fails
+    @Test
+    public void repairAmbiguousFallbackTargetsToPreviousSnapshot(@TempDir Path temporaryDirectory) throws Exception {
+        for (AmbiguousMoveMode mode : List.of(
+                AmbiguousMoveMode.FALLBACK_PARTIAL_TARGET,
+                AmbiguousMoveMode.FALLBACK_MISSING_TARGET,
+                AmbiguousMoveMode.FALLBACK_CORRUPT_TARGET
+        )) {
+            assertFallbackRepair(temporaryDirectory.resolve(mode.name()), mode, null);
+        }
+        byte[] corruptPrevious = "{previous-corrupt".getBytes(StandardCharsets.UTF_8);
+        assertFallbackRepair(
+                temporaryDirectory.resolve("corrupt-previous"),
+                AmbiguousMoveMode.FALLBACK_CORRUPT_TARGET,
+                corruptPrevious
+        );
+    }
+
+    /// Reports an explicit indeterminate outcome when an ambiguous target cannot be repaired atomically.
+    ///
+    /// @param temporaryDirectory isolated launcher-local home
+    /// @throws Exception if fixture setup fails
+    @Test
+    public void reportIndeterminateOutcomeWhenFallbackRepairFails(@TempDir Path temporaryDirectory) throws Exception {
+        PluginRecoveryRecord previous = record(
+                PluginRecoveryRecord.FailureReason.UNEXPECTED_PROCESS_EXIT,
+                100L
+        );
+        new PluginRecoveryStore(temporaryDirectory).save(previous);
+        PluginRecoveryStore.PublicationException exception = assertThrows(
+                PluginRecoveryStore.PublicationException.class,
+                () -> new PluginRecoveryStore(
+                        temporaryDirectory,
+                        new AmbiguousMoveOperations(
+                                temporaryDirectory,
+                                AmbiguousMoveMode.FALLBACK_REPAIR_FAILURE
+                        )
+                ).save(record(PluginRecoveryRecord.FailureReason.UNEXPECTED_PROCESS_EXIT, 200L))
+        );
+
+        assertEquals(PluginRecoveryStore.PublicationOutcome.INDETERMINATE, exception.result().outcome());
+        assertEquals(PluginRecoveryStore.PublicationDurability.UNKNOWN, exception.result().durability());
+    }
+
+    /// Reports a typed indeterminate outcome when home identity cannot be revalidated after a successful move.
+    ///
+    /// @param temporaryDirectory isolated launcher-local home
+    /// @throws Exception if fixture setup fails
+    @Test
+    public void reportIndeterminateOutcomeAfterPostMoveIdentityFailure(@TempDir Path temporaryDirectory)
+            throws Exception {
+        new PluginRecoveryStore(temporaryDirectory).save(record(
+                PluginRecoveryRecord.FailureReason.UNEXPECTED_PROCESS_EXIT,
+                100L
+        ));
+        PluginRecoveryStore.PublicationException exception = assertThrows(
+                PluginRecoveryStore.PublicationException.class,
+                () -> new PluginRecoveryStore(
+                        temporaryDirectory,
+                        new AmbiguousMoveOperations(
+                                temporaryDirectory,
+                                AmbiguousMoveMode.POST_MOVE_IDENTITY_FAILURE
+                        )
+                ).save(record(PluginRecoveryRecord.FailureReason.UNEXPECTED_PROCESS_EXIT, 200L))
+        );
+
+        assertEquals(PluginRecoveryStore.PublicationOutcome.INDETERMINATE, exception.result().outcome());
+        assertEquals(PluginRecoveryStore.PublicationDurability.UNKNOWN, exception.result().durability());
     }
 
     /// Builds one complete ordinary-plugin recovery record.
@@ -613,6 +869,97 @@ public final class PluginRecoveryStoreTest {
                 launcherLogReference,
                 null
         );
+    }
+
+    /// Builds one recovery record with caller-selected semantic coordinates.
+    ///
+    /// @param reason controlled failure reason
+    /// @param stage last startup stage
+    /// @param active active identity fields
+    /// @return recovery record candidate
+    private static PluginRecoveryRecord recoveryRecord(
+            PluginRecoveryRecord.FailureReason reason,
+            ProtectorStage stage,
+            ActiveIdentities active
+    ) {
+        return new PluginRecoveryRecord(
+                1_777_000_000_000L,
+                reason.category(),
+                reason,
+                stage,
+                100L,
+                active.providerId(),
+                active.pluginId(),
+                null,
+                null
+        );
+    }
+
+    /// Serializes one raw semantic matrix fixture without invoking the record constructor.
+    ///
+    /// @param reason controlled failure reason
+    /// @param stage last startup stage
+    /// @param active active identity fields
+    /// @return strict recovery JSON
+    private static String recoveryDocument(
+            PluginRecoveryRecord.FailureReason reason,
+            ProtectorStage stage,
+            ActiveIdentities active
+    ) {
+        return "{\"schemaVersion\":1"
+                + ",\"failureTimestampEpochMillis\":1777000000000"
+                + ",\"failureCategory\":\"" + reason.category().wireName() + "\""
+                + ",\"failureReason\":\"" + reason.wireName() + "\""
+                + ",\"lastStage\":\"" + stage.wireName() + "\""
+                + ",\"lastHeartbeatMonotonicNanos\":100"
+                + ",\"activeProviderId\":" + jsonString(active.providerId())
+                + ",\"activePluginId\":" + jsonString(active.pluginId())
+                + ",\"launcherLogReference\":null"
+                + ",\"diagnosticDumpReference\":null}";
+    }
+
+    /// Returns one simple JSON string or null fixture value.
+    ///
+    /// @param value canonical identifier, or `null`
+    /// @return JSON scalar
+    private static String jsonString(@org.jetbrains.annotations.Nullable String value) {
+        return value == null ? "null" : "\"" + value + "\"";
+    }
+
+    /// Returns whether one semantic matrix coordinate represents a possible supervised startup failure.
+    ///
+    /// @param reason controlled failure reason
+    /// @param stage last startup stage
+    /// @param active active identity fields
+    /// @return whether the combination is legal
+    private static boolean isLegalRecoveryCombination(
+            PluginRecoveryRecord.FailureReason reason,
+            ProtectorStage stage,
+            ActiveIdentities active
+    ) {
+        if (stage == ProtectorStage.UI_READY) {
+            return false;
+        }
+        boolean structurallyValid = active.providerId() == null && active.pluginId() == null
+                || stage == ProtectorStage.RUNTIME_PROVIDERS_LOADING
+                && active.providerId() != null
+                && active.pluginId() == null
+                || stage == ProtectorStage.ORDINARY_PLUGINS_LOADING
+                && active.providerId() == null
+                && active.pluginId() != null;
+        if (!structurallyValid) {
+            return false;
+        }
+        return switch (reason) {
+            case CORE_DEADLINE_EXCEEDED -> stage == ProtectorStage.JVM_STARTED
+                    && active.providerId() == null
+                    && active.pluginId() == null;
+            case PROVIDER_DEADLINE_EXCEEDED -> stage == ProtectorStage.RUNTIME_PROVIDERS_LOADING
+                    && active.providerId() != null;
+            case PLUGIN_DEADLINE_EXCEEDED -> stage == ProtectorStage.ORDINARY_PLUGINS_LOADING
+                    && active.pluginId() != null;
+            case UNEXPECTED_PROCESS_EXIT, CHILD_CRASH, HEARTBEAT_LOST, HARD_STARTUP_DEADLINE_EXCEEDED -> true;
+        };
     }
 
     /// Writes one invalid document, asserts fail-closed loading, and verifies the original remains untouched.
@@ -699,6 +1046,28 @@ public final class PluginRecoveryStoreTest {
         }
     }
 
+    /// Clears one store from an executor while preserving an `IOException` as the task failure cause.
+    ///
+    /// @param store concurrent recovery store
+    private static void clearUnchecked(PluginRecoveryStore store) {
+        try {
+            store.clear();
+        } catch (IOException exception) {
+            throw new java.io.UncheckedIOException(exception);
+        }
+    }
+
+    /// Asserts one captured owned path uses exactly the canonical UUID temporary filename grammar.
+    ///
+    /// @param path captured owned temporary path, or `null` when creation did not occur
+    private static void assertCanonicalTemporaryName(@org.jetbrains.annotations.Nullable Path path) {
+        assertTrue(path != null);
+        assertTrue(path.getFileName().toString().matches(
+                "plugin-startup-recovery\\.json\\.tmp-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+                        + "[0-9a-f]{4}-[0-9a-f]{12}"
+        ));
+    }
+
     /// Exercises one injected pre-publication fault and verifies rollback and owned-temp cleanup.
     ///
     /// @param temporaryDirectory isolated launcher-local home
@@ -716,13 +1085,54 @@ public final class PluginRecoveryStoreTest {
         FaultInjectingOperations operations = new FaultInjectingOperations();
         configuration.accept(operations);
 
-        assertThrows(IOException.class, () -> new PluginRecoveryStore(temporaryDirectory, operations).save(record(
-                PluginRecoveryRecord.FailureReason.UNEXPECTED_PROCESS_EXIT,
-                200L
-        )));
+        PluginRecoveryStore.PublicationException exception = assertThrows(
+                PluginRecoveryStore.PublicationException.class,
+                () -> new PluginRecoveryStore(temporaryDirectory, operations).save(record(
+                        PluginRecoveryRecord.FailureReason.UNEXPECTED_PROCESS_EXIT,
+                        200L
+                ))
+        );
 
+        assertEquals(PluginRecoveryStore.PublicationOutcome.NOT_PUBLISHED, exception.result().outcome());
+        assertEquals(PluginRecoveryStore.PublicationDurability.NOT_APPLICABLE, exception.result().durability());
         assertEquals(previous, new PluginRecoveryStore(temporaryDirectory).load().orElseThrow());
         assertNoControlledTemporaryFiles(temporaryDirectory);
+    }
+
+    /// Exercises one ambiguous fallback outcome and verifies exact restoration of the bounded prior snapshot.
+    ///
+    /// @param home isolated launcher-local home
+    /// @param mode fallback target outcome
+    /// @param rawPrevious raw prior bytes, or `null` to create a valid prior record
+    /// @throws Exception if fixture setup or repair verification fails
+    private static void assertFallbackRepair(
+            Path home,
+            AmbiguousMoveMode mode,
+            byte @org.jetbrains.annotations.Nullable [] rawPrevious
+    ) throws Exception {
+        PluginRecoveryRecord previous = record(
+                PluginRecoveryRecord.FailureReason.UNEXPECTED_PROCESS_EXIT,
+                100L
+        );
+        new PluginRecoveryStore(home).save(previous);
+        Path recoveryFile = home.resolve(PluginRecoveryStore.FILE_NAME);
+        if (rawPrevious != null) {
+            Files.write(recoveryFile, rawPrevious);
+        }
+        byte[] expectedPrevious = Files.readAllBytes(recoveryFile);
+
+        PluginRecoveryStore.PublicationException exception = assertThrows(
+                PluginRecoveryStore.PublicationException.class,
+                () -> new PluginRecoveryStore(home, new AmbiguousMoveOperations(home, mode)).save(record(
+                        PluginRecoveryRecord.FailureReason.UNEXPECTED_PROCESS_EXIT,
+                        200L
+                ))
+        );
+
+        assertEquals(PluginRecoveryStore.PublicationOutcome.NOT_PUBLISHED, exception.result().outcome());
+        assertEquals(PluginRecoveryStore.PublicationDurability.NOT_APPLICABLE, exception.result().durability());
+        assertTrue(java.util.Arrays.equals(expectedPrevious, Files.readAllBytes(recoveryFile)));
+        assertNoControlledTemporaryFiles(home);
     }
 
     /// Asserts no regular controlled temporary sibling remains.
@@ -797,36 +1207,75 @@ public final class PluginRecoveryStoreTest {
         }
     }
 
-    /// File operations that hold both created temporary files open until concurrent ownership is proven.
+    /// File operations that block one save while its owned temporary file is being forced.
     @NotNullByDefault
-    private static final class ConcurrentCreateOperations extends PluginRecoveryStore.FileOperations {
-        /// Barrier reached after each distinct temporary file is created.
-        private final CountDownLatch createdFiles = new CountDownLatch(2);
+    private static final class BlockingTemporaryForceOperations extends PluginRecoveryStore.FileOperations {
+        /// Signal emitted when temporary forcing begins.
+        private final CountDownLatch forceStarted = new CountDownLatch(1);
 
-        /// Creates concurrent publication operations.
-        private ConcurrentCreateOperations() {
+        /// Gate allowing temporary forcing to continue.
+        private final CountDownLatch allowForce = new CountDownLatch(1);
+
+        /// Captured owned temporary path, or `null` before creation.
+        private volatile @org.jetbrains.annotations.Nullable Path createdPath;
+
+        /// Creates blocking publication operations.
+        private BlockingTemporaryForceOperations() {
         }
 
-        /// Creates one unique temporary file and waits for the other save to create its own file.
+        /// Captures one uniquely owned temporary path.
         ///
         /// @param path unique temporary path
         /// @return open writable channel
-        /// @throws IOException if creation, waiting, or interruption fails
+        /// @throws IOException if creation fails
         @Override
         FileChannel createNewWritable(Path path) throws IOException {
-            FileChannel channel = super.createNewWritable(path);
-            createdFiles.countDown();
+            createdPath = path;
+            return super.createNewWritable(path);
+        }
+
+        /// Blocks temporary forcing until the concurrent assertion releases it.
+        ///
+        /// @param channel open owned temporary-file channel
+        /// @throws IOException if waiting, interruption, or forcing fails
+        @Override
+        void forceTemporary(FileChannel channel) throws IOException {
+            forceStarted.countDown();
             try {
-                if (!createdFiles.await(5L, TimeUnit.SECONDS)) {
-                    channel.close();
-                    throw new IOException("Concurrent temporary-file creation did not reach the barrier");
+                if (!allowForce.await(5L, TimeUnit.SECONDS)) {
+                    throw new IOException("Timed out waiting to force the active temporary file");
                 }
-                return channel;
             } catch (InterruptedException exception) {
                 Thread.currentThread().interrupt();
-                channel.close();
-                throw new IOException("Concurrent temporary-file creation was interrupted", exception);
+                throw new IOException("Temporary forcing was interrupted", exception);
             }
+            super.forceTemporary(channel);
+        }
+    }
+
+    /// File operations that report when a second store instance creates its temporary file.
+    @NotNullByDefault
+    private static final class ObservingCreateOperations extends PluginRecoveryStore.FileOperations {
+        /// Signal emitted on owned temporary creation.
+        private final CountDownLatch created = new CountDownLatch(1);
+
+        /// Captured owned temporary path, or `null` before creation.
+        private volatile @org.jetbrains.annotations.Nullable Path createdPath;
+
+        /// Creates observing publication operations.
+        private ObservingCreateOperations() {
+        }
+
+        /// Captures and reports one uniquely owned temporary path.
+        ///
+        /// @param path unique temporary path
+        /// @return open writable channel
+        /// @throws IOException if creation fails
+        @Override
+        FileChannel createNewWritable(Path path) throws IOException {
+            createdPath = path;
+            created.countDown();
+            return super.createNewWritable(path);
         }
     }
 
@@ -930,6 +1379,200 @@ public final class PluginRecoveryStoreTest {
                 throw new IOException("injected cleanup failure");
             }
             super.deleteOwnedTemporary(temporaryFile);
+        }
+    }
+
+    /// Attribute operations that expose deterministic missing, denied, or uncertain launcher-home inspection.
+    @NotNullByDefault
+    private static final class AttributeFailureOperations extends PluginRecoveryStore.FileOperations {
+        /// Exact launcher home whose inspection is controlled.
+        private final Path target;
+
+        /// Whether controlled inspection reports definite absence.
+        private final boolean missing;
+
+        /// Whether controlled inspection reports access denial rather than an indeterminate failure.
+        private final boolean denied;
+
+        /// Number of controlled target inspections.
+        private int targetInspections;
+
+        /// Creates one controlled attribute boundary.
+        ///
+        /// @param target exact launcher home
+        /// @param missing whether the home is definitely absent
+        /// @param denied whether inspection is denied
+        private AttributeFailureOperations(Path target, boolean missing, boolean denied) {
+            this.target = target;
+            this.missing = missing;
+            this.denied = denied;
+        }
+
+        /// Reads normal components and emits the selected outcome for the exact launcher home.
+        ///
+        /// @param path inspected path
+        /// @return no-follow attributes for uncontrolled components
+        /// @throws IOException for the controlled missing, denied, or uncertain outcome
+        @Override
+        BasicFileAttributes readAttributes(Path path) throws IOException {
+            if (!path.equals(target)) {
+                return super.readAttributes(path);
+            }
+            targetInspections++;
+            if (missing) {
+                throw new NoSuchFileException(path.toString());
+            }
+            if (denied) {
+                throw new AccessDeniedException(path.toString());
+            }
+            throw new IOException("injected indeterminate attributes");
+        }
+    }
+
+    /// Real filesystem move wrappers that create deterministic ambiguous publication outcomes.
+    @NotNullByDefault
+    private static final class AmbiguousMoveOperations extends PluginRecoveryStore.FileOperations {
+        /// Exact launcher home used for post-move identity failure injection.
+        private final Path launcherHome;
+
+        /// Selected ambiguous move behavior.
+        private final AmbiguousMoveMode mode;
+
+        /// Number of atomic replacement attempts, including repair.
+        private int atomicAttempts;
+
+        /// Whether a real move completed.
+        private boolean moveCompleted;
+
+        /// Creates one deterministic ambiguous move wrapper.
+        ///
+        /// @param launcherHome exact launcher home
+        /// @param mode selected behavior
+        private AmbiguousMoveOperations(Path launcherHome, AmbiguousMoveMode mode) {
+            this.launcherHome = launcherHome;
+            this.mode = mode;
+        }
+
+        /// Executes, rejects, or fails atomic replacement according to the selected behavior.
+        ///
+        /// @param source owned forced temporary file
+        /// @param target exact recovery document
+        /// @throws IOException after the configured filesystem effect
+        @Override
+        void atomicReplace(Path source, Path target) throws IOException {
+            atomicAttempts++;
+            if (mode == AmbiguousMoveMode.ATOMIC_MOVE_THEN_THROW) {
+                super.atomicReplace(source, target);
+                throw new IOException("injected exception after atomic move");
+            }
+            if (mode == AmbiguousMoveMode.POST_MOVE_IDENTITY_FAILURE) {
+                super.atomicReplace(source, target);
+                moveCompleted = true;
+                return;
+            }
+            if (mode.usesFallback()) {
+                if (atomicAttempts > 1) {
+                    if (mode == AmbiguousMoveMode.FALLBACK_REPAIR_FAILURE) {
+                        throw new IOException("injected atomic repair failure");
+                    }
+                    super.atomicReplace(source, target);
+                    return;
+                }
+                throw new AtomicMoveNotSupportedException(source.toString(), target.toString(), "injected");
+            }
+            super.atomicReplace(source, target);
+        }
+
+        /// Executes a real fallback move or leaves the configured ambiguous target before throwing.
+        ///
+        /// @param source owned forced temporary file
+        /// @param target exact recovery document
+        /// @throws IOException after the configured filesystem effect
+        @Override
+        void replace(Path source, Path target) throws IOException {
+            if (mode == AmbiguousMoveMode.FALLBACK_MOVE_THEN_THROW) {
+                super.replace(source, target);
+                throw new IOException("injected exception after fallback move");
+            }
+            switch (mode) {
+                case FALLBACK_PARTIAL_TARGET, FALLBACK_REPAIR_FAILURE -> Files.writeString(
+                        target,
+                        "partial",
+                        StandardCharsets.UTF_8
+                );
+                case FALLBACK_MISSING_TARGET -> Files.deleteIfExists(target);
+                case FALLBACK_CORRUPT_TARGET -> Files.writeString(
+                        target,
+                        "{corrupt-target",
+                        StandardCharsets.UTF_8
+                );
+                default -> throw new AssertionError("Unexpected fallback mode");
+            }
+            Files.deleteIfExists(source);
+            throw new IOException("injected ambiguous fallback failure");
+        }
+
+        /// Fails launcher-home inspection only after one real move completed.
+        ///
+        /// @param path inspected path
+        /// @return no-follow attributes before publication
+        /// @throws IOException after publication or when normal inspection fails
+        @Override
+        BasicFileAttributes readAttributes(Path path) throws IOException {
+            if (moveCompleted && path.equals(launcherHome)) {
+                throw new IOException("injected post-move identity failure");
+            }
+            return super.readAttributes(path);
+        }
+    }
+
+    /// Ambiguous filesystem outcomes exercised by publication reconciliation tests.
+    @NotNullByDefault
+    private enum AmbiguousMoveMode {
+        /// Atomic movement completes before its wrapper throws.
+        ATOMIC_MOVE_THEN_THROW,
+
+        /// Fallback movement completes before its wrapper throws.
+        FALLBACK_MOVE_THEN_THROW,
+
+        /// Fallback failure leaves a partial target.
+        FALLBACK_PARTIAL_TARGET,
+
+        /// Fallback failure leaves no target.
+        FALLBACK_MISSING_TARGET,
+
+        /// Fallback failure leaves a corrupt target.
+        FALLBACK_CORRUPT_TARGET,
+
+        /// Fallback failure leaves a partial target and atomic repair fails.
+        FALLBACK_REPAIR_FAILURE,
+
+        /// A successful atomic move is followed by launcher-home identity failure.
+        POST_MOVE_IDENTITY_FAILURE;
+
+        /// Returns whether the initial atomic attempt should select fallback replacement.
+        ///
+        /// @return whether fallback is selected
+        private boolean usesFallback() {
+            return this == FALLBACK_MOVE_THEN_THROW
+                    || this == FALLBACK_PARTIAL_TARGET
+                    || this == FALLBACK_MISSING_TARGET
+                    || this == FALLBACK_CORRUPT_TARGET
+                    || this == FALLBACK_REPAIR_FAILURE;
+        }
+    }
+
+    /// Optional active identities used to enumerate recovery semantic combinations.
+    ///
+    /// @param providerId active Runtime Provider ID, or `null`
+    /// @param pluginId active ordinary plugin ID, or `null`
+    @NotNullByDefault
+    private record ActiveIdentities(
+            @org.jetbrains.annotations.Nullable String providerId,
+            @org.jetbrains.annotations.Nullable String pluginId
+    ) {
+        /// Creates one active-identity matrix coordinate.
+        private ActiveIdentities {
         }
     }
 }

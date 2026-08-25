@@ -28,7 +28,10 @@ import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.StringReader;
+import java.nio.ByteBuffer;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Duration;
@@ -112,19 +115,75 @@ public final class ProtectorProtocol {
         addNullableString(envelope, "activePluginId", message.activePluginId());
         envelope.addProperty("kind", message.kind().wireName());
         String encoded = GSON.toJson(envelope) + "\n";
-        if (encoded.getBytes(StandardCharsets.UTF_8).length > MAX_MESSAGE_BYTES) {
+        if (encoded.length() > MAX_MESSAGE_BYTES
+                || encoded.getBytes(StandardCharsets.UTF_8).length > MAX_MESSAGE_BYTES) {
             throw invalidMessage();
         }
         return encoded;
     }
 
-    /// Strictly decodes one authenticated line and enforces non-decreasing sender monotonic time.
+    /// Reads one bounded UTF-8 transport frame without consuming bytes from the following frame.
+    ///
+    /// LF and CRLF are accepted and returned as one LF-terminated Java string. Clean EOF before any byte returns
+    /// `null`; EOF after any byte, NUL, bare CR, malformed UTF-8, and frames exceeding the sixteen-KiB bound fail.
+    /// At most one byte beyond the bound is consumed to establish that a frame is oversized.
+    ///
+    /// @param input unbuffered or caller-buffered Protector transport
+    /// @return one normalized LF-terminated line, or `null` at clean EOF
+    /// @throws IOException if framing, size, or UTF-8 validation fails
+    public static @Nullable String readLine(InputStream input) throws IOException {
+        byte[] bytes = new byte[MAX_MESSAGE_BYTES];
+        int length = 0;
+        while (true) {
+            int next = input.read();
+            if (next == -1) {
+                if (length == 0) {
+                    return null;
+                }
+                throw invalidMessage();
+            }
+            if (length == MAX_MESSAGE_BYTES) {
+                throw invalidMessage();
+            }
+            if (next == 0) {
+                throw invalidMessage();
+            }
+            bytes[length++] = (byte) next;
+            if (next == '\n') {
+                break;
+            }
+        }
+
+        int contentLength = length - 1;
+        if (contentLength > 0 && bytes[contentLength - 1] == '\r') {
+            contentLength--;
+        }
+        for (int index = 0; index < contentLength; index++) {
+            if (bytes[index] == '\r') {
+                throw invalidMessage();
+            }
+        }
+        String content;
+        try {
+            content = StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .decode(ByteBuffer.wrap(bytes, 0, contentLength))
+                    .toString();
+        } catch (IOException exception) {
+            throw invalidMessage();
+        }
+        return content + "\n";
+    }
+
+    /// Strictly decodes one authenticated line and enforces strictly increasing sender monotonic time.
     ///
     /// @param encoded exactly one LF-terminated UTF-8 JSON document represented as a Java string
     /// @return validated control payload
     /// @throws IOException if authentication, framing, schema, type, bound, or monotonic validation fails
     public synchronized ProtectorMessage decode(String encoded) throws IOException {
-        if (encoded.getBytes(StandardCharsets.UTF_8).length > MAX_MESSAGE_BYTES
+        if (encoded.length() > MAX_MESSAGE_BYTES
+                || encoded.getBytes(StandardCharsets.UTF_8).length > MAX_MESSAGE_BYTES
                 || encoded.length() < 2
                 || encoded.charAt(encoded.length() - 1) != '\n'
                 || encoded.indexOf('\n') != encoded.length() - 1
@@ -139,8 +198,8 @@ public final class ProtectorProtocol {
         )) {
             throw new IOException("Protector message authentication failed");
         }
-        if (parsed.timestampNanos() < lastDecodedTimestampNanos) {
-            throw new IOException("Protector message timestamp regressed");
+        if (lastDecodedTimestampNanos >= 0L && parsed.timestampNanos() <= lastDecodedTimestampNanos) {
+            throw new IOException("Protector message timestamp did not increase");
         }
 
         ProtectorMessage message;

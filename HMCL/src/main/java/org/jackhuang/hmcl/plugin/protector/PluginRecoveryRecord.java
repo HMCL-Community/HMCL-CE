@@ -52,6 +52,11 @@ public record PluginRecoveryRecord(
     /// Portable relative-reference syntax independent of host path separators.
     private static final Pattern REFERENCE_PATTERN = Pattern.compile("[A-Za-z0-9._/-]+");
 
+    /// Windows device names that remain reserved with any case or filename extension.
+    private static final Pattern WINDOWS_RESERVED_COMPONENT_PATTERN = Pattern.compile(
+            "(?i)(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\\..*)?"
+    );
+
     /// Validates, bounds, and redacts all persisted fields.
     public PluginRecoveryRecord {
         Objects.requireNonNull(failureCategory, "failureCategory");
@@ -66,7 +71,7 @@ public record PluginRecoveryRecord(
         if (failureReason.category() != failureCategory) {
             throw new IllegalArgumentException("Recovery failure reason does not match its category");
         }
-        ProtectorMessage.validateActiveIdentities(lastStage, activeProviderId, activePluginId);
+        validateFailureState(failureReason, lastStage, activeProviderId, activePluginId);
         launcherLogReference = validateReference(launcherLogReference);
         diagnosticDumpReference = validateReference(diagnosticDumpReference);
     }
@@ -88,11 +93,51 @@ public record PluginRecoveryRecord(
             throw new IllegalArgumentException("Recovery reference must be a bounded portable relative path");
         }
         for (String component : reference.split("/", -1)) {
-            if (component.equals(".") || component.equals("..")) {
-                throw new IllegalArgumentException("Recovery reference cannot escape launcher-local storage");
+            if (component.equals(".")
+                    || component.equals("..")
+                    || component.endsWith(".")
+                    || component.endsWith(" ")
+                    || component.contains(":")
+                    || WINDOWS_RESERVED_COMPONENT_PATTERN.matcher(component).matches()) {
+                throw new IllegalArgumentException("Recovery reference contains a non-portable path component");
             }
         }
         return reference;
+    }
+
+    /// Validates that one controlled reason could occur at the recorded pre-ready stage and identity.
+    ///
+    /// Broad process, crash, heartbeat, and hard-deadline failures may occur at any pre-ready stage with an optional
+    /// matching active identity. Stage-specific deadlines are confined to their exact stage, and Provider or plugin
+    /// deadlines require the corresponding active identity.
+    ///
+    /// @param reason controlled failure reason
+    /// @param stage last authenticated startup stage
+    /// @param activeProviderId active Runtime Provider ID, or `null`
+    /// @param activePluginId active ordinary plugin ID, or `null`
+    private static void validateFailureState(
+            FailureReason reason,
+            ProtectorStage stage,
+            @Nullable String activeProviderId,
+            @Nullable String activePluginId
+    ) {
+        if (stage == ProtectorStage.UI_READY) {
+            throw new IllegalArgumentException("Recovery records cannot describe completed startup");
+        }
+        ProtectorMessage.validateActiveIdentities(stage, activeProviderId, activePluginId);
+        boolean valid = switch (reason) {
+            case CORE_DEADLINE_EXCEEDED -> stage == ProtectorStage.JVM_STARTED
+                    && activeProviderId == null
+                    && activePluginId == null;
+            case PROVIDER_DEADLINE_EXCEEDED -> stage == ProtectorStage.RUNTIME_PROVIDERS_LOADING
+                    && activeProviderId != null;
+            case PLUGIN_DEADLINE_EXCEEDED -> stage == ProtectorStage.ORDINARY_PLUGINS_LOADING
+                    && activePluginId != null;
+            case UNEXPECTED_PROCESS_EXIT, CHILD_CRASH, HEARTBEAT_LOST, HARD_STARTUP_DEADLINE_EXCEEDED -> true;
+        };
+        if (!valid) {
+            throw new IllegalArgumentException("Recovery failure reason does not match its startup state");
+        }
     }
 
     /// Controlled startup failure reasons that cannot contain exception text, arguments, credentials, or IPC data.
