@@ -31,9 +31,9 @@ import java.util.Set;
 
 /// SPI implemented by every plugin runtime provider.
 ///
-/// The launcher currently ships one in-process Java provider. This interface defines the registration and
-/// compatibility boundary for future external providers; runtime-plugin discovery, lifecycle management, and
-/// store installation are not yet connected to it.
+/// The launcher ships one in-process Java provider. Optional Provider plugins register this SPI after package
+/// discovery; the plugin manager resolves Store dependencies, the runtime supervisor owns their lifecycle, and the
+/// runtime loader delegates external payloads. Concrete external Runtime Hosts remain separately distributed plugins.
 @NotNullByDefault
 public interface RuntimeProvider extends AutoCloseable {
     /// Returns the immutable provider identity, ranking metadata, and advertised capabilities.

@@ -21,15 +21,15 @@ import org.jetbrains.annotations.NotNullByDefault;
 
 /// Capability tier a plugin operates at, derived from the declarations in its manifest.
 ///
-/// Level 1 API plugins only call Core API functions. Level 2 and Level 3 describe hook and patch declarations
-/// reserved by the schema-v5 contract. HMCL currently parses, validates, and exposes those declarations, but it
-/// does not yet dispatch hooks or apply declarative patches.
+/// Level 1 API plugins only call Core API functions. Level 2 describes lifecycle Hook declarations routed through
+/// the Hook dispatcher, including supported external Runtime endpoints. Level 3 reserves declarative patches;
+/// HMCL validates and exposes Patch declarations but does not yet apply them through a bytecode engine.
 @NotNullByDefault
 public enum PluginCapabilityLevel {
     /// Calls Core API functions only; the safest tier.
     API,
 
-    /// Declares launcher lifecycle hook subscriptions for the future hook dispatcher.
+    /// Declares launcher lifecycle Hook subscriptions routed through the Hook dispatcher.
     HOOK,
 
     /// Declares method patches for the future JVM patch engine.

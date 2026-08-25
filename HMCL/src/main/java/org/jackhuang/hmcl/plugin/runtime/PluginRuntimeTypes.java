@@ -25,9 +25,9 @@ import java.util.Set;
 
 /// Canonical runtime identifiers shared by plugin manifests and the official runtime repository.
 ///
-/// The launcher currently registers only the built-in Java runtime. Other reserved identifiers describe the
-/// future external-runtime contract; provider discovery, lifecycle management, and on-demand store installation
-/// are not yet implemented.
+/// The launcher ships the built-in Java runtime and can discover optional Provider plugins for other identifiers,
+/// resolve their Store dependencies, supervise their lifecycle, and delegate external payloads to them. Concrete
+/// external Runtime Hosts are distributed separately and are not bundled with the launcher.
 @NotNullByDefault
 public final class PluginRuntimeTypes {
     /// Built-in JVM runtime loaded directly by the launcher; never provided by an external plugin.
