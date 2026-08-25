@@ -83,14 +83,12 @@ public final class RuntimeProviderRegistration implements AutoCloseable {
     ///
     /// @throws IOException if Provider payload or Host resource cleanup fails
     @Override
-    public void close() throws IOException {
-        synchronized (lifecycleLock) {
-            if (closed.get()) {
-                return;
-            }
-            supervisor.closeRegistration(this);
-            closed.set(true);
+    public synchronized void close() throws IOException {
+        if (closed.get()) {
+            return;
         }
+        supervisor.closeRegistration(this);
+        closed.set(true);
     }
 
     /// Returns the Provider-scoped lifecycle monitor owned by this registration.

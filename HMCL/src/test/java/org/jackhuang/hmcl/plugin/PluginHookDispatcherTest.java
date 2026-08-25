@@ -18,6 +18,7 @@
 package org.jackhuang.hmcl.plugin;
 
 import org.jackhuang.hmcl.plugin.bridge.PluginCapabilitySession;
+import org.jackhuang.hmcl.plugin.bridge.PluginCapabilityToken;
 import org.jackhuang.hmcl.plugin.bridge.PluginPermissionAuthority;
 import org.jackhuang.hmcl.plugin.runtime.PluginExecutionMode;
 import org.jackhuang.hmcl.plugin.runtime.PluginAbi;
@@ -39,6 +40,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.file.Path;
@@ -49,10 +51,19 @@ import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RunnableFuture;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -211,7 +222,7 @@ public final class PluginHookDispatcherTest {
                 PluginExecutionMode.EMBEDDED,
                 authority,
                 session::issue,
-                (ownerPluginId, token, event, providerTimeout) -> {
+                (ownerPluginId, token, event, providerTimeout, cancellation) -> {
                     receivedEvent.set(event);
                     receivedTimeout.set(providerTimeout);
                     return PluginHookResult.cancel("runtime-policy", "Runtime Provider cancelled launch");
@@ -226,10 +237,13 @@ public final class PluginHookDispatcherTest {
                         PluginHookPoint.BEFORE_GAME_LAUNCH,
                         dataWithName("redacted"),
                         new NamePolicy(true)
-                ));
+        ));
 
         assertEquals(PluginHookDispatchException.Category.CANCELLED, failure.category());
-        assertEquals(timeout, receivedTimeout.get());
+        Duration remainingTimeout = receivedTimeout.get();
+        assertFalse(remainingTimeout.isZero());
+        assertFalse(remainingTimeout.isNegative());
+        assertTrue(remainingTimeout.compareTo(timeout) <= 0);
         assertEquals("redacted", receivedEvent.get().data().requireString("name"));
         assertThrows(SecurityException.class,
                 () -> receivedEvent.get().secrets().resolve("access-token"));
@@ -285,6 +299,109 @@ public final class PluginHookDispatcherTest {
             assertTrue(policy.committedNames().isEmpty());
         } finally {
             allowCallbackExit.countDown();
+        }
+    }
+
+    /// Revokes the exact dispatch token when a supervised Provider ignores timeout interruption.
+    ///
+    /// @throws Exception if lifecycle setup or callback coordination fails
+    @Test
+    public void revokeSupervisedTokenWhenIgnoredInterruptTimesOut() throws Exception {
+        AtomicBoolean allowCallbackExit = new AtomicBoolean();
+        CountDownLatch callbackStarted = new CountDownLatch(1);
+        CountDownLatch callbackFinished = new CountDownLatch(1);
+        AtomicReference<PluginCapabilityToken> receivedToken = new AtomicReference<>();
+        SupervisedRuntimeFixture fixture = new SupervisedRuntimeFixture(
+                "dev.test.supervised-token-timeout",
+                (handle, token, event, timeout) -> {
+                    receivedToken.set(token);
+                    callbackStarted.countDown();
+                    while (!allowCallbackExit.get()) {
+                        try {
+                            TimeUnit.MILLISECONDS.sleep(10);
+                        } catch (InterruptedException exception) {
+                            // Deliberately ignore cooperative cancellation to exercise fail-closed authority.
+                        }
+                    }
+                    callbackFinished.countDown();
+                    return replaceName("late-runtime-result");
+                }
+        );
+        try (fixture) {
+            AtomicInteger released = new AtomicInteger();
+            PluginHookDispatcher dispatcher = dispatcher(Duration.ofMillis(80), () -> List.of(
+                    subscriber(fixture.pluginId(), fixture.endpoint(), released)
+            ));
+            try {
+                PluginHookDispatchException failure = assertThrows(PluginHookDispatchException.class,
+                        () -> dispatcher.dispatchBefore(
+                                PluginHookPoint.BEFORE_GAME_LAUNCH,
+                                dataWithName("initial"),
+                                new NamePolicy(true)
+                        ));
+
+                assertTrue(callbackStarted.await(1, TimeUnit.SECONDS));
+                assertEquals(PluginHookDispatchException.Category.TIMEOUT, failure.category());
+                PluginCapabilityToken token = receivedToken.get();
+                assertThrows(SecurityException.class, () -> fixture.requireHookPermission(token));
+                assertEquals(0, released.get());
+            } finally {
+                allowCallbackExit.set(true);
+                assertTrue(callbackFinished.await(1, TimeUnit.SECONDS));
+            }
+        }
+    }
+
+    /// Bounds payload disablement after a timed-out supervised Provider ignores interruption.
+    ///
+    /// @throws Exception if lifecycle setup or callback coordination fails
+    @Test
+    public void boundPayloadDisableWhenTimedOutProviderIgnoresInterrupt() throws Exception {
+        AtomicBoolean allowCallbackExit = new AtomicBoolean();
+        CountDownLatch callbackStarted = new CountDownLatch(1);
+        SupervisedRuntimeFixture fixture = new SupervisedRuntimeFixture(
+                "dev.test.supervised-disable-timeout",
+                (handle, token, event, timeout) -> {
+                    callbackStarted.countDown();
+                    while (!allowCallbackExit.get()) {
+                        try {
+                            TimeUnit.MILLISECONDS.sleep(10);
+                        } catch (InterruptedException exception) {
+                            // Deliberately ignore cooperative cancellation until test cleanup.
+                        }
+                    }
+                    return PluginHookResult.unchanged();
+                }
+        );
+        ExecutorService lifecycleExecutor = daemonExecutor(1);
+        @Nullable Future<Void> disabling = null;
+        try {
+            try {
+                PluginHookDispatcher dispatcher = dispatcher(Duration.ofMillis(80), () -> List.of(
+                        subscriber(fixture.pluginId(), fixture.endpoint(), new AtomicInteger())
+                ));
+                PluginHookDispatchException failure = assertThrows(PluginHookDispatchException.class,
+                        () -> dispatcher.dispatchBefore(
+                                PluginHookPoint.BEFORE_GAME_LAUNCH,
+                                dataWithName("initial"),
+                                new NamePolicy(true)
+                        ));
+
+                assertTrue(callbackStarted.await(1, TimeUnit.SECONDS));
+                assertEquals(PluginHookDispatchException.Category.TIMEOUT, failure.category());
+                disabling = lifecycleExecutor.submit(() -> {
+                    fixture.disablePayload();
+                    return null;
+                });
+                disabling.get(1, TimeUnit.SECONDS);
+            } finally {
+                allowCallbackExit.set(true);
+                if (disabling != null) {
+                    disabling.get(2, TimeUnit.SECONDS);
+                }
+            }
+        } finally {
+            fixture.close();
         }
     }
 
@@ -469,6 +586,182 @@ public final class PluginHookDispatcherTest {
         }
     }
 
+    /// Cancels an exact prepared invocation and releases its lease when executor submission is rejected.
+    @Test
+    public void cancelPreparedInvocationWhenSubmissionRejected() {
+        ExecutorService executor = daemonExecutor(1);
+        executor.shutdownNow();
+        PreparedEndpointProbe endpoint = new PreparedEndpointProbe(
+                remainingTimeout -> PluginHookResult.unchanged());
+        AtomicInteger released = new AtomicInteger();
+        PluginHookDispatcher dispatcher = dispatcher(
+                executor,
+                Duration.ofSeconds(1),
+                () -> List.of(subscriber("dev.test.rejected", endpoint, released))
+        );
+
+        PluginHookDispatchException failure = assertThrows(
+                PluginHookDispatchException.class,
+                () -> dispatcher.dispatchBefore(
+                        PluginHookPoint.BEFORE_GAME_LAUNCH,
+                        dataWithName("initial"),
+                        new NamePolicy(true)
+                )
+        );
+
+        assertEquals(PluginHookDispatchException.Category.EXCEPTION, failure.category());
+        assertEquals(1, endpoint.preparedCount());
+        assertEquals(1, endpoint.cancelledCount());
+        assertEquals(0, endpoint.invokedCount());
+        assertEquals(1, released.get());
+    }
+
+    /// Cancels an exact prepared invocation after its endpoint throws and retains no callback lease.
+    @Test
+    public void cancelPreparedInvocationWhenEndpointFails() {
+        PreparedEndpointProbe endpoint = new PreparedEndpointProbe(remainingTimeout -> {
+            throw new IOException("private Provider failure");
+        });
+        AtomicInteger released = new AtomicInteger();
+        PluginHookDispatcher dispatcher = dispatcher(Duration.ofSeconds(1), () -> List.of(
+                subscriber("dev.test.prepared-failure", endpoint, released)
+        ));
+
+        PluginHookDispatchException failure = assertThrows(
+                PluginHookDispatchException.class,
+                () -> dispatcher.dispatchBefore(
+                        PluginHookPoint.BEFORE_GAME_LAUNCH,
+                        dataWithName("initial"),
+                        new NamePolicy(true)
+                )
+        );
+
+        assertEquals(PluginHookDispatchException.Category.EXCEPTION, failure.category());
+        assertEquals(1, endpoint.preparedCount());
+        assertEquals(1, endpoint.invokedCount());
+        assertEquals(1, endpoint.cancelledCount());
+        assertEquals(1, released.get());
+    }
+
+    /// Cancels an exact running invocation when the dispatch owner is interrupted.
+    ///
+    /// @throws Exception if callback coordination or bounded assertions fail
+    @Test
+    public void cancelPreparedInvocationWhenDispatcherInterrupted() throws Exception {
+        CountDownLatch callbackEntered = new CountDownLatch(1);
+        CountDownLatch callbackInterrupted = new CountDownLatch(1);
+        CountDownLatch releaseCallback = new CountDownLatch(1);
+        PreparedEndpointProbe endpoint = new PreparedEndpointProbe(remainingTimeout -> {
+            callbackEntered.countDown();
+            while (true) {
+                try {
+                    releaseCallback.await();
+                    return PluginHookResult.unchanged();
+                } catch (InterruptedException exception) {
+                    callbackInterrupted.countDown();
+                }
+            }
+        });
+        AtomicInteger released = new AtomicInteger();
+        PluginHookDispatcher dispatcher = dispatcher(Duration.ofSeconds(2), () -> List.of(
+                subscriber("dev.test.prepared-interrupted", endpoint, released)
+        ));
+        ExecutorService dispatchExecutor = daemonExecutor(1);
+        Future<PluginDataObject> dispatch = dispatchExecutor.submit(() -> dispatcher.dispatchBefore(
+                PluginHookPoint.BEFORE_GAME_LAUNCH,
+                dataWithName("initial"),
+                new NamePolicy(true)
+        ));
+        try {
+            assertTrue(callbackEntered.await(1, TimeUnit.SECONDS));
+
+            assertTrue(dispatch.cancel(true));
+            awaitValue(endpoint.cancelled, 1);
+            assertTrue(callbackInterrupted.await(1, TimeUnit.SECONDS));
+            assertEquals(0, released.get());
+        } finally {
+            releaseCallback.countDown();
+        }
+        awaitValue(released, 1);
+        assertEquals(1, endpoint.cancelledCount());
+    }
+
+    /// Passes only the unspent part of one absolute callback budget after executor queue delay.
+    ///
+    /// @throws Exception if queue coordination or bounded dispatch fails
+    @Test
+    public void passRemainingBudgetAfterQueueDelay() throws Exception {
+        ExecutorService callbackExecutor = daemonExecutor(1);
+        CountDownLatch blockerEntered = new CountDownLatch(1);
+        CountDownLatch releaseBlocker = new CountDownLatch(1);
+        callbackExecutor.submit(() -> {
+            blockerEntered.countDown();
+            try {
+                releaseBlocker.await();
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        assertTrue(blockerEntered.await(1, TimeUnit.SECONDS));
+        Duration configuredTimeout = Duration.ofSeconds(1);
+        PreparedEndpointProbe endpoint = new PreparedEndpointProbe(
+                remainingTimeout -> PluginHookResult.unchanged());
+        AtomicInteger released = new AtomicInteger();
+        PluginHookDispatcher dispatcher = dispatcher(
+                callbackExecutor,
+                configuredTimeout,
+                () -> List.of(subscriber("dev.test.remaining-budget", endpoint, released))
+        );
+        ExecutorService dispatchExecutor = daemonExecutor(1);
+        Future<PluginDataObject> dispatch = dispatchExecutor.submit(() -> dispatcher.dispatchBefore(
+                PluginHookPoint.BEFORE_GAME_LAUNCH,
+                dataWithName("initial"),
+                new NamePolicy(true)
+        ));
+        assertTrue(endpoint.awaitPrepared());
+        Thread.sleep(120);
+        releaseBlocker.countDown();
+
+        assertEquals("initial", dispatch.get(2, TimeUnit.SECONDS).requireString("name"));
+        Duration remainingTimeout = endpoint.remainingTimeout();
+        assertFalse(remainingTimeout.isZero());
+        assertFalse(remainingTimeout.isNegative());
+        assertTrue(remainingTimeout.compareTo(configuredTimeout.minusMillis(75)) < 0);
+        assertEquals(1, endpoint.invokedCount());
+        assertEquals(0, endpoint.cancelledCount());
+        assertEquals(1, released.get());
+    }
+
+    /// Categorizes worker-observed absolute deadline exhaustion as timeout without entering the endpoint.
+    @Test
+    public void categorizeWorkerDeadlineExhaustionAsTimeout() {
+        DeadlineRaceExecutor callbackExecutor = new DeadlineRaceExecutor();
+        executors.add(callbackExecutor);
+        PreparedEndpointProbe endpoint = new PreparedEndpointProbe(
+                remainingTimeout -> PluginHookResult.unchanged());
+        AtomicInteger released = new AtomicInteger();
+        PluginHookDispatcher dispatcher = dispatcher(
+                callbackExecutor,
+                Duration.ofMillis(40),
+                () -> List.of(subscriber("dev.test.worker-deadline", endpoint, released))
+        );
+
+        PluginHookDispatchException failure = assertThrows(
+                PluginHookDispatchException.class,
+                () -> dispatcher.dispatchBefore(
+                        PluginHookPoint.BEFORE_GAME_LAUNCH,
+                        dataWithName("initial"),
+                        new NamePolicy(true)
+                )
+        );
+
+        assertEquals(PluginHookDispatchException.Category.TIMEOUT, failure.category());
+        assertEquals(1, endpoint.preparedCount());
+        assertEquals(1, endpoint.cancelledCount());
+        assertEquals(0, endpoint.invokedCount());
+        assertEquals(1, released.get());
+    }
+
     /// Interrupts a timed-out callback, discards its late result, and retains its lease until it actually exits.
     ///
     /// @throws Exception if latch waits are interrupted
@@ -541,15 +834,13 @@ public final class PluginHookDispatcherTest {
             }
         });
         assertTrue(blockerStarted.await(1, TimeUnit.SECONDS));
-        AtomicBoolean endpointInvoked = new AtomicBoolean();
+        PreparedEndpointProbe endpoint = new PreparedEndpointProbe(
+                remainingTimeout -> PluginHookResult.unchanged());
         AtomicInteger released = new AtomicInteger();
         PluginHookDispatcher dispatcher = dispatcher(
                 executor,
                 Duration.ofMillis(60),
-                () -> List.of(subscriber("dev.test.queued", event -> {
-                    endpointInvoked.set(true);
-                    return PluginHookResult.unchanged();
-                }, released))
+                () -> List.of(subscriber("dev.test.queued", endpoint, released))
         );
 
         PluginHookDispatchException failure = assertThrows(PluginHookDispatchException.class,
@@ -560,9 +851,11 @@ public final class PluginHookDispatcherTest {
                 ));
 
         assertEquals(PluginHookDispatchException.Category.TIMEOUT, failure.category());
+        assertEquals(1, endpoint.preparedCount());
+        assertEquals(1, endpoint.cancelledCount());
+        assertEquals(0, endpoint.invokedCount());
         assertEquals(1, released.get());
         allowWorker.countDown();
-        assertFalse(endpointInvoked.get());
     }
 
     /// Rejects a zero callback timeout during dispatcher construction.
@@ -671,6 +964,193 @@ public final class PluginHookDispatcherTest {
             Thread.sleep(5);
         }
         assertEquals(expected, value.get());
+    }
+
+    /// Executor that deterministically lets a queued worker observe deadline exhaustion before timed `get()` returns.
+    @NotNullByDefault
+    private static final class DeadlineRaceExecutor extends ThreadPoolExecutor {
+        /// Gate opened when the dispatcher begins its timed Future wait.
+        private final CountDownLatch timedWaitStarted = new CountDownLatch(1);
+
+        /// Creates one daemon worker with an unbounded test-only queue.
+        private DeadlineRaceExecutor() {
+            super(
+                    1,
+                    1,
+                    0,
+                    TimeUnit.MILLISECONDS,
+                    new LinkedBlockingQueue<>(),
+                    runnable -> {
+                        Thread thread = new Thread(runnable, "plugin-hook-deadline-race-test");
+                        thread.setDaemon(true);
+                        return thread;
+                    }
+            );
+        }
+
+        /// Delays callback execution until after the dispatcher's short absolute budget has expired.
+        ///
+        /// @param command submitted Future task
+        @Override
+        public void execute(Runnable command) {
+            super.execute(() -> {
+                try {
+                    timedWaitStarted.await();
+                    Thread.sleep(100);
+                    command.run();
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+        }
+
+        /// Creates a Future whose timed wait exposes the worker's wrapped deadline marker deterministically.
+        ///
+        /// @param callable submitted callback
+        /// @return test Future task
+        /// @param <T> callback result type
+        @Override
+        protected <T> RunnableFuture<T> newTaskFor(Callable<T> callable) {
+            return new FutureTask<>(callable) {
+                /// Opens worker execution and waits with a larger harness bound than the dispatcher budget.
+                ///
+                /// @param timeout dispatcher wait budget, intentionally superseded by the harness bound
+                /// @param unit dispatcher wait unit
+                /// @return callback result
+                /// @throws InterruptedException if the test thread is interrupted
+                /// @throws ExecutionException if the worker reports deadline exhaustion
+                /// @throws TimeoutException if the worker fails to complete within the harness bound
+                @Override
+                public T get(long timeout, TimeUnit unit)
+                        throws InterruptedException, ExecutionException, TimeoutException {
+                    timedWaitStarted.countDown();
+                    return super.get(1, TimeUnit.SECONDS);
+                }
+            };
+        }
+    }
+
+    /// Observable exact prepared-invocation endpoint used by dispatcher cleanup tests.
+    @NotNullByDefault
+    private static final class PreparedEndpointProbe implements PluginHookEndpoint {
+        /// Callback behavior invoked after worker admission.
+        private final InvocationBehavior behavior;
+
+        /// Number of exact invocations prepared.
+        private final AtomicInteger prepared = new AtomicInteger();
+
+        /// Number of prepared invocations entered by a worker.
+        private final AtomicInteger invoked = new AtomicInteger();
+
+        /// Number of exact invocations whose cancellation won once.
+        private final AtomicInteger cancelled = new AtomicInteger();
+
+        /// Signal emitted after preparation completes.
+        private final CountDownLatch preparedSignal = new CountDownLatch(1);
+
+        /// Remaining absolute budget received by the worker, or `null` before invocation.
+        private final AtomicReference<@Nullable Duration> receivedTimeout = new AtomicReference<>();
+
+        /// Creates one prepared endpoint probe.
+        ///
+        /// @param behavior worker callback behavior
+        private PreparedEndpointProbe(InvocationBehavior behavior) {
+            this.behavior = behavior;
+        }
+
+        /// Rejects direct invocation because the dispatcher must use the preparation boundary.
+        ///
+        /// @param event immutable Hook event
+        /// @return never returns
+        @Override
+        public PluginHookResult invoke(PluginHookEvent event) {
+            throw new AssertionError("Dispatcher bypassed prepared invocation boundary");
+        }
+
+        /// Creates one independently cancellable invocation and signals preparation.
+        ///
+        /// @param event immutable Hook event
+        /// @return exact invocation probe
+        @Override
+        public Invocation prepareInvocation(PluginHookEvent event) {
+            prepared.incrementAndGet();
+            preparedSignal.countDown();
+            return new Invocation() {
+                /// Whether cancellation already won this exact invocation.
+                private final AtomicBoolean invocationCancelled = new AtomicBoolean();
+
+                /// Invokes test behavior with the dispatcher's remaining budget.
+                ///
+                /// @param remainingTimeout positive remaining dispatcher budget
+                /// @return configured callback result
+                /// @throws Exception if configured behavior fails
+                @Override
+                public @Nullable PluginHookResult invoke(Duration remainingTimeout) throws Exception {
+                    if (invocationCancelled.get()) {
+                        throw new CancellationException("Prepared test invocation was cancelled");
+                    }
+                    invoked.incrementAndGet();
+                    receivedTimeout.set(remainingTimeout);
+                    return behavior.invoke(remainingTimeout);
+                }
+
+                /// Records cancellation once for this exact invocation.
+                @Override
+                public void cancel() {
+                    if (invocationCancelled.compareAndSet(false, true)) {
+                        cancelled.incrementAndGet();
+                    }
+                }
+            };
+        }
+
+        /// Waits for preparation with a hard test bound.
+        ///
+        /// @return whether preparation completed
+        /// @throws InterruptedException if waiting is interrupted
+        private boolean awaitPrepared() throws InterruptedException {
+            return preparedSignal.await(1, TimeUnit.SECONDS);
+        }
+
+        /// Returns the preparation count.
+        ///
+        /// @return preparation count
+        private int preparedCount() {
+            return prepared.get();
+        }
+
+        /// Returns the worker invocation count.
+        ///
+        /// @return invocation count
+        private int invokedCount() {
+            return invoked.get();
+        }
+
+        /// Returns the exact cancellation count.
+        ///
+        /// @return cancellation count
+        private int cancelledCount() {
+            return cancelled.get();
+        }
+
+        /// Returns the remaining timeout observed by the callback.
+        ///
+        /// @return remaining absolute budget
+        private Duration remainingTimeout() {
+            return java.util.Objects.requireNonNull(receivedTimeout.get());
+        }
+    }
+
+    /// Callback behavior used by one prepared endpoint probe.
+    @FunctionalInterface
+    @NotNullByDefault
+    private interface InvocationBehavior {
+        /// Invokes test behavior with one remaining dispatcher budget.
+        ///
+        /// @param remainingTimeout positive remaining budget
+        /// @return callback result, or `null` to exercise malformed output
+        /// @throws Exception if configured endpoint behavior fails
+        @Nullable PluginHookResult invoke(Duration remainingTimeout) throws Exception;
     }
 
     /// Validates name-bearing callback data and records atomic candidate commits and after failures.
@@ -819,6 +1299,9 @@ public final class PluginHookDispatcherTest {
         /// Launcher-owned lifecycle owner.
         private final RuntimeSupervisor supervisor;
 
+        /// Launcher-owned capability authority shared by the payload session and endpoint.
+        private final PluginPermissionAuthority authority;
+
         /// Host-owned active registration.
         private final RuntimeProviderRegistration registration;
 
@@ -851,7 +1334,7 @@ public final class PluginHookDispatcherTest {
                     Set.of(RuntimeFeature.BRIDGE, RuntimeFeature.HOOKS),
                     null
             ));
-            PluginPermissionAuthority authority = new PluginPermissionAuthority();
+            authority = new PluginPermissionAuthority();
             RuntimePayloadContext context = new RuntimePayloadContext(
                     identity,
                     Path.of("build", "supervised-runtime", pluginId, "package"),
@@ -889,6 +1372,27 @@ public final class PluginHookDispatcherTest {
         /// @return Hook endpoint
         private RuntimeHookEndpoint endpoint() {
             return endpoint;
+        }
+
+        /// Disables the exact fixture payload through its Supervisor.
+        ///
+        /// @throws Exception if Provider disablement fails
+        private void disablePayload() throws Exception {
+            supervisor.disablePayload(handle);
+        }
+
+        /// Requires the Hook permission on one exact fixture token.
+        ///
+        /// @param token callback token to verify
+        private void requireHookPermission(PluginCapabilityToken token) {
+            authority.requirePermission(
+                    token,
+                    identity.getPluginId(),
+                    identity,
+                    PluginExecutionMode.EMBEDDED,
+                    PluginPermission.LAUNCHER_HOOK,
+                    "runtime.payload"
+            );
         }
 
         /// Disables and unloads the payload before closing its Provider registration.

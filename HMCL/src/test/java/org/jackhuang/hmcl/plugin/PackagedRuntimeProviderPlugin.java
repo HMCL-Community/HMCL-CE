@@ -85,6 +85,10 @@ public final class PackagedRuntimeProviderPlugin
     public static final String UNLOAD_CAPABILITY_CLOSED_PROPERTY =
             "hmcl.test.runtime-provider.unload-capability-closed";
 
+    /// Process property recording whether payload disable observed its capability session already suspended.
+    public static final String DISABLE_CAPABILITY_SUSPENDED_PROPERTY =
+            "hmcl.test.runtime-provider.disable-capability-suspended";
+
     /// Process property containing the identity hash of the TCCL observed by the latest Hook callback.
     public static final String HOOK_TCCL_PROPERTY = "hmcl.test.runtime-provider.hook-tccl";
 
@@ -224,7 +228,10 @@ public final class PackagedRuntimeProviderPlugin
     /// Records payload disablement.
     @Override
     public void disablePayload(RuntimePayloadHandle handle) {
-        requirePayloadCapabilityTokenSupplier().get();
+        System.setProperty(
+                DISABLE_CAPABILITY_SUSPENDED_PROPERTY,
+                Boolean.toString(!canIssuePayloadCapability())
+        );
         append("payload.disable");
     }
 

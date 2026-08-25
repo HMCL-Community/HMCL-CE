@@ -30,6 +30,8 @@ import org.jetbrains.annotations.Nullable;
 
 import java.time.Duration;
 import java.util.Objects;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
 /// Adapts one selected external Runtime Provider callback to the launcher's shared Hook dispatcher contract.
@@ -102,36 +104,195 @@ public final class RuntimeHookEndpoint implements PluginHookEndpoint {
     /// @throws Exception if authority verification, transport, or the external callback fails
     @Override
     public @Nullable PluginHookResult invoke(PluginHookEvent event, Duration timeout) throws Exception {
-        PluginHookEvent immutableEvent = Objects.requireNonNull(event, "event");
-        Duration callbackTimeout = requirePositiveTimeout(timeout);
-        @Nullable ProviderInvoker invoker = providerInvoker;
-        if (invoker == null) {
-            throw new PluginHookDispatchException(
-                    immutableEvent.point(),
-                    artifactIdentity.getPluginId(),
-                    PluginHookDispatchException.Category.MISSING_ENDPOINT
-            );
+        return prepareInvocation(event).invoke(requirePositiveTimeout(timeout));
+    }
+
+    /// Prepares one exact runtime callback whose dispatch token can be revoked before callback completion.
+    ///
+    /// @param event immutable Hook event
+    /// @return exact runtime callback invocation
+    @Override
+    public Invocation prepareInvocation(PluginHookEvent event) {
+        return new RuntimeInvocation(Objects.requireNonNull(event, "event"));
+    }
+
+    /// One exact runtime callback invocation and its independently revocable dispatch token.
+    @NotNullByDefault
+    private final class RuntimeInvocation implements Invocation, CancellationSignal {
+        /// Immutable event captured for this exact invocation.
+        private final PluginHookEvent event;
+
+        /// Current invocation lifecycle state.
+        private final AtomicReference<InvocationState> state = new AtomicReference<>(InvocationState.PREPARED);
+
+        /// Private monitor serializing token issuance, terminal-state selection, and exact revocation.
+        private final Object authorityLock = new Object();
+
+        /// Exact issued dispatch token, or `null` before issuance and after cleanup.
+        private final AtomicReference<@Nullable PluginCapabilityToken> token = new AtomicReference<>();
+
+        /// Supervisor cancellation action installed after exact callback admission, or `null` before admission.
+        private @Nullable Runnable cancellationAction;
+
+        /// Whether the installed Supervisor cancellation action was already selected for execution.
+        private boolean cancellationActionRun;
+
+        /// Creates one initially prepared runtime invocation.
+        ///
+        /// @param event immutable Hook event
+        private RuntimeInvocation(PluginHookEvent event) {
+            this.event = event;
         }
-        PluginCapabilityToken token = Objects.requireNonNull(
-                capabilityTokenSupplier.get(), "capabilityTokenSupplier result");
-        permissionAuthority.requirePermission(
-                token,
-                artifactIdentity.getPluginId(),
-                artifactIdentity,
-                executionMode,
-                PluginPermission.LAUNCHER_HOOK,
-                CALLBACK_DOMAIN
-        );
-        try {
-            return invoker.invokeHook(
-                    artifactIdentity.getPluginId(),
-                    token,
-                    immutableEvent,
-                    callbackTimeout
-            );
-        } finally {
-            permissionAuthority.revoke(token);
+
+        /// Issues, verifies, and invokes with only the dispatcher's remaining callback budget.
+        ///
+        /// @param remainingTimeout positive remaining dispatcher budget
+        /// @return Provider result, or `null` when the Provider violates its contract
+        /// @throws Exception if authority verification, transport, or the external callback fails
+        @Override
+        public @Nullable PluginHookResult invoke(Duration remainingTimeout) throws Exception {
+            Duration callbackTimeout = requirePositiveTimeout(remainingTimeout);
+            synchronized (authorityLock) {
+                if (!state.compareAndSet(InvocationState.PREPARED, InvocationState.RUNNING)) {
+                    throw cancelled();
+                }
+            }
+            try {
+                @Nullable ProviderInvoker invoker = providerInvoker;
+                if (invoker == null) {
+                    throw new PluginHookDispatchException(
+                            event.point(),
+                            artifactIdentity.getPluginId(),
+                            PluginHookDispatchException.Category.MISSING_ENDPOINT
+                    );
+                }
+                PluginCapabilityToken issuedToken;
+                synchronized (authorityLock) {
+                    requireRunning();
+                    issuedToken = Objects.requireNonNull(
+                            capabilityTokenSupplier.get(), "capabilityTokenSupplier result");
+                    token.set(issuedToken);
+                }
+                permissionAuthority.requirePermission(
+                        issuedToken,
+                        artifactIdentity.getPluginId(),
+                        artifactIdentity,
+                        executionMode,
+                        PluginPermission.LAUNCHER_HOOK,
+                        CALLBACK_DOMAIN
+                );
+                requireRunning();
+                @Nullable PluginHookResult result = invoker.invokeHook(
+                        artifactIdentity.getPluginId(),
+                        issuedToken,
+                        event,
+                        callbackTimeout,
+                        this
+                );
+                synchronized (authorityLock) {
+                    requireRunning();
+                    revokeTokenWhileLocked();
+                    state.set(InvocationState.COMPLETED);
+                }
+                return result;
+            } finally {
+                synchronized (authorityLock) {
+                    revokeTokenWhileLocked();
+                    state.compareAndSet(InvocationState.RUNNING, InvocationState.COMPLETED);
+                }
+            }
         }
+
+        /// Cancels this exact callback and immediately revokes its issued dispatch token.
+        @Override
+        public void cancel() {
+            synchronized (authorityLock) {
+                InvocationState current = state.get();
+                if (current == InvocationState.CANCELLED || current == InvocationState.COMPLETED) {
+                    return;
+                }
+                state.set(InvocationState.CANCELLED);
+                revokeTokenWhileLocked();
+            }
+            runCancellationActionIfReady();
+        }
+
+        /// Returns whether cancellation won this exact invocation.
+        ///
+        /// @return whether the invocation is cancelled
+        @Override
+        public boolean isCancelled() {
+            return state.get() == InvocationState.CANCELLED;
+        }
+
+        /// Installs the Supervisor action which cancels the exact admitted callback record.
+        ///
+        /// @param action exact callback cancellation action
+        @Override
+        public void onCancel(Runnable action) {
+            Objects.requireNonNull(action, "action");
+            synchronized (this) {
+                if (cancellationAction != null) {
+                    throw new IllegalStateException("Runtime Hook cancellation action is already installed");
+                }
+                cancellationAction = action;
+            }
+            runCancellationActionIfReady();
+        }
+
+        /// Revokes and clears the exact issued token while holding [authorityLock].
+        private void revokeTokenWhileLocked() {
+            @Nullable PluginCapabilityToken issuedToken = token.getAndSet(null);
+            if (issuedToken != null) {
+                permissionAuthority.revoke(issuedToken);
+            }
+        }
+
+        /// Selects and runs the installed Supervisor cancellation action at most once.
+        private void runCancellationActionIfReady() {
+            @Nullable Runnable action = null;
+            synchronized (this) {
+                if (!cancellationActionRun
+                        && state.get() == InvocationState.CANCELLED
+                        && cancellationAction != null) {
+                    cancellationActionRun = true;
+                    action = cancellationAction;
+                }
+            }
+            if (action != null) {
+                action.run();
+            }
+        }
+
+        /// Requires cancellation not to have won the current invocation race.
+        private void requireRunning() {
+            if (state.get() != InvocationState.RUNNING) {
+                throw cancelled();
+            }
+        }
+
+        /// Creates one stable cancellation failure without Provider-controlled details.
+        ///
+        /// @return cancellation failure
+        private CancellationException cancelled() {
+            return new CancellationException("Runtime Hook invocation was cancelled");
+        }
+    }
+
+    /// Lifecycle state for one exact runtime Hook invocation.
+    @NotNullByDefault
+    private enum InvocationState {
+        /// Invocation exists but has not entered the Provider path.
+        PREPARED,
+
+        /// Invocation issued authority and may be executing Provider code.
+        RUNNING,
+
+        /// Invocation completed or failed and released its authority.
+        COMPLETED,
+
+        /// Cancellation won and revoked invocation authority.
+        CANCELLED
     }
 
     /// Requires a positive timeout without changing its exact value.
@@ -156,13 +317,32 @@ public final class RuntimeHookEndpoint implements PluginHookEndpoint {
         /// @param token short-lived plugin-scoped capability token
         /// @param event immutable Hook event
         /// @param timeout positive dispatcher callback deadline
+        /// @param cancellation exact invocation cancellation signal
         /// @return external callback result, or `null` for malformed Provider output
         /// @throws Exception if the Provider transport or external callback fails
         @Nullable PluginHookResult invokeHook(
                 String ownerPluginId,
                 PluginCapabilityToken token,
                 PluginHookEvent event,
-                Duration timeout
+                Duration timeout,
+                CancellationSignal cancellation
         ) throws Exception;
+    }
+
+    /// Exact invocation cancellation boundary shared by the endpoint and Runtime Supervisor.
+    @NotNullByDefault
+    public interface CancellationSignal {
+        /// Cancels the invocation and synchronously revokes its dispatch authority.
+        void cancel();
+
+        /// Returns whether cancellation already won.
+        ///
+        /// @return whether the invocation is cancelled
+        boolean isCancelled();
+
+        /// Installs one idempotent Supervisor-owned callback cancellation action.
+        ///
+        /// @param action exact callback cancellation action
+        void onCancel(Runnable action);
     }
 }

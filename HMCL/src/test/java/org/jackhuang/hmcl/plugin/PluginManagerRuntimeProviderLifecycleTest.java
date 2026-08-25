@@ -296,6 +296,27 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
         }
     }
 
+    /// Suspends payload authority before the Provider begins its bounded disable callback.
+    ///
+    /// @param temporaryDirectory isolated launcher home
+    /// @throws Exception if package creation, discovery, lifecycle changes, or cleanup fails
+    @Test
+    public void suspendPayloadCapabilitiesBeforeDisableCallback(@TempDir Path temporaryDirectory) throws Exception {
+        Path localHome = temporaryDirectory.resolve("home");
+        RuntimeProviderRegistry registry = RuntimeProviderRegistry.processWide();
+        clearFixture(registry);
+        try {
+            PluginManager manager = loadEnabledPayload(localHome);
+
+            manager.disablePlugin(PAYLOAD_ID);
+
+            assertEquals("true", System.getProperty(
+                    PackagedRuntimeProviderPlugin.DISABLE_CAPABILITY_SUSPENDED_PROPERTY));
+        } finally {
+            clearFixture(registry);
+        }
+    }
+
     /// Suspends capability issuance when payload enablement fails after obtaining a token.
     ///
     /// @param temporaryDirectory isolated launcher home
@@ -1253,6 +1274,7 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
         System.clearProperty(PackagedRuntimeProviderPlugin.CHECK_PAYLOAD_CAPABILITY_PROPERTY);
         System.clearProperty(PackagedRuntimeProviderPlugin.PAYLOAD_CAPABILITY_AVAILABLE_PROPERTY);
         System.clearProperty(PackagedRuntimeProviderPlugin.UNLOAD_CAPABILITY_CLOSED_PROPERTY);
+        System.clearProperty(PackagedRuntimeProviderPlugin.DISABLE_CAPABILITY_SUSPENDED_PROPERTY);
         System.clearProperty(PackagedRuntimeProviderPlugin.HOOK_TCCL_PROPERTY);
         FXThreadTestSupport.runOnFxThread(
                 () -> PluginUIRegistry.unregisterAll(PackagedRuntimeProviderPlugin.PROVIDER_ID));

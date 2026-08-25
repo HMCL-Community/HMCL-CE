@@ -35,6 +35,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.lang.management.LockInfo;
@@ -44,15 +45,19 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -188,12 +193,12 @@ public final class RuntimeSupervisorTest {
         registration.close();
     }
 
-    /// Waits for an admitted Hook callback to exit before payload disablement reaches Provider code.
+    /// Cancels an admitted cooperative Hook callback before payload disablement reaches Provider code.
     ///
     /// @param temporaryDirectory isolated payload paths
     /// @throws Exception if callback coordination or lifecycle cleanup fails
     @Test
-    public void drainRunningHookBeforePayloadDisable(@TempDir Path temporaryDirectory) throws Exception {
+    public void cancelRunningHookBeforePayloadDisable(@TempDir Path temporaryDirectory) throws Exception {
         String payloadId = "dev.plugin.hook-drain";
         RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
         RuntimeSupervisor supervisor = new RuntimeSupervisor(registry);
@@ -221,12 +226,12 @@ public final class RuntimeSupervisorTest {
                 return null;
             });
 
-            assertFalse(disabling.isDone());
-            assertFalse(provider.events.contains("disable:" + payloadId));
-            releaseHook.countDown();
-            assertEquals(PluginHookResult.Action.UNCHANGED,
-                    hook.get(5, TimeUnit.SECONDS).action());
             disabling.get(5, TimeUnit.SECONDS);
+            ExecutionException failure = assertThrows(
+                    ExecutionException.class,
+                    () -> hook.get(5, TimeUnit.SECONDS)
+            );
+            assertTrue(failure.getCause() instanceof CancellationException);
             assertTrue(provider.events.indexOf("hook:" + payloadId)
                     < provider.events.indexOf("disable:" + payloadId));
         } finally {
@@ -234,6 +239,334 @@ public final class RuntimeSupervisorTest {
             executor.shutdownNow();
             supervisor.unloadPayload(handle);
             registration.close();
+        }
+    }
+
+    /// Allows a second payload callback through a shared Host while the first payload ignores interruption.
+    ///
+    /// @param temporaryDirectory isolated payload paths
+    /// @throws Exception if callback coordination or lifecycle cleanup fails
+    @Test
+    public void isolateSharedHostPayloadHooks(@TempDir Path temporaryDirectory) throws Exception {
+        String firstPayloadId = "dev.plugin.hook-shared-first";
+        String secondPayloadId = "dev.plugin.hook-shared-second";
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        RuntimeSupervisor supervisor = new RuntimeSupervisor(registry);
+        RecordingProvider provider = new RecordingProvider("dev.host.rust", true);
+        advanceToBootstrap(supervisor, "dev.host.rust");
+        RuntimeProviderRegistration registration = supervisor.register("dev.host.rust", provider);
+        supervisor.activate(registration);
+        registry.bind(firstPayloadId, requirement("rust"));
+        registry.bind(secondPayloadId, requirement("rust"));
+        RuntimePayloadHandle firstHandle = supervisor.loadPayload(
+                firstPayloadId, payloadContext(firstPayloadId, temporaryDirectory));
+        RuntimePayloadHandle secondHandle = supervisor.loadPayload(
+                secondPayloadId, payloadContext(secondPayloadId, temporaryDirectory));
+        supervisor.enablePayload(firstHandle);
+        supervisor.enablePayload(secondHandle);
+        CountDownLatch firstHookEntered = new CountDownLatch(1);
+        CountDownLatch releaseFirstHook = new CountDownLatch(1);
+        provider.blockHookIgnoringInterrupt(firstPayloadId, firstHookEntered, releaseFirstHook);
+        RuntimeHookEndpoint.ProviderInvoker firstInvoker = supervisor.hookInvoker(firstPayloadId);
+        RuntimeHookEndpoint.ProviderInvoker secondInvoker = supervisor.hookInvoker(secondPayloadId);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            TestCancellationSignal firstCancellation = new TestCancellationSignal(registration.lifecycleLock());
+            Future<@Nullable PluginHookResult> firstHook = executor.submit(() -> firstInvoker.invokeHook(
+                    firstPayloadId,
+                    capabilityToken(new PluginArtifactIdentity(firstPayloadId, "1.0.0", "a".repeat(64))),
+                    hookEvent(firstPayloadId),
+                    Duration.ofSeconds(1),
+                    firstCancellation
+            ));
+            assertTrue(firstHookEntered.await(5, TimeUnit.SECONDS));
+
+            PluginHookResult secondResult = secondInvoker.invokeHook(
+                    secondPayloadId,
+                    capabilityToken(new PluginArtifactIdentity(secondPayloadId, "1.0.0", "a".repeat(64))),
+                    hookEvent(secondPayloadId),
+                    Duration.ofSeconds(1),
+                    new TestCancellationSignal(registration.lifecycleLock())
+            );
+
+            assertEquals(PluginHookResult.Action.UNCHANGED, secondResult.action());
+            firstCancellation.cancel();
+            assertFalse(firstHook.isDone());
+            releaseFirstHook.countDown();
+            assertFutureCancelled(firstHook);
+        } finally {
+            releaseFirstHook.countDown();
+            executor.shutdownNow();
+            supervisor.unloadPayload(secondHandle);
+            supervisor.unloadPayload(firstHandle);
+            registration.close();
+        }
+    }
+
+    /// Bounds payload unload, revokes exact authority, and discards late Provider success or failure.
+    ///
+    /// @param failHook whether the detached Provider callback fails after its release
+    /// @param temporaryDirectory isolated payload paths
+    /// @throws Exception if callback coordination or lifecycle cleanup fails
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    public void discardLateHookCompletionAfterBoundedPayloadUnload(
+            boolean failHook,
+            @TempDir Path temporaryDirectory
+    ) throws Exception {
+        String payloadId = failHook
+                ? "dev.plugin.hook-unload-late-error"
+                : "dev.plugin.hook-unload-late-success";
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        RuntimeSupervisor supervisor = new RuntimeSupervisor(registry);
+        RecordingProvider provider = new RecordingProvider("dev.host.rust", true);
+        advanceToBootstrap(supervisor, "dev.host.rust");
+        RuntimeProviderRegistration registration = supervisor.register("dev.host.rust", provider);
+        supervisor.activate(registration);
+        registry.bind(payloadId, requirement("rust"));
+        RuntimePayloadHandle handle = supervisor.loadPayload(
+                payloadId, payloadContext(payloadId, temporaryDirectory));
+        supervisor.enablePayload(handle);
+        CountDownLatch hookEntered = new CountDownLatch(1);
+        CountDownLatch releaseHook = new CountDownLatch(1);
+        provider.blockHookIgnoringInterrupt(payloadId, hookEntered, releaseHook);
+        if (failHook) {
+            provider.failHookAfterRelease(payloadId);
+        }
+        PluginArtifactIdentity identity = new PluginArtifactIdentity(payloadId, "1.0.0", "a".repeat(64));
+        PluginPermissionAuthority authority = new PluginPermissionAuthority();
+        RuntimeHookEndpoint endpoint = hookEndpoint(supervisor, identity, authority);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<PluginHookResult> hook = executor.submit(() ->
+                    endpoint.invoke(hookEvent(payloadId), Duration.ofSeconds(2)));
+            assertTrue(hookEntered.await(5, TimeUnit.SECONDS));
+            Future<Void> unloading = executor.submit(() -> {
+                supervisor.unloadPayload(handle);
+                return null;
+            });
+
+            unloading.get(1, TimeUnit.SECONDS);
+            assertFalse(hook.isDone());
+            PluginCapabilityToken token = provider.hookToken(payloadId);
+            assertThrows(SecurityException.class, () -> authority.requirePermission(
+                    token,
+                    payloadId,
+                    identity,
+                    PluginExecutionMode.EMBEDDED,
+                    PluginPermission.LAUNCHER_HOOK,
+                    RuntimeHookEndpoint.CALLBACK_DOMAIN
+            ));
+            releaseHook.countDown();
+            assertFutureCancelled(hook);
+            assertThrows(SecurityException.class, () -> authority.requirePermission(
+                    token,
+                    payloadId,
+                    identity,
+                    PluginExecutionMode.EMBEDDED,
+                    PluginPermission.LAUNCHER_HOOK,
+                    RuntimeHookEndpoint.CALLBACK_DOMAIN
+            ));
+        } finally {
+            releaseHook.countDown();
+            executor.shutdownNow();
+            registration.close();
+        }
+    }
+
+    /// Cancels callback authority outside the Provider lifecycle monitor during bounded Host teardown.
+    ///
+    /// @param temporaryDirectory isolated payload paths
+    /// @throws Exception if callback coordination or lifecycle cleanup fails
+    @Test
+    public void cancelHookOutsideLifecycleMonitorDuringHostClose(@TempDir Path temporaryDirectory) throws Exception {
+        String payloadId = "dev.plugin.hook-host-close";
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        RuntimeSupervisor supervisor = new RuntimeSupervisor(registry);
+        RecordingProvider provider = new RecordingProvider("dev.host.rust", true);
+        advanceToBootstrap(supervisor, "dev.host.rust");
+        RuntimeProviderRegistration registration = supervisor.register("dev.host.rust", provider);
+        supervisor.activate(registration);
+        registry.bind(payloadId, requirement("rust"));
+        RuntimePayloadHandle handle = supervisor.loadPayload(
+                payloadId, payloadContext(payloadId, temporaryDirectory));
+        supervisor.enablePayload(handle);
+        CountDownLatch hookEntered = new CountDownLatch(1);
+        CountDownLatch releaseHook = new CountDownLatch(1);
+        provider.blockHookIgnoringInterrupt(payloadId, hookEntered, releaseHook);
+        TestCancellationSignal cancellation = new TestCancellationSignal(registration.lifecycleLock());
+        PluginArtifactIdentity identity = new PluginArtifactIdentity(payloadId, "1.0.0", "a".repeat(64));
+        RuntimeHookEndpoint.ProviderInvoker invoker = supervisor.hookInvoker(payloadId);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<@Nullable PluginHookResult> hook = executor.submit(() -> invoker.invokeHook(
+                    payloadId,
+                    capabilityToken(identity),
+                    hookEvent(payloadId),
+                    Duration.ofSeconds(1),
+                    cancellation
+            ));
+            assertTrue(hookEntered.await(5, TimeUnit.SECONDS));
+            Future<Void> closing = executor.submit(() -> {
+                registration.close();
+                return null;
+            });
+
+            closing.get(1, TimeUnit.SECONDS);
+            assertFalse(cancellation.cancelledWhileHoldingMonitor());
+            assertTrue(registration.isClosed());
+            assertFalse(hook.isDone());
+
+            RecordingProvider replacementProvider = new RecordingProvider("dev.host.rust", true);
+            advanceToBootstrap(supervisor, "dev.host.rust");
+            RuntimeProviderRegistration replacementRegistration =
+                    supervisor.register("dev.host.rust", replacementProvider);
+            supervisor.activate(replacementRegistration);
+            assertSame(replacementProvider, registry.findById("dev.host.rust").orElseThrow());
+
+            releaseHook.countDown();
+            assertFutureCancelled(hook);
+            replacementRegistration.close();
+        } finally {
+            releaseHook.countDown();
+            executor.shutdownNow();
+        }
+    }
+
+    /// Rejects a callback completion after Host close enters `STOPPING` but before payload cancellation can begin.
+    ///
+    /// @param temporaryDirectory isolated payload paths
+    /// @throws Exception if callback coordination or lifecycle cleanup fails
+    @Test
+    public void rejectHookCompletionAfterHostCloseStarts(@TempDir Path temporaryDirectory) throws Exception {
+        String payloadId = "dev.plugin.hook-close-started";
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        RuntimeSupervisor supervisor = new RuntimeSupervisor(registry);
+        RecordingProvider provider = new RecordingProvider("dev.host.rust", true);
+        advanceToBootstrap(supervisor, "dev.host.rust");
+        RuntimeProviderRegistration registration = supervisor.register("dev.host.rust", provider);
+        supervisor.activate(registration);
+        registry.bind(payloadId, requirement("rust"));
+        RuntimePayloadHandle handle = supervisor.loadPayload(
+                payloadId, payloadContext(payloadId, temporaryDirectory));
+        supervisor.enablePayload(handle);
+        CountDownLatch hookEntered = new CountDownLatch(1);
+        CountDownLatch releaseHook = new CountDownLatch(1);
+        provider.blockHook(hookEntered, releaseHook);
+        TestCancellationSignal cancellation = new TestCancellationSignal(registration.lifecycleLock());
+        PluginArtifactIdentity identity = new PluginArtifactIdentity(payloadId, "1.0.0", "a".repeat(64));
+        RuntimeHookEndpoint.ProviderInvoker invoker = supervisor.hookInvoker(payloadId);
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        FutureTask<Void> closing = new FutureTask<>(() -> {
+            registration.close();
+            return null;
+        });
+        Thread closingThread = new Thread(closing, "runtime-provider-close-test");
+        boolean closingStarted = false;
+        try {
+            Future<@Nullable PluginHookResult> hook = executor.submit(() -> invoker.invokeHook(
+                    payloadId,
+                    capabilityToken(identity),
+                    hookEvent(payloadId),
+                    Duration.ofSeconds(1),
+                    cancellation
+            ));
+            assertTrue(hookEntered.await(5, TimeUnit.SECONDS));
+            synchronized (registration.lifecycleLock()) {
+                closingThread.start();
+                closingStarted = true;
+                awaitBlockedOn(closingThread, registration.lifecycleLock());
+                assertEquals(RuntimeProviderState.STOPPING, supervisor.state("dev.host.rust").orElseThrow());
+
+                releaseHook.countDown();
+                assertFutureCancelled(hook);
+            }
+            closing.get(2, TimeUnit.SECONDS);
+        } finally {
+            releaseHook.countDown();
+            if (closingStarted) {
+                closing.get(2, TimeUnit.SECONDS);
+            } else {
+                registration.close();
+            }
+            executor.shutdownNow();
+        }
+    }
+
+    /// Cancels every shared-Host payload generation before spending one total registration drain budget.
+    ///
+    /// @param temporaryDirectory isolated payload paths
+    /// @throws Exception if callback coordination or bounded Host teardown fails
+    @Test
+    public void cancelAllSharedHostHooksBeforeRegistrationDrain(@TempDir Path temporaryDirectory) throws Exception {
+        String firstPayloadId = "dev.plugin.hook-close-first";
+        String secondPayloadId = "dev.plugin.hook-close-second";
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        RuntimeSupervisor supervisor = new RuntimeSupervisor(registry);
+        RecordingProvider provider = new RecordingProvider("dev.host.rust", true);
+        advanceToBootstrap(supervisor, "dev.host.rust");
+        RuntimeProviderRegistration registration = supervisor.register("dev.host.rust", provider);
+        supervisor.activate(registration);
+        registry.bind(firstPayloadId, requirement("rust"));
+        registry.bind(secondPayloadId, requirement("rust"));
+        RuntimePayloadHandle firstHandle = supervisor.loadPayload(
+                firstPayloadId, payloadContext(firstPayloadId, temporaryDirectory));
+        RuntimePayloadHandle secondHandle = supervisor.loadPayload(
+                secondPayloadId, payloadContext(secondPayloadId, temporaryDirectory));
+        supervisor.enablePayload(firstHandle);
+        supervisor.enablePayload(secondHandle);
+        CountDownLatch firstEntered = new CountDownLatch(1);
+        CountDownLatch secondEntered = new CountDownLatch(1);
+        CountDownLatch releaseFirst = new CountDownLatch(1);
+        CountDownLatch releaseSecond = new CountDownLatch(1);
+        provider.blockHookIgnoringInterrupt(firstPayloadId, firstEntered, releaseFirst);
+        provider.blockHookIgnoringInterrupt(secondPayloadId, secondEntered, releaseSecond);
+        TestCancellationSignal firstCancellation = new TestCancellationSignal(registration.lifecycleLock());
+        TestCancellationSignal secondCancellation = new TestCancellationSignal(registration.lifecycleLock());
+        ExecutorService executor = Executors.newFixedThreadPool(3);
+        @Nullable Future<Void> closing = null;
+        try {
+            Future<@Nullable PluginHookResult> firstHook = executor.submit(() ->
+                    supervisor.hookInvoker(firstPayloadId).invokeHook(
+                            firstPayloadId,
+                            capabilityToken(new PluginArtifactIdentity(
+                                    firstPayloadId, "1.0.0", "a".repeat(64))),
+                            hookEvent(firstPayloadId),
+                            Duration.ofSeconds(2),
+                            firstCancellation
+                    ));
+            Future<@Nullable PluginHookResult> secondHook = executor.submit(() ->
+                    supervisor.hookInvoker(secondPayloadId).invokeHook(
+                            secondPayloadId,
+                            capabilityToken(new PluginArtifactIdentity(
+                                    secondPayloadId, "1.0.0", "a".repeat(64))),
+                            hookEvent(secondPayloadId),
+                            Duration.ofSeconds(2),
+                            secondCancellation
+                    ));
+            assertTrue(firstEntered.await(1, TimeUnit.SECONDS));
+            assertTrue(secondEntered.await(1, TimeUnit.SECONDS));
+            closing = executor.submit(() -> {
+                registration.close();
+                return null;
+            });
+
+            assertTrue(secondCancellation.awaitCancelled());
+            assertTrue(firstCancellation.awaitCancelled());
+            closing.get(1, TimeUnit.SECONDS);
+            assertFalse(firstHook.isDone());
+            assertFalse(secondHook.isDone());
+            releaseFirst.countDown();
+            releaseSecond.countDown();
+            assertFutureCancelled(firstHook);
+            assertFutureCancelled(secondHook);
+        } finally {
+            releaseFirst.countDown();
+            releaseSecond.countDown();
+            if (closing != null) {
+                closing.get(2, TimeUnit.SECONDS);
+            }
+            executor.shutdownNow();
         }
     }
 
@@ -264,6 +597,47 @@ public final class RuntimeSupervisorTest {
         assertFalse(provider.events.contains("hook:" + payloadId));
 
         supervisor.unloadPayload(handle);
+        registration.close();
+    }
+
+    /// Reopens Hook admission when explicit enablement retries after Provider disablement fails.
+    ///
+    /// @param temporaryDirectory isolated payload paths
+    /// @throws Exception if fixture setup, recovery, or cleanup fails
+    @Test
+    public void reopenHookAdmissionAfterPayloadDisableFailure(@TempDir Path temporaryDirectory) throws Exception {
+        String payloadId = "dev.plugin.hook-disable-recovery";
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        RuntimeSupervisor supervisor = new RuntimeSupervisor(registry);
+        RecordingProvider provider = new RecordingProvider("dev.host.rust", true);
+        advanceToBootstrap(supervisor, "dev.host.rust");
+        RuntimeProviderRegistration registration = supervisor.register("dev.host.rust", provider);
+        supervisor.activate(registration);
+        registry.bind(payloadId, requirement("rust"));
+        RuntimePayloadHandle handle = supervisor.loadPayload(
+                payloadId, payloadContext(payloadId, temporaryDirectory));
+        supervisor.enablePayload(handle);
+        RuntimeHookEndpoint.ProviderInvoker invoker = supervisor.hookInvoker(payloadId);
+        TestCancellationSignal cancellation = new TestCancellationSignal(registration.lifecycleLock());
+        provider.failNextPayloadDisable = true;
+
+        assertThrows(IOException.class, () -> supervisor.disablePayload(handle));
+        assertThrows(IOException.class, () -> invoker.invokeHook(
+                payloadId,
+                capabilityToken(new PluginArtifactIdentity(payloadId, "1.0.0", "a".repeat(64))),
+                hookEvent(payloadId),
+                Duration.ofSeconds(1),
+                cancellation
+        ));
+
+        supervisor.enablePayload(handle);
+        assertEquals(PluginHookResult.Action.UNCHANGED, invoker.invokeHook(
+                payloadId,
+                capabilityToken(new PluginArtifactIdentity(payloadId, "1.0.0", "a".repeat(64))),
+                hookEvent(payloadId),
+                Duration.ofSeconds(1),
+                new TestCancellationSignal(registration.lifecycleLock())
+        ).action());
         registration.close();
     }
 
@@ -463,7 +837,7 @@ public final class RuntimeSupervisorTest {
         assertEquals(2, provider.events.stream().filter("close"::equals).count());
     }
 
-    /// Serializes a blocked payload load with registration close so the returned handle is tracked and released.
+    /// Fails a blocked payload load closed when registration close wins before handle publication.
     ///
     /// @param temporaryDirectory isolated payload paths
     /// @throws Exception if fixture setup, synchronization, or lifecycle completion fails
@@ -494,13 +868,70 @@ public final class RuntimeSupervisorTest {
             assertFalse(closeEntered.await(200, TimeUnit.MILLISECONDS));
             releaseLoad.countDown();
 
-            assertEquals("dev.plugin.loaded", loading.get(5, TimeUnit.SECONDS).ownerPluginId());
-            closing.get(5, TimeUnit.SECONDS);
+            ExecutionException loadingFailure = assertThrows(
+                    ExecutionException.class,
+                    () -> loading.get(5, TimeUnit.SECONDS)
+            );
+            assertTrue(loadingFailure.getCause() instanceof IOException);
+            assertTrue(Objects.requireNonNull(loadingFailure.getCause().getMessage()).contains("STOPPING"));
+            ExecutionException closeFailure = assertThrows(
+                    ExecutionException.class,
+                    () -> closing.get(5, TimeUnit.SECONDS)
+            );
+            assertTrue(closeFailure.getCause() instanceof IOException);
+            assertFalse(registration.isClosed());
+            registry.unbind("dev.plugin.loaded");
+            registration.close();
             assertTrue(registration.isClosed());
             assertEquals(1, provider.events.stream().filter("unload:dev.plugin.loaded"::equals).count());
             assertEquals(1, provider.events.stream().filter("close"::equals).count());
         } finally {
             releaseLoad.countDown();
+            executor.shutdownNow();
+        }
+    }
+
+    /// Closes a Provider only once when registration close races activation rollback.
+    ///
+    /// @throws Exception if activation or close coordination fails unexpectedly
+    @Test
+    public void avoidDuplicateProviderCloseDuringActivationRollback() throws Exception {
+        RuntimeProviderRegistry registry = new RuntimeProviderRegistry();
+        RuntimeSupervisor supervisor = new RuntimeSupervisor(registry);
+        RecordingProvider provider = new RecordingProvider("dev.host.rust", true);
+        CountDownLatch initializeEntered = new CountDownLatch(1);
+        CountDownLatch releaseInitialize = new CountDownLatch(1);
+        provider.blockInitialize(initializeEntered, releaseInitialize);
+        provider.rejectDuplicateClose = true;
+        advanceToBootstrap(supervisor, "dev.host.rust");
+        RuntimeProviderRegistration registration = supervisor.register("dev.host.rust", provider);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<Void> activating = executor.submit(() -> {
+                supervisor.activate(registration);
+                return null;
+            });
+            assertTrue(initializeEntered.await(5, TimeUnit.SECONDS));
+            Future<Void> closing = executor.submit(() -> {
+                registration.close();
+                return null;
+            });
+            awaitState(supervisor, "dev.host.rust", RuntimeProviderState.STOPPING);
+
+            releaseInitialize.countDown();
+            ExecutionException activationFailure = assertThrows(
+                    ExecutionException.class,
+                    () -> activating.get(5, TimeUnit.SECONDS)
+            );
+            assertTrue(activationFailure.getCause() instanceof IOException);
+            closing.get(5, TimeUnit.SECONDS);
+            assertEquals(1, provider.events.stream().filter("close"::equals).count());
+            assertTrue(registration.isClosed());
+            assertTrue(registry.findById("dev.host.rust").isEmpty());
+            assertEquals(RuntimeProviderState.FAILED, supervisor.state("dev.host.rust").orElseThrow());
+            assertThrows(IOException.class, () -> supervisor.activateOwnedRegistration("dev.host.rust"));
+        } finally {
+            releaseInitialize.countDown();
             executor.shutdownNow();
         }
     }
@@ -822,6 +1253,38 @@ public final class RuntimeSupervisorTest {
         }
     }
 
+    /// Requires one asynchronous Hook invocation to complete only with fail-closed cancellation.
+    ///
+    /// @param hook callback future
+    /// @throws Exception if waiting is interrupted or times out
+    private static void assertFutureCancelled(Future<?> hook) throws Exception {
+        ExecutionException failure = assertThrows(
+                ExecutionException.class,
+                () -> hook.get(5, TimeUnit.SECONDS)
+        );
+        assertTrue(failure.getCause() instanceof CancellationException);
+    }
+
+    /// Waits until one Provider reaches an exact lifecycle state.
+    ///
+    /// @param supervisor lifecycle owner
+    /// @param providerId canonical Provider ID
+    /// @param expected expected lifecycle state
+    /// @throws InterruptedException if polling is interrupted
+    private static void awaitState(
+            RuntimeSupervisor supervisor,
+            String providerId,
+            RuntimeProviderState expected
+    ) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (supervisor.state(providerId).orElseThrow() != expected) {
+            if (System.nanoTime() >= deadline) {
+                throw new AssertionError("Runtime Provider did not reach state " + expected + ": " + providerId);
+            }
+            Thread.sleep(10);
+        }
+    }
+
     /// Waits until one worker has completed its initial payload lookup and is blocked on an exact lifecycle monitor.
     ///
     /// @param thread payload mutation worker
@@ -882,6 +1345,91 @@ public final class RuntimeSupervisorTest {
                 case DISABLE -> "disable:dev.plugin.loaded";
                 case UNLOAD -> "unload:dev.plugin.loaded";
             };
+        }
+    }
+
+    /// Cancellation probe which detects forbidden authority callbacks under one lifecycle monitor.
+    @NotNullByDefault
+    private static final class TestCancellationSignal implements RuntimeHookEndpoint.CancellationSignal {
+        /// Provider lifecycle monitor which must not be held during cancellation.
+        private final Object forbiddenMonitor;
+
+        /// Supervisor action installed for the exact admitted callback, or `null` before admission.
+        private @Nullable Runnable action;
+
+        /// Whether cancellation already won.
+        private boolean cancelled;
+
+        /// Whether cancellation was invoked while holding the forbidden monitor.
+        private volatile boolean cancelledWhileHoldingMonitor;
+
+        /// Signal emitted when cancellation wins.
+        private final CountDownLatch cancelledSignal = new CountDownLatch(1);
+
+        /// Creates one cancellation lock-order probe.
+        ///
+        /// @param forbiddenMonitor monitor which cancellation must not hold
+        private TestCancellationSignal(Object forbiddenMonitor) {
+            this.forbiddenMonitor = forbiddenMonitor;
+        }
+
+        /// Cancels once and invokes the installed Supervisor action outside this probe's monitor.
+        @Override
+        public void cancel() {
+            @Nullable Runnable currentAction;
+            synchronized (this) {
+                if (cancelled) {
+                    return;
+                }
+                cancelled = true;
+                cancelledWhileHoldingMonitor = Thread.holdsLock(forbiddenMonitor);
+                currentAction = action;
+            }
+            cancelledSignal.countDown();
+            if (currentAction != null) {
+                currentAction.run();
+            }
+        }
+
+        /// Returns whether cancellation already won.
+        ///
+        /// @return whether this signal is cancelled
+        @Override
+        public synchronized boolean isCancelled() {
+            return cancelled;
+        }
+
+        /// Installs one exact Supervisor callback action and runs it immediately after earlier cancellation.
+        ///
+        /// @param action exact callback cancellation action
+        @Override
+        public void onCancel(Runnable action) {
+            boolean runNow;
+            synchronized (this) {
+                if (this.action != null) {
+                    throw new IllegalStateException("Cancellation action is already installed");
+                }
+                this.action = action;
+                runNow = cancelled;
+            }
+            if (runNow) {
+                action.run();
+            }
+        }
+
+        /// Returns whether cancellation crossed the forbidden lifecycle monitor.
+        ///
+        /// @return forbidden monitor observation
+        private boolean cancelledWhileHoldingMonitor() {
+            return cancelledWhileHoldingMonitor;
+        }
+
+        /// Waits for cancellation with a hard test bound.
+        ///
+        /// @return whether cancellation won before the bound
+        /// @throws InterruptedException if waiting is interrupted
+        private boolean awaitCancelled() throws InterruptedException {
+            return cancelledSignal.await(1, TimeUnit.SECONDS);
         }
     }
 
@@ -973,8 +1521,14 @@ public final class RuntimeSupervisorTest {
         /// Whether the next Provider close callback must fail before cleanup completes.
         private boolean failNextClose;
 
+        /// Whether a duplicate Provider close callback must fail as a non-idempotence probe.
+        private boolean rejectDuplicateClose;
+
         /// Whether the next payload enable callback must fail.
         private boolean failNextPayloadEnable;
+
+        /// Whether the next payload disable callback must fail.
+        private boolean failNextPayloadDisable;
 
         /// Whether the next load callback must return a handle owned by another plugin.
         private boolean returnWrongPayloadOwner;
@@ -984,6 +1538,12 @@ public final class RuntimeSupervisorTest {
 
         /// Optional gate which blocks payload loading until the test releases it.
         private @Nullable CountDownLatch releaseLoad;
+
+        /// Optional signal emitted when Provider initialization begins.
+        private @Nullable CountDownLatch initializeEntered;
+
+        /// Optional gate which blocks Provider initialization until the test releases it.
+        private @Nullable CountDownLatch releaseInitialize;
 
         /// Optional signal emitted when payload enablement enters the Provider callback.
         private @Nullable CountDownLatch enableEntered;
@@ -996,6 +1556,18 @@ public final class RuntimeSupervisorTest {
 
         /// Optional gate which blocks Hook invocation until the test releases it.
         private @Nullable CountDownLatch releaseHook;
+
+        /// Callback-entry signals keyed by payloads configured to ignore interruption.
+        private final Map<String, CountDownLatch> nonCooperativeHookEntered = new ConcurrentHashMap<>();
+
+        /// Callback-release gates keyed by payloads configured to ignore interruption.
+        private final Map<String, CountDownLatch> nonCooperativeHookRelease = new ConcurrentHashMap<>();
+
+        /// Payloads whose non-cooperative Hook must fail after its release gate opens.
+        private final Set<String> failingHooks = ConcurrentHashMap.newKeySet();
+
+        /// Exact callback tokens observed by payload owner.
+        private final Map<String, PluginCapabilityToken> hookTokens = new ConcurrentHashMap<>();
 
         /// Optional signal emitted when Provider shutdown enters the callback.
         private @Nullable CountDownLatch closeEntered;
@@ -1041,6 +1613,15 @@ public final class RuntimeSupervisorTest {
             releaseLoad = release;
         }
 
+        /// Configures Provider initialization to block between the supplied latches.
+        ///
+        /// @param entered signal emitted on callback entry
+        /// @param release gate allowing callback completion
+        private void blockInitialize(CountDownLatch entered, CountDownLatch release) {
+            initializeEntered = entered;
+            releaseInitialize = release;
+        }
+
         /// Configures the next payload enable callback to block between the supplied latches.
         ///
         /// @param entered signal emitted on callback entry
@@ -1059,6 +1640,35 @@ public final class RuntimeSupervisorTest {
             releaseHook = release;
         }
 
+        /// Configures one payload Hook to remain blocked when cooperative interruption arrives.
+        ///
+        /// @param ownerPluginId exact payload owner
+        /// @param entered signal emitted on callback entry
+        /// @param release gate allowing callback completion
+        private void blockHookIgnoringInterrupt(
+                String ownerPluginId,
+                CountDownLatch entered,
+                CountDownLatch release
+        ) {
+            nonCooperativeHookEntered.put(ownerPluginId, entered);
+            nonCooperativeHookRelease.put(ownerPluginId, release);
+        }
+
+        /// Configures one non-cooperative payload Hook to fail after its release gate opens.
+        ///
+        /// @param ownerPluginId exact payload owner
+        private void failHookAfterRelease(String ownerPluginId) {
+            failingHooks.add(ownerPluginId);
+        }
+
+        /// Returns the exact token observed by one payload Hook.
+        ///
+        /// @param ownerPluginId exact payload owner
+        /// @return callback token
+        private PluginCapabilityToken hookToken(String ownerPluginId) {
+            return Objects.requireNonNull(hookTokens.get(ownerPluginId));
+        }
+
         /// Returns the immutable fake descriptor.
         @Override
         public RuntimeProviderDescriptor descriptor() {
@@ -1067,8 +1677,9 @@ public final class RuntimeSupervisorTest {
 
         /// Records Provider initialization.
         @Override
-        public void initialize() {
+        public void initialize() throws IOException {
             events.add("initialize");
+            awaitCallback(initializeEntered, releaseInitialize);
         }
 
         /// Records and returns the configured health result.
@@ -1101,8 +1712,12 @@ public final class RuntimeSupervisorTest {
 
         /// Records payload disablement.
         @Override
-        public void disablePayload(RuntimePayloadHandle handle) {
+        public void disablePayload(RuntimePayloadHandle handle) throws IOException {
             events.add("disable:" + handle.ownerPluginId());
+            if (failNextPayloadDisable) {
+                failNextPayloadDisable = false;
+                throw new IOException("configured payload disable failure");
+            }
         }
 
         /// Records payload unloading.
@@ -1130,7 +1745,19 @@ public final class RuntimeSupervisorTest {
                 PluginHookEvent event,
                 Duration timeout
         ) throws IOException {
-            events.add("hook:" + handle.ownerPluginId());
+            String ownerPluginId = handle.ownerPluginId();
+            events.add("hook:" + ownerPluginId);
+            hookTokens.put(ownerPluginId, token);
+            @Nullable CountDownLatch nonCooperativeEntered = nonCooperativeHookEntered.get(ownerPluginId);
+            @Nullable CountDownLatch nonCooperativeRelease = nonCooperativeHookRelease.get(ownerPluginId);
+            if (nonCooperativeEntered != null && nonCooperativeRelease != null) {
+                nonCooperativeEntered.countDown();
+                awaitIgnoringInterrupt(nonCooperativeRelease);
+                if (failingHooks.contains(ownerPluginId)) {
+                    throw new IOException("configured late Hook failure");
+                }
+                return PluginHookResult.unchanged();
+            }
             awaitCallback(hookEntered, releaseHook);
             return PluginHookResult.unchanged();
         }
@@ -1138,6 +1765,9 @@ public final class RuntimeSupervisorTest {
         /// Records Provider shutdown.
         @Override
         public void close() throws IOException {
+            if (rejectDuplicateClose && events.contains("close")) {
+                throw new IOException("configured duplicate Provider close");
+            }
             events.add("close");
             @Nullable CountDownLatch entered = closeEntered;
             if (entered != null) {
@@ -1171,6 +1801,20 @@ public final class RuntimeSupervisorTest {
             } catch (InterruptedException exception) {
                 Thread.currentThread().interrupt();
                 throw new IOException("Interrupted while waiting to release Provider callback", exception);
+            }
+        }
+
+        /// Waits for a release gate while deliberately consuming cooperative interruption.
+        ///
+        /// @param release callback release gate
+        private static void awaitIgnoringInterrupt(CountDownLatch release) {
+            while (true) {
+                try {
+                    release.await();
+                    return;
+                } catch (InterruptedException exception) {
+                    // Deliberately remain in Provider code so bounded lifecycle detachment is exercised.
+                }
             }
         }
     }

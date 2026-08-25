@@ -1060,11 +1060,12 @@ public final class PluginManager {
                                         ClassLoader providerClassLoader =
                                                 providerContainer.getContext().getClassLoader();
                                         RuntimeHookEndpoint.ProviderInvoker selectedInvoker = supervisedInvoker;
-                                        providerInvoker = (ownerPluginId, token, event, timeout) -> runPluginCallback(
+                                        providerInvoker = (ownerPluginId, token, event, timeout, cancellation) ->
+                                                runPluginCallback(
                                                 providerClassLoader,
                                                 () -> selectedInvoker.invokeHook(
-                                                        ownerPluginId, token, event, timeout)
-                                        );
+                                                        ownerPluginId, token, event, timeout, cancellation)
+                                                );
                                     }
                                 }
                             }
@@ -1600,6 +1601,7 @@ public final class PluginManager {
             return;
         }
         if (container.isEnabled()) {
+            container.suspendCapabilitySession();
             try {
                 runPluginCallback(
                         container.getContext().getClassLoader(),
@@ -1609,7 +1611,6 @@ public final class PluginManager {
             } catch (RuntimeException | Error exception) {
                 LOG.error("Failed to disable plugin: " + pluginId, exception);
             } finally {
-                container.suspendCapabilitySession();
                 if (container.getManifest().getPluginKind() == PluginKind.RUNTIME_PROVIDER) {
                     runtimeSupervisor.hostDisabled(pluginId);
                 }

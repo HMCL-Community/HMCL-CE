@@ -72,9 +72,6 @@ final class PluginHookDispatcher {
     /// Per-subscriber wait limit expressed without conversion during dispatch.
     private final long timeoutNanos;
 
-    /// Exact per-subscriber deadline forwarded to Runtime Provider transports.
-    private final Duration timeout;
-
     /// Clock shared with policies that construct deterministic event envelopes and launch sessions.
     private final Clock clock;
 
@@ -103,15 +100,15 @@ final class PluginHookDispatcher {
             ExecutorService executor,
             Duration timeout,
             Clock clock,
-            SubscriberSource subscriberSource
+        SubscriberSource subscriberSource
     ) {
         this.executor = Objects.requireNonNull(executor, "executor");
-        this.timeout = Objects.requireNonNull(timeout, "timeout");
-        if (timeout.isZero() || timeout.isNegative()) {
+        Duration timeoutValue = Objects.requireNonNull(timeout, "timeout");
+        if (timeoutValue.isZero() || timeoutValue.isNegative()) {
             throw new IllegalArgumentException("Plugin Hook timeout must be positive");
         }
         try {
-            timeoutNanos = timeout.toNanos();
+            timeoutNanos = timeoutValue.toNanos();
         } catch (ArithmeticException exception) {
             throw new IllegalArgumentException("Plugin Hook timeout is too large", exception);
         }
@@ -286,9 +283,20 @@ final class PluginHookDispatcher {
             PluginHookSubscriber subscriber,
             PluginHookEvent event
     ) {
+        long startedAt = System.nanoTime();
         Object startGate = new Object();
         AtomicBoolean started = new AtomicBoolean();
         AtomicBoolean cancelledBeforeStart = new AtomicBoolean();
+        PluginHookEndpoint.Invocation invocation;
+        try {
+            invocation = Objects.requireNonNull(
+                    subscriber.endpoint().prepareInvocation(event),
+                    "Plugin Hook endpoint returned a null invocation"
+            );
+        } catch (RuntimeException | Error exception) {
+            subscriber.close();
+            throw failure(point, subscriber, PluginHookDispatchException.Category.EXCEPTION, exception);
+        }
         Future<@Nullable PluginHookResult> future;
         try {
             future = executor.submit(() -> {
@@ -299,32 +307,50 @@ final class PluginHookDispatcher {
                     started.set(true);
                 }
                 try {
-                    return subscriber.endpoint().invoke(event, timeout);
+                    long remainingNanos = remainingNanos(startedAt);
+                    if (remainingNanos <= 0) {
+                        invocation.cancel();
+                        throw new CallbackDeadlineExceededException(
+                                "Plugin Hook deadline elapsed before callback start");
+                    }
+                    return invocation.invoke(Duration.ofNanos(remainingNanos));
                 } finally {
                     subscriber.close();
                 }
             });
         } catch (RejectedExecutionException exception) {
+            invocation.cancel();
             subscriber.close();
             throw failure(point, subscriber, PluginHookDispatchException.Category.EXCEPTION, exception);
         }
 
         try {
-            return future.get(timeoutNanos, TimeUnit.NANOSECONDS);
+            long remainingNanos = remainingNanos(startedAt);
+            if (remainingNanos <= 0) {
+                throw new TimeoutException("Plugin Hook deadline elapsed before callback wait");
+            }
+            return future.get(remainingNanos, TimeUnit.NANOSECONDS);
         } catch (TimeoutException exception) {
+            invocation.cancel();
             future.cancel(true);
             releaseIfCancelledBeforeStart(subscriber, startGate, started, cancelledBeforeStart);
             throw failure(point, subscriber, PluginHookDispatchException.Category.TIMEOUT, exception);
         } catch (InterruptedException exception) {
+            invocation.cancel();
             future.cancel(true);
             releaseIfCancelledBeforeStart(subscriber, startGate, started, cancelledBeforeStart);
             Thread.currentThread().interrupt();
             throw failure(point, subscriber, PluginHookDispatchException.Category.EXCEPTION, exception);
         } catch (CancellationException exception) {
+            invocation.cancel();
             releaseIfCancelledBeforeStart(subscriber, startGate, started, cancelledBeforeStart);
             throw failure(point, subscriber, PluginHookDispatchException.Category.EXCEPTION, exception);
         } catch (ExecutionException exception) {
             @Nullable Throwable cause = exception.getCause();
+            if (cause instanceof CallbackDeadlineExceededException deadlineFailure) {
+                throw failure(point, subscriber, PluginHookDispatchException.Category.TIMEOUT, deadlineFailure);
+            }
+            invocation.cancel();
             if (cause instanceof PluginHookDispatchException dispatchFailure
                     && dispatchFailure.point() == point
                     && dispatchFailure.pluginId().equals(subscriber.pluginId())
@@ -332,6 +358,29 @@ final class PluginHookDispatcher {
                 throw dispatchFailure;
             }
             throw failure(point, subscriber, PluginHookDispatchException.Category.EXCEPTION, null);
+        }
+    }
+
+    /// Returns the unspent portion of one callback's original absolute dispatcher budget.
+    ///
+    /// @param startedAt monotonic start time captured before invocation preparation
+    /// @return remaining nanoseconds, clamped to zero
+    private long remainingNanos(long startedAt) {
+        long elapsedNanos = System.nanoTime() - startedAt;
+        if (elapsedNanos <= 0) {
+            return timeoutNanos;
+        }
+        return Math.max(0, timeoutNanos - elapsedNanos);
+    }
+
+    /// Internal worker marker distinguishing absolute deadline exhaustion from lifecycle cancellation.
+    @NotNullByDefault
+    private static final class CallbackDeadlineExceededException extends CancellationException {
+        /// Creates one stable deadline failure.
+        ///
+        /// @param message non-sensitive failure description
+        private CallbackDeadlineExceededException(String message) {
+            super(message);
         }
     }
 

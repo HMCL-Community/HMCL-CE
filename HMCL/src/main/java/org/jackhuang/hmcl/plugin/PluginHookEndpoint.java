@@ -21,6 +21,9 @@ import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
 
 import java.time.Duration;
+import java.util.Objects;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /// Invokes one runtime-neutral Hook endpoint through the immutable public event contract.
 @FunctionalInterface
@@ -44,5 +47,53 @@ public interface PluginHookEndpoint {
     /// @throws Exception if the endpoint transport or plugin callback fails
     default @Nullable PluginHookResult invoke(PluginHookEvent event, Duration timeout) throws Exception {
         return invoke(event);
+    }
+
+    /// Prepares one exact callback invocation before executor submission.
+    ///
+    /// The default wrapper preserves Java endpoint source and binary behavior while allowing the dispatcher to
+    /// cancel a queued invocation before its callback starts.
+    ///
+    /// @param event immutable Hook event
+    /// @return one exact prepared invocation
+    default Invocation prepareInvocation(PluginHookEvent event) {
+        PluginHookEvent immutableEvent = Objects.requireNonNull(event, "event");
+        return new Invocation() {
+            /// Whether cancellation won before or during invocation.
+            private final AtomicBoolean cancelled = new AtomicBoolean();
+
+            /// Invokes the existing endpoint unless cancellation already won.
+            ///
+            /// @param remainingTimeout positive remaining dispatcher budget
+            /// @return endpoint result
+            /// @throws Exception if the endpoint transport or callback fails
+            @Override
+            public @Nullable PluginHookResult invoke(Duration remainingTimeout) throws Exception {
+                if (cancelled.get()) {
+                    throw new CancellationException("Plugin Hook invocation was cancelled");
+                }
+                return PluginHookEndpoint.this.invoke(immutableEvent, remainingTimeout);
+            }
+
+            /// Prevents a queued default invocation from entering the endpoint.
+            @Override
+            public void cancel() {
+                cancelled.set(true);
+            }
+        };
+    }
+
+    /// One exact callback invocation prepared before dispatcher executor submission.
+    @NotNullByDefault
+    interface Invocation {
+        /// Invokes the endpoint with the remaining portion of the dispatcher's original callback budget.
+        ///
+        /// @param remainingTimeout positive remaining dispatcher budget
+        /// @return endpoint result, or `null` when a malformed endpoint violates the contract
+        /// @throws Exception if the endpoint transport or callback fails
+        @Nullable PluginHookResult invoke(Duration remainingTimeout) throws Exception;
+
+        /// Cancels this exact invocation and synchronously revokes any invocation-scoped authority.
+        void cancel();
     }
 }
