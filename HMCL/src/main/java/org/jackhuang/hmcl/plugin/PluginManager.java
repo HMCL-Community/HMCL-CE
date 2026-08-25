@@ -41,6 +41,8 @@ import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderDeclaration;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderRegistry;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeRequirement;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeSupervisor;
+import org.jackhuang.hmcl.plugin.protector.PluginRecoveryRecord;
+import org.jackhuang.hmcl.plugin.protector.PluginRecoveryStore;
 import org.jackhuang.hmcl.plugin.protector.StartupReporter;
 import org.jackhuang.hmcl.plugin.trust.PluginCertificationReceipt;
 import org.jackhuang.hmcl.plugin.trust.PluginCertificationReceiptStore;
@@ -95,6 +97,8 @@ public final class PluginManager {
     private final Path pluginStorageDirectory;
     /// Persisted desired enablement and pending-uninstall state store.
     private final PluginStateStore stateStore;
+    /// Strict startup recovery evidence store consumed only after durable quarantine publication.
+    private final PluginRecoveryStore recoveryStore;
     /// Proof-backed certified installation receipts changed in the same transaction as packages.
     private final PluginCertificationReceiptStore certificationReceiptStore;
     /// Dependent-scoped runtime Provider bindings changed atomically with package publication.
@@ -141,6 +145,10 @@ public final class PluginManager {
     private final Set<String> enabledStates = new HashSet<>();
     /// Plugin IDs whose files and data should be removed at the next startup.
     private final Set<String> pendingUninstall = new HashSet<>();
+    /// Installed plugin IDs retained but blocked from execution after startup recovery.
+    private final Set<String> quarantinedStates = new HashSet<>();
+    /// Persisted secret-free report from the latest consumed recovery record, or `null` when absent.
+    private volatile @Nullable PluginQuarantineReport quarantineReport;
     /// Reports exact provider and ordinary-plugin startup stages to the process Protector.
     private final BiConsumer<PluginKind, String> startupStageReporter;
     /// Creates the singleton manager and its storage directories.
@@ -247,6 +255,7 @@ public final class PluginManager {
         installationStateGuard = new PluginInstallationStateGuard(artifactResolver);
         dependencyPlanner = new PluginDependencyPlanner(packageRepository, runtimeBindingStore);
         stateStore = new PluginStateStore(localHome.resolve("plugin-states.json"), mutationLock);
+        recoveryStore = new PluginRecoveryStore(localHome);
         certificationReceiptStore = new PluginCertificationReceiptStore(localHome);
         packageMutationService = new PluginPackageMutationService(
                 localHome,
@@ -279,7 +288,7 @@ public final class PluginManager {
                 Metadata.VERSION,
                 runtimeTrustGuard
         );
-        stateStore.load(enabledStates, pendingUninstall);
+        quarantineReport = stateStore.load(enabledStates, pendingUninstall, quarantinedStates).orElse(null);
         loaders.put(PluginManifest.PluginType.JAVA, new JavaPluginLoader());
         loaders.put(PluginManifest.PluginType.KOTLIN, new JavaPluginLoader());
     }
@@ -302,9 +311,18 @@ public final class PluginManager {
         }
     }
 
-    /// Persists plugin state through the dedicated shared-lock state store.
-    private void saveStates() {
-        stateStore.save(enabledStates, pendingUninstall);
+    /// Strictly persists all plugin state, including the secret-free quarantine report.
+    ///
+    /// @throws IOException if the complete state snapshot cannot be published durably
+    private void saveStates() throws IOException {
+        stateStore.saveStrict(enabledStates, pendingUninstall, quarantinedStates, quarantineReport);
+    }
+
+    /// Strictly refreshes all persisted plugin state, including the secret-free quarantine report.
+    ///
+    /// @throws IOException if the state document is unreadable or malformed
+    private void loadStates() throws IOException {
+        quarantineReport = stateStore.loadStrict(enabledStates, pendingUninstall, quarantinedStates).orElse(null);
     }
 
     /// Recovers the package journal while excluding concurrent launcher mutations.
@@ -342,6 +360,12 @@ public final class PluginManager {
             LOG.error("Cannot discover plugins while batch-install recovery is incomplete");
             return;
         }
+        Optional<PluginRecoveryRecord> recoveryRecord = recoveryStore.load();
+        loadStates();
+        Map<String, PluginPackageCandidate> candidates = readCandidates(recoveryRecord.isPresent());
+        if (recoveryRecord.isPresent()) {
+            quarantineRecoveredPlugins(recoveryRecord.get(), candidates.keySet());
+        }
         try {
             permissionService.reload();
         } catch (IOException exception) {
@@ -349,8 +373,6 @@ public final class PluginManager {
             return;
         }
 
-        stateStore.load(enabledStates, pendingUninstall);
-        Map<String, PluginPackageCandidate> candidates = readCandidates();
         applyPendingUninstalls(candidates);
         reconcileLoadedContainers(candidates);
         try {
@@ -405,6 +427,43 @@ public final class PluginManager {
         LOG.info("Discovered " + plugins.size() + " plugin(s)");
     }
 
+    /// Durably quarantines every installed third-party package before publishing and consuming recovery evidence.
+    ///
+    /// Installed package, extracted configuration, and persistent data files are not opened for mutation or removed.
+    /// Pending removals for retained packages are cancelled so a later safe startup cannot delete quarantine evidence.
+    ///
+    /// @param recoveryRecord strict previous-startup recovery evidence
+    /// @param installedPluginIds manifest-only installed third-party IDs
+    /// @throws IOException if quarantine persistence or exact recovery-record removal fails
+    private void quarantineRecoveredPlugins(
+            PluginRecoveryRecord recoveryRecord,
+            Set<String> installedPluginIds
+    ) throws IOException {
+        Set<String> quarantinedForRecovery = installedPluginIds.stream()
+                .sorted()
+                .collect(Collectors.toCollection(java.util.LinkedHashSet::new));
+        Set<String> nextEnabledStates = new HashSet<>(enabledStates);
+        Set<String> nextPendingUninstall = new HashSet<>(pendingUninstall);
+        Set<String> nextQuarantinedStates = new HashSet<>(quarantinedStates);
+        nextEnabledStates.removeAll(quarantinedForRecovery);
+        nextPendingUninstall.removeAll(quarantinedForRecovery);
+        nextQuarantinedStates.addAll(quarantinedForRecovery);
+        PluginQuarantineReport nextReport = PluginQuarantineReport.fromRecovery(
+                recoveryRecord,
+                Set.copyOf(quarantinedForRecovery)
+        );
+
+        stateStore.saveStrict(nextEnabledStates, nextPendingUninstall, nextQuarantinedStates, nextReport);
+        enabledStates.clear();
+        enabledStates.addAll(nextEnabledStates);
+        pendingUninstall.clear();
+        pendingUninstall.addAll(nextPendingUninstall);
+        quarantinedStates.clear();
+        quarantinedStates.addAll(nextQuarantinedStates);
+        quarantineReport = nextReport;
+        recoveryStore.clear();
+    }
+
     /// Returns whether compatibility must wait for a persisted external Provider binding to start.
     ///
     /// @param manifest candidate manifest
@@ -448,10 +507,12 @@ public final class PluginManager {
         }
     }
 
-    /// Reads and validates every package manifest, rejecting duplicate IDs deterministically.
+    /// Reads and validates every package manifest, rejecting unsafe recovery enumeration deterministically.
+    ///
+    /// @param failClosed whether any malformed package or duplicate ID must abort enumeration
     /// @return package candidates indexed by ID
-    /// @throws IOException if the plugin directory cannot be listed
-    private Map<String, PluginPackageCandidate> readCandidates() throws IOException {
+    /// @throws IOException if the plugin directory cannot be listed or strict enumeration is incomplete
+    private Map<String, PluginPackageCandidate> readCandidates(boolean failClosed) throws IOException {
         Map<String, PluginPackageCandidate> candidates = new LinkedHashMap<>();
         try (Stream<Path> files = Files.list(pluginsDirectory)) {
             for (Path nplFile : files
@@ -474,12 +535,23 @@ public final class PluginManager {
                             )
                     );
                     if (previous != null) {
+                        if (failClosed) {
+                            throw new IOException("Duplicate installed plugin ID during recovery: "
+                                    + manifest.getId());
+                        }
                         LOG.error("Duplicate plugin ID " + manifest.getId() + " in "
                                 + previous.nplFile.getFileName() + " and " + nplFile.getFileName());
                     } else {
                         runtimeState.remember(identity);
                     }
                 } catch (IOException | RuntimeException exception) {
+                    if (failClosed) {
+                        throw new IOException(
+                                "Cannot enumerate installed plugin package during recovery: "
+                                        + nplFile.getFileName(),
+                                exception
+                        );
+                    }
                     LOG.error("Invalid plugin package: " + nplFile.getFileName(), exception);
                 }
             }
@@ -509,8 +581,10 @@ public final class PluginManager {
             try {
                 Set<String> nextEnabledStates = new HashSet<>(enabledStates);
                 Set<String> nextPendingUninstall = new HashSet<>(pendingUninstall);
+                Set<String> nextQuarantinedStates = new HashSet<>(quarantinedStates);
                 nextEnabledStates.remove(pluginId);
                 nextPendingUninstall.remove(pluginId);
+                nextQuarantinedStates.remove(pluginId);
                 @Unmodifiable List<Path> installedPackages = packageRepository.findInstalledPackages(pluginId);
                 packageMutationService.publishRemoval(
                         installedPackages,
@@ -519,11 +593,16 @@ public final class PluginManager {
                             permissionService.removePlugin(pluginId);
                             certificationReceiptStore.removePlugin(pluginId);
                             runtimeBindingStore.removeDependentsStrict(Set.of(pluginId));
-                            stateStore.saveStrict(nextEnabledStates, nextPendingUninstall);
+                            stateStore.saveStrict(
+                                    nextEnabledStates,
+                                    nextPendingUninstall,
+                                    nextQuarantinedStates,
+                                    quarantineReport
+                            );
                         },
                         () -> {
                             permissionService.reload();
-                            stateStore.load(enabledStates, pendingUninstall);
+                            loadStates();
                         }
                 );
 
@@ -531,6 +610,8 @@ public final class PluginManager {
                 enabledStates.addAll(nextEnabledStates);
                 pendingUninstall.clear();
                 pendingUninstall.addAll(nextPendingUninstall);
+                quarantinedStates.clear();
+                quarantinedStates.addAll(nextQuarantinedStates);
                 candidates.remove(pluginId);
                 clearArtifactState(pluginId);
                 LOG.info("Uninstalled plugin marked for removal: " + pluginId);
@@ -1367,9 +1448,19 @@ public final class PluginManager {
         administrativeGuard.checkTrustedCaller();
         try {
             return mutationLock.call(() -> {
-                stateStore.load(enabledStates, pendingUninstall);
+                loadStates();
                 @Unmodifiable Map<String, PluginManifest> installedManifests =
                         packageRepository.readInstalledManifests(plugins);
+                @Unmodifiable Map<String, RuntimeProviderBinding> runtimeBindings = runtimeBindingStore.readStrict();
+                if (enablementClosureIntersectsQuarantine(
+                        pluginId,
+                        installedManifests,
+                        runtimeBindings,
+                        new HashSet<>()
+                )) {
+                    LOG.warning("Cannot enable quarantined plugin closure without explicit restoration: " + pluginId);
+                    return false;
+                }
                 @Nullable PluginManifest requestedManifest = installedManifests.get(pluginId);
                 if (requestedManifest != null) {
                     PluginCompatibilityResult compatibility = evaluateCompatibility(requestedManifest);
@@ -1396,7 +1487,7 @@ public final class PluginManager {
                 recordEnableIntent(
                         pluginId,
                         installedManifests,
-                        runtimeBindingStore.readStrict(),
+                        runtimeBindings,
                         new HashSet<>()
                 );
                 boolean enabled = enablePlugin(pluginId, new HashSet<>());
@@ -1407,6 +1498,43 @@ public final class PluginManager {
             LOG.warning("Cannot persist plugin enablement for " + pluginId, exception);
             return false;
         }
+    }
+
+    /// Returns whether one requested enablement closure contains a recovery-quarantined plugin.
+    ///
+    /// @param pluginId closure root
+    /// @param installedManifests immutable installed manifests indexed by ID
+    /// @param runtimeBindings immutable runtime bindings indexed by dependent ID
+    /// @param visited IDs already inspected
+    /// @return whether explicit quarantine restoration is required
+    private boolean enablementClosureIntersectsQuarantine(
+            String pluginId,
+            @Unmodifiable Map<String, PluginManifest> installedManifests,
+            @Unmodifiable Map<String, RuntimeProviderBinding> runtimeBindings,
+            Set<String> visited
+    ) {
+        if (!visited.add(pluginId)) {
+            return false;
+        }
+        if (quarantinedStates.contains(pluginId)) {
+            return true;
+        }
+        @Nullable RuntimeProviderBinding runtimeBinding = runtimeBindings.get(pluginId);
+        if (runtimeBinding != null && enablementClosureIntersectsQuarantine(
+                runtimeBinding.providerId(), installedManifests, runtimeBindings, visited)) {
+            return true;
+        }
+        @Nullable PluginManifest manifest = installedManifests.get(pluginId);
+        if (manifest == null) {
+            return false;
+        }
+        for (PluginDependency dependency : manifest.getPluginDependencies()) {
+            if (enablementClosureIntersectsQuarantine(
+                    dependency.getId(), installedManifests, runtimeBindings, visited)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /// Records desired enablement for one installed plugin and its executable dependency closure.
@@ -1615,7 +1743,7 @@ public final class PluginManager {
     public void disablePlugin(String pluginId) throws IOException {
         administrativeGuard.checkTrustedCaller();
         mutationLock.run(() -> {
-            stateStore.load(enabledStates, pendingUninstall);
+            loadStates();
             @Unmodifiable List<String> enabledRuntimeDependents =
                     dependencyPlanner.findEnabledRuntimeDependents(pluginId, Set.copyOf(enabledStates));
             if (!enabledRuntimeDependents.isEmpty()) {
@@ -1635,7 +1763,7 @@ public final class PluginManager {
     public void disablePluginCascade(String pluginId) throws IOException {
         administrativeGuard.checkTrustedCaller();
         mutationLock.run(() -> {
-            stateStore.load(enabledStates, pendingUninstall);
+            loadStates();
             disablePluginLocked(pluginId);
         });
     }
@@ -1726,7 +1854,7 @@ public final class PluginManager {
         administrativeGuard.checkTrustedCaller();
         try {
             mutationLock.run(() -> {
-                stateStore.load(enabledStates, pendingUninstall);
+                loadStates();
                 unloadPluginLocked(pluginId);
             });
         } catch (IOException exception) {
@@ -1927,7 +2055,7 @@ public final class PluginManager {
             String pluginId,
             Set<PluginPermission> grantedPermissions
     ) throws IOException {
-        stateStore.load(enabledStates, pendingUninstall);
+        loadStates();
         Objects.requireNonNull(grantedPermissions, "Granted permissions");
         @Nullable PluginPermissionService.ResolvedArtifact published =
                 artifactResolver.findCurrentPermissionArtifact(pluginId);
@@ -2142,7 +2270,7 @@ public final class PluginManager {
     /// @throws IOException if package, state, permission, manifest, or digest inspection fails
     public PluginInstallationPlanningSnapshot getInstallationPlanningSnapshot() throws IOException {
         return mutationLock.call(() -> {
-            stateStore.load(enabledStates, pendingUninstall);
+            loadStates();
             @Unmodifiable Map<String, PluginManifest> manifests = Map.copyOf(
                     dependencyPlanner.readInstallPlanningManifests(plugins, pendingUninstall)
             );
@@ -2218,7 +2346,7 @@ public final class PluginManager {
     ) throws IOException {
         @Unmodifiable Map<String, PluginManifest> snapshot = Map.copyOf(installedManifests);
         return mutationLock.call(() -> {
-            stateStore.load(enabledStates, pendingUninstall);
+            loadStates();
             Map<String, PluginArtifactIdentity> reusable = new LinkedHashMap<>();
             for (Map.Entry<String, PluginManifest> entry : snapshot.entrySet()) {
                 if (pendingUninstall.contains(entry.getKey())) {
@@ -2526,7 +2654,7 @@ public final class PluginManager {
             PluginRuntimeInstallAuthorization runtimeAuthorization
     ) throws IOException {
         runtimeAuthorization.requireAcknowledgements();
-        stateStore.load(enabledStates, pendingUninstall);
+        loadStates();
         if (inspections.isEmpty()) {
             if (!grantsByPluginId.isEmpty()
                     || !expectedReusableArtifacts.isEmpty()
@@ -2626,6 +2754,7 @@ public final class PluginManager {
         nextEnabledStates.addAll(plannedDependencyIds);
         nextEnabledStates.addAll(runtimeAuthorization.getEnablementPluginIds());
         Set<String> nextPendingUninstall = new HashSet<>(pendingUninstall);
+        Set<String> nextQuarantinedStates = new HashSet<>(quarantinedStates);
         for (String pluginId : replacements.keySet()) {
             if (!installedBefore.containsKey(pluginId)) {
                 nextEnabledStates.add(pluginId);
@@ -2647,7 +2776,8 @@ public final class PluginManager {
                 expectedPriorArtifacts,
                 runtimeBindingStore.readStrict(),
                 Set.copyOf(enabledStates),
-                Set.copyOf(pendingUninstall)
+                Set.copyOf(pendingUninstall),
+                Set.copyOf(quarantinedStates)
         );
         // Runtime providers are live process state, so close the planning-to-publication compatibility window.
         for (PluginManifest replacement : replacements.values()) {
@@ -2671,12 +2801,18 @@ public final class PluginManager {
                     );
                     runtimeBindingStore.replaceStrict(prospectiveRuntimeBindings);
                 },
-                () -> stateStore.saveStrict(nextEnabledStates, nextPendingUninstall),
+                () -> stateStore.saveStrict(
+                        nextEnabledStates,
+                        nextPendingUninstall,
+                        nextQuarantinedStates,
+                        quarantineReport
+                ),
                 () -> activateLiveRuntimeProviderReplacements(
                         liveSwapSession,
                         inspectionsById,
                         nextEnabledStates,
-                        nextPendingUninstall
+                        nextPendingUninstall,
+                        nextQuarantinedStates
                 ),
                 () -> {
                     permissionService.reload();
@@ -2688,6 +2824,8 @@ public final class PluginManager {
         enabledStates.addAll(nextEnabledStates);
         pendingUninstall.clear();
         pendingUninstall.addAll(nextPendingUninstall);
+        quarantinedStates.clear();
+        quarantinedStates.addAll(nextQuarantinedStates);
         for (Map.Entry<String, PluginManifest> replacement : replacements.entrySet()) {
             String pluginId = replacement.getKey();
             LocalPluginInspection inspection = Objects.requireNonNull(inspectionsById.get(pluginId));
@@ -2733,6 +2871,7 @@ public final class PluginManager {
     /// @param runtimeBindings immutable live dependent-to-Provider bindings before publication
     /// @param originalEnabledStates immutable desired enablement before publication
     /// @param originalPendingUninstall immutable pending removals before publication
+    /// @param originalQuarantinedStates immutable recovery quarantine before publication
     /// @return mutable transaction-local swap session containing immutable lifecycle snapshots
     /// @throws IOException if two replaced Host graphs overlap
     private LiveRuntimeProviderSwapSession captureLiveRuntimeProviderSwapSession(
@@ -2741,7 +2880,8 @@ public final class PluginManager {
             @Unmodifiable Map<String, Optional<PluginArtifactIdentity>> expectedPriorArtifacts,
             @Unmodifiable Map<String, RuntimeProviderBinding> runtimeBindings,
             @Unmodifiable Set<String> originalEnabledStates,
-            @Unmodifiable Set<String> originalPendingUninstall
+            @Unmodifiable Set<String> originalPendingUninstall,
+            @Unmodifiable Set<String> originalQuarantinedStates
     ) throws IOException {
         Map<String, PluginContainer> loadedById = new LinkedHashMap<>();
         stateLock.readLock().lock();
@@ -2797,7 +2937,8 @@ public final class PluginManager {
         return new LiveRuntimeProviderSwapSession(
                 List.copyOf(swaps),
                 Set.copyOf(originalEnabledStates),
-                Set.copyOf(originalPendingUninstall)
+                Set.copyOf(originalPendingUninstall),
+                Set.copyOf(originalQuarantinedStates)
         );
     }
 
@@ -2871,12 +3012,14 @@ public final class PluginManager {
     /// @param inspections immutable replacement inspections indexed by plugin ID
     /// @param nextEnabledStates immutable desired enablement after publication
     /// @param nextPendingUninstall immutable pending removals after publication
+    /// @param nextQuarantinedStates immutable recovery quarantine after publication
     /// @throws IOException if teardown, canonical loading, activation, health, or dependent restoration fails
     private void activateLiveRuntimeProviderReplacements(
             LiveRuntimeProviderSwapSession session,
             @Unmodifiable Map<String, LocalPluginInspection> inspections,
             @Unmodifiable Set<String> nextEnabledStates,
-            @Unmodifiable Set<String> nextPendingUninstall
+            @Unmodifiable Set<String> nextPendingUninstall,
+            @Unmodifiable Set<String> nextQuarantinedStates
     ) throws IOException {
         if (session.swaps().isEmpty()) {
             return;
@@ -2885,11 +3028,11 @@ public final class PluginManager {
             session.markStarted(swap.provider().identity().getPluginId());
             unloadLiveRuntimeGraph(swap);
         }
-        replaceDesiredState(nextEnabledStates, nextPendingUninstall);
+        replaceDesiredState(nextEnabledStates, nextPendingUninstall, nextQuarantinedStates);
         for (LiveRuntimeProviderSwap swap : session.swaps()) {
             loadLiveRuntimeGraph(swap, inspections, nextEnabledStates, true);
         }
-        replaceDesiredState(nextEnabledStates, nextPendingUninstall);
+        replaceDesiredState(nextEnabledStates, nextPendingUninstall, nextQuarantinedStates);
     }
 
     /// Restores each started old Host graph after the journal has restored packages and documents.
@@ -2915,11 +3058,19 @@ public final class PluginManager {
         }
         if (failure == null) {
             try {
-                replaceDesiredState(session.originalEnabledStates(), session.originalPendingUninstall());
+                replaceDesiredState(
+                        session.originalEnabledStates(),
+                        session.originalPendingUninstall(),
+                        session.originalQuarantinedStates()
+                );
                 for (LiveRuntimeProviderSwap swap : started) {
                     loadLiveRuntimeGraph(swap, Map.of(), session.originalEnabledStates(), false);
                 }
-                replaceDesiredState(session.originalEnabledStates(), session.originalPendingUninstall());
+                replaceDesiredState(
+                        session.originalEnabledStates(),
+                        session.originalPendingUninstall(),
+                        session.originalQuarantinedStates()
+                );
                 return;
             } catch (IOException | RuntimeException exception) {
                 failure = new IOException("Failed to restore the previous live runtime Provider graph", exception);
@@ -2943,7 +3094,11 @@ public final class PluginManager {
             swap.dependents().forEach(dependent -> disabled.remove(dependent.identity().getPluginId()));
         }
         try {
-            replaceDesiredState(Set.copyOf(disabled), session.originalPendingUninstall());
+            replaceDesiredState(
+                    Set.copyOf(disabled),
+                    session.originalPendingUninstall(),
+                    session.originalQuarantinedStates()
+            );
         } catch (IOException stateFailure) {
             Objects.requireNonNull(failure).addSuppressed(stateFailure);
         }
@@ -3101,16 +3256,20 @@ public final class PluginManager {
     ///
     /// @param desiredEnabledStates immutable enabled plugin IDs
     /// @param desiredPendingUninstall immutable pending removal IDs
+    /// @param desiredQuarantinedStates immutable recovery quarantine IDs
     /// @throws IOException if strict state persistence fails
     private void replaceDesiredState(
             @Unmodifiable Set<String> desiredEnabledStates,
-            @Unmodifiable Set<String> desiredPendingUninstall
+            @Unmodifiable Set<String> desiredPendingUninstall,
+            @Unmodifiable Set<String> desiredQuarantinedStates
     ) throws IOException {
         enabledStates.clear();
         enabledStates.addAll(desiredEnabledStates);
         pendingUninstall.clear();
         pendingUninstall.addAll(desiredPendingUninstall);
-        stateStore.saveStrict(enabledStates, pendingUninstall);
+        quarantinedStates.clear();
+        quarantinedStates.addAll(desiredQuarantinedStates);
+        stateStore.saveStrict(enabledStates, pendingUninstall, quarantinedStates, quarantineReport);
     }
 
     /// Appends one lifecycle failure to an optional aggregate.
@@ -3335,7 +3494,7 @@ public final class PluginManager {
     /// @param pluginId plugin ID
     /// @throws IOException if package, state, or permission mutation fails
     private void uninstallPluginLocked(String pluginId) throws IOException {
-        stateStore.load(enabledStates, pendingUninstall);
+        loadStates();
         @Nullable PluginContainer container = pluginMap.get(pluginId);
         @Unmodifiable List<Path> installedPackages = packageRepository.findInstalledPackages(pluginId);
         if (container == null && installedPackages.isEmpty()) {
@@ -3363,8 +3522,10 @@ public final class PluginManager {
         }
         Set<String> nextEnabledStates = new HashSet<>(enabledStates);
         Set<String> nextPendingUninstall = new HashSet<>(pendingUninstall);
+        Set<String> nextQuarantinedStates = new HashSet<>(quarantinedStates);
         nextEnabledStates.remove(pluginId);
         nextPendingUninstall.remove(pluginId);
+        nextQuarantinedStates.remove(pluginId);
         packageMutationService.publishRemoval(
                 List.copyOf(packagesToRemove),
                 pluginId,
@@ -3372,17 +3533,24 @@ public final class PluginManager {
                     permissionService.removePlugin(pluginId);
                     certificationReceiptStore.removePlugin(pluginId);
                     runtimeBindingStore.removeDependentsStrict(Set.of(pluginId));
-                    stateStore.saveStrict(nextEnabledStates, nextPendingUninstall);
+                    stateStore.saveStrict(
+                            nextEnabledStates,
+                            nextPendingUninstall,
+                            nextQuarantinedStates,
+                            quarantineReport
+                    );
                 },
                 () -> {
                     permissionService.reload();
-                    stateStore.load(enabledStates, pendingUninstall);
+                    loadStates();
                 }
         );
         enabledStates.clear();
         enabledStates.addAll(nextEnabledStates);
         pendingUninstall.clear();
         pendingUninstall.addAll(nextPendingUninstall);
+        quarantinedStates.clear();
+        quarantinedStates.addAll(nextQuarantinedStates);
         clearArtifactState(pluginId);
         LOG.info("Uninstalled plugin: " + pluginId);
     }
@@ -3413,7 +3581,7 @@ public final class PluginManager {
     /// @param pluginId plugin ID
     /// @throws IOException if dependency inspection or durable state publication fails
     private void markForUninstallLocked(String pluginId) throws IOException {
-        stateStore.load(enabledStates, pendingUninstall);
+        loadStates();
         @Unmodifiable List<String> blockingDependents = dependencyPlanner.findBlockingDependents(
                 pluginId,
                 plugins,
@@ -3426,17 +3594,24 @@ public final class PluginManager {
         }
         Set<String> nextEnabledStates = new HashSet<>(enabledStates);
         Set<String> nextPendingUninstall = new HashSet<>(pendingUninstall);
+        Set<String> nextQuarantinedStates = new HashSet<>(quarantinedStates);
         nextPendingUninstall.add(pluginId);
         nextEnabledStates.remove(pluginId);
+        nextQuarantinedStates.remove(pluginId);
         packageMutationService.publishDocuments(
                 () -> {
                     permissionService.removePlugin(pluginId);
                     runtimeBindingStore.removeDependentsStrict(Set.of(pluginId));
-                    stateStore.saveStrict(nextEnabledStates, nextPendingUninstall);
+                    stateStore.saveStrict(
+                            nextEnabledStates,
+                            nextPendingUninstall,
+                            nextQuarantinedStates,
+                            quarantineReport
+                    );
                 },
                 () -> {
                     permissionService.reload();
-                    stateStore.load(enabledStates, pendingUninstall);
+                    loadStates();
                 }
         );
 
@@ -3444,6 +3619,8 @@ public final class PluginManager {
         enabledStates.addAll(nextEnabledStates);
         pendingUninstall.clear();
         pendingUninstall.addAll(nextPendingUninstall);
+        quarantinedStates.clear();
+        quarantinedStates.addAll(nextQuarantinedStates);
         @Nullable PluginContainer container = pluginMap.get(pluginId);
         if (container != null && container.isEnabled()) {
             disablePluginLocked(pluginId);
@@ -3479,6 +3656,213 @@ public final class PluginManager {
         } finally {
             stateLock.readLock().unlock();
         }
+    }
+
+    /// Returns the persisted secret-free report from the latest consumed startup recovery evidence.
+    ///
+    /// @return persisted quarantine report, or empty before any recovery evidence has been consumed
+    public Optional<PluginQuarantineReport> getQuarantineReport() {
+        return Optional.ofNullable(quarantineReport);
+    }
+
+    /// Returns the immutable persisted recovery quarantine.
+    ///
+    /// @return immutable quarantined plugin IDs
+    public @Unmodifiable Set<String> getQuarantinedPluginIds() {
+        stateLock.readLock().lock();
+        try {
+            return Set.copyOf(quarantinedStates);
+        } finally {
+            stateLock.readLock().unlock();
+        }
+    }
+
+    /// Returns whether one installed plugin remains in the persisted recovery quarantine.
+    ///
+    /// @param pluginId plugin ID
+    /// @return whether the plugin is quarantined
+    public boolean isPluginQuarantined(String pluginId) {
+        stateLock.readLock().lock();
+        try {
+            return quarantinedStates.contains(pluginId);
+        } finally {
+            stateLock.readLock().unlock();
+        }
+    }
+
+    /// Restores one quarantined plugin together with its executable dependency and Runtime Provider closure.
+    ///
+    /// @param pluginId quarantined plugin ID
+    /// @return immutable provider-first restored closure
+    /// @throws IOException if the installed closure is missing, incompatible, cyclic, pending removal, or cannot persist
+    public @Unmodifiable List<String> restoreQuarantinedPlugin(String pluginId) throws IOException {
+        return restoreQuarantinedPlugins(Set.of(pluginId));
+    }
+
+    /// Restores a selected quarantined group together with its executable dependency and Runtime Provider closure.
+    ///
+    /// @param pluginIds selected quarantined plugin IDs
+    /// @return immutable provider-first restored closure
+    /// @throws IOException if the installed closure is missing, incompatible, cyclic, pending removal, or cannot persist
+    public @Unmodifiable List<String> restoreQuarantinedPlugins(Set<String> pluginIds) throws IOException {
+        administrativeGuard.checkTrustedCaller();
+        Set<String> requestedIds = Set.copyOf(pluginIds);
+        return mutationLock.call(() -> {
+            loadStates();
+            return restoreQuarantinedPluginsLocked(requestedIds);
+        });
+    }
+
+    /// Restores every quarantined plugin through one executable dependency and Runtime Provider closure.
+    ///
+    /// @return immutable provider-first restored closure
+    /// @throws IOException if the installed closure is missing, incompatible, cyclic, pending removal, or cannot persist
+    public @Unmodifiable List<String> restoreAllQuarantinedPlugins() throws IOException {
+        administrativeGuard.checkTrustedCaller();
+        return mutationLock.call(() -> {
+            loadStates();
+            return restoreQuarantinedPluginsLocked(Set.copyOf(quarantinedStates));
+        });
+    }
+
+    /// Computes and strictly persists one dependency-consistent quarantine restoration while holding the mutation lock.
+    ///
+    /// @param requestedIds exact quarantined roots selected by the caller
+    /// @return immutable provider-first restored closure
+    /// @throws IOException if the installed graph is not executable or strict state publication fails
+    private @Unmodifiable List<String> restoreQuarantinedPluginsLocked(
+            @Unmodifiable Set<String> requestedIds
+    ) throws IOException {
+        if (requestedIds.isEmpty()) {
+            return List.of();
+        }
+        for (String pluginId : requestedIds) {
+            if (!PluginManifest.isValidId(pluginId)) {
+                throw new IllegalArgumentException("Invalid plugin ID: " + pluginId);
+            }
+            if (!quarantinedStates.contains(pluginId)) {
+                throw new IOException("Plugin is not quarantined: " + pluginId);
+            }
+        }
+
+        @Unmodifiable Map<String, PluginManifest> manifests = Map.copyOf(
+                dependencyPlanner.readInstallPlanningManifests(plugins, pendingUninstall)
+        );
+        @Unmodifiable Map<String, RuntimeProviderBinding> runtimeBindings = runtimeBindingStore.readStrict();
+        Set<String> closure = new HashSet<>();
+        for (String pluginId : requestedIds.stream().sorted().toList()) {
+            collectRestoreClosure(pluginId, manifests, runtimeBindings, new HashSet<>(), closure);
+        }
+        dependencyPlanner.validateReplacementGraph(manifests, Set.copyOf(closure), runtimeBindings);
+
+        List<String> ordered = new ArrayList<>();
+        Set<String> orderedIds = new HashSet<>();
+        manifests.values().stream()
+                .filter(manifest -> closure.contains(manifest.getId()))
+                .filter(manifest -> manifest.getPluginKind() == PluginKind.RUNTIME_PROVIDER)
+                .sorted(java.util.Comparator.comparing(PluginManifest::getId))
+                .forEach(manifest -> appendRestoreOrder(
+                        manifest.getId(), manifests, runtimeBindings, closure, orderedIds, ordered));
+        manifests.values().stream()
+                .filter(manifest -> closure.contains(manifest.getId()))
+                .filter(manifest -> manifest.getPluginKind() != PluginKind.RUNTIME_PROVIDER)
+                .sorted(java.util.Comparator.comparing(PluginManifest::getId))
+                .forEach(manifest -> appendRestoreOrder(
+                        manifest.getId(), manifests, runtimeBindings, closure, orderedIds, ordered));
+
+        Set<String> nextEnabledStates = new HashSet<>(enabledStates);
+        Set<String> nextQuarantinedStates = new HashSet<>(quarantinedStates);
+        nextEnabledStates.addAll(closure);
+        nextQuarantinedStates.removeAll(closure);
+        stateStore.saveStrict(
+                nextEnabledStates,
+                pendingUninstall,
+                nextQuarantinedStates,
+                quarantineReport
+        );
+        enabledStates.clear();
+        enabledStates.addAll(nextEnabledStates);
+        quarantinedStates.clear();
+        quarantinedStates.addAll(nextQuarantinedStates);
+        return List.copyOf(ordered);
+    }
+
+    /// Collects one executable restore closure, following runtime bindings before concrete plugin dependencies.
+    ///
+    /// @param pluginId closure root
+    /// @param manifests immutable installed manifests indexed by ID
+    /// @param runtimeBindings immutable runtime bindings indexed by dependent ID
+    /// @param visiting IDs on the current traversal stack
+    /// @param closure mutable collected closure
+    /// @throws IOException if an executable dependency is missing, legacy, incompatible, or cyclic
+    private static void collectRestoreClosure(
+            String pluginId,
+            @Unmodifiable Map<String, PluginManifest> manifests,
+            @Unmodifiable Map<String, RuntimeProviderBinding> runtimeBindings,
+            Set<String> visiting,
+            Set<String> closure
+    ) throws IOException {
+        if (closure.contains(pluginId)) {
+            return;
+        }
+        if (!visiting.add(pluginId)) {
+            throw new IOException("Cyclic plugin dependency detected at " + pluginId);
+        }
+        @Nullable PluginManifest manifest = manifests.get(pluginId);
+        if (manifest == null) {
+            throw new IOException("Missing installed plugin in quarantine restoration closure: " + pluginId);
+        }
+        if (manifest.getSchemaVersion() < PluginManifest.MIN_EXECUTABLE_SCHEMA_VERSION) {
+            throw new IOException("Legacy plugin cannot be restored to execution: " + pluginId);
+        }
+        @Nullable RuntimeProviderBinding runtimeBinding = runtimeBindings.get(pluginId);
+        if (runtimeBinding != null) {
+            collectRestoreClosure(runtimeBinding.providerId(), manifests, runtimeBindings, visiting, closure);
+        }
+        for (PluginDependency dependency : manifest.getPluginDependencies()) {
+            @Nullable PluginManifest dependencyManifest = manifests.get(dependency.getId());
+            if (dependencyManifest == null || !dependency.matchesVersion(dependencyManifest.getVersion())) {
+                throw new IOException("Plugin " + pluginId + " requires unavailable dependency "
+                        + dependency.getId() + " " + dependency.getVersion());
+            }
+            collectRestoreClosure(dependency.getId(), manifests, runtimeBindings, visiting, closure);
+        }
+        visiting.remove(pluginId);
+        closure.add(pluginId);
+    }
+
+    /// Appends one closure member after its runtime and concrete dependencies in deterministic order.
+    ///
+    /// @param pluginId closure member
+    /// @param manifests immutable installed manifests indexed by ID
+    /// @param runtimeBindings immutable runtime bindings indexed by dependent ID
+    /// @param closure immutable selected closure
+    /// @param visited IDs already appended
+    /// @param ordered mutable provider-first topological result
+    private static void appendRestoreOrder(
+            String pluginId,
+            @Unmodifiable Map<String, PluginManifest> manifests,
+            @Unmodifiable Map<String, RuntimeProviderBinding> runtimeBindings,
+            @Unmodifiable Set<String> closure,
+            Set<String> visited,
+            List<String> ordered
+    ) {
+        if (!visited.add(pluginId)) {
+            return;
+        }
+        @Nullable RuntimeProviderBinding runtimeBinding = runtimeBindings.get(pluginId);
+        if (runtimeBinding != null && closure.contains(runtimeBinding.providerId())) {
+            appendRestoreOrder(
+                    runtimeBinding.providerId(), manifests, runtimeBindings, closure, visited, ordered);
+        }
+        PluginManifest manifest = Objects.requireNonNull(manifests.get(pluginId));
+        manifest.getPluginDependencies().stream()
+                .map(PluginDependency::getId)
+                .filter(closure::contains)
+                .sorted()
+                .forEach(dependencyId -> appendRestoreOrder(
+                        dependencyId, manifests, runtimeBindings, closure, visited, ordered));
+        ordered.add(pluginId);
     }
 
     /// Returns the authoritative state of the artifact currently published for one plugin ID.
@@ -3603,6 +3987,9 @@ public final class PluginManager {
         /// Immutable pending removals restored by journal rollback.
         private final @Unmodifiable Set<String> originalPendingUninstall;
 
+        /// Immutable recovery quarantine restored by journal rollback.
+        private final @Unmodifiable Set<String> originalQuarantinedStates;
+
         /// Host IDs whose old graph teardown started before commit.
         private final Set<String> startedProviderIds = new HashSet<>();
 
@@ -3611,10 +3998,12 @@ public final class PluginManager {
         /// @param swaps immutable active Host replacement graphs
         /// @param originalEnabledStates immutable desired enablement before publication
         /// @param originalPendingUninstall immutable pending removals before publication
+        /// @param originalQuarantinedStates immutable recovery quarantine before publication
         private LiveRuntimeProviderSwapSession(
                 @Unmodifiable List<LiveRuntimeProviderSwap> swaps,
                 @Unmodifiable Set<String> originalEnabledStates,
-                @Unmodifiable Set<String> originalPendingUninstall
+                @Unmodifiable Set<String> originalPendingUninstall,
+                @Unmodifiable Set<String> originalQuarantinedStates
         ) {
             this.swaps = List.copyOf(swaps);
             liveGraphIds = swaps.stream()
@@ -3626,6 +4015,7 @@ public final class PluginManager {
                     .collect(Collectors.toUnmodifiableSet());
             this.originalEnabledStates = Set.copyOf(originalEnabledStates);
             this.originalPendingUninstall = Set.copyOf(originalPendingUninstall);
+            this.originalQuarantinedStates = Set.copyOf(originalQuarantinedStates);
         }
 
         /// Returns every immutable captured Host graph.
@@ -3670,6 +4060,13 @@ public final class PluginManager {
         /// @return immutable pending removal IDs
         private @Unmodifiable Set<String> originalPendingUninstall() {
             return originalPendingUninstall;
+        }
+
+        /// Returns recovery quarantine from before publication.
+        ///
+        /// @return immutable recovery quarantine IDs
+        private @Unmodifiable Set<String> originalQuarantinedStates() {
+            return originalQuarantinedStates;
         }
     }
 

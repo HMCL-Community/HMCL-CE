@@ -31,6 +31,12 @@ final class PluginPersistedStates {
     /// IDs awaiting uninstall, or `null` in malformed legacy files.
     @Nullable List<@Nullable String> pendingUninstall;
 
+    /// IDs retained but blocked from execution after startup recovery, or `null` in legacy or malformed files.
+    @Nullable List<@Nullable String> quarantined;
+
+    /// Secret-free recovery report, or `null` in legacy files and before the first recovery quarantine.
+    @Nullable PluginQuarantineReport quarantineReport;
+
     /// Creates an empty state object for Gson and saving.
     PluginPersistedStates() {
     }

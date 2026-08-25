@@ -597,10 +597,12 @@ public final class PluginManagerRuntimeProviderLifecycleTest {
 
             Set<String> enabled = new HashSet<>();
             Set<String> pendingUninstall = new HashSet<>();
+            Set<String> quarantined = new HashSet<>();
             new PluginStateStore(localHome.resolve("plugin-states.json"), new PluginMutationLock(localHome))
-                    .load(enabled, pendingUninstall);
+                    .load(enabled, pendingUninstall, quarantined);
             assertEquals(Set.of(PackagedRuntimeProviderPlugin.PROVIDER_ID, PAYLOAD_ID), enabled);
             assertTrue(pendingUninstall.isEmpty());
+            assertTrue(quarantined.isEmpty());
             PluginContainer restoredContainer = Objects.requireNonNull(
                     manager.getPlugin(PackagedRuntimeProviderPlugin.PROVIDER_ID));
             assertNotSame(oldContainer, restoredContainer);
