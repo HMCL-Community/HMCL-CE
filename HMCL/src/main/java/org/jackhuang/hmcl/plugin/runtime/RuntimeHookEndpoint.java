@@ -31,6 +31,7 @@ import org.jetbrains.annotations.Nullable;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
@@ -125,6 +126,9 @@ public final class RuntimeHookEndpoint implements PluginHookEndpoint {
         /// Current invocation lifecycle state.
         private final AtomicReference<InvocationState> state = new AtomicReference<>(InvocationState.PREPARED);
 
+        /// Cancellation request published before waiting for token-issuance serialization.
+        private final AtomicBoolean cancellationRequested = new AtomicBoolean();
+
         /// Private monitor serializing token issuance, terminal-state selection, and exact revocation.
         private final Object authorityLock = new Object();
 
@@ -206,6 +210,7 @@ public final class RuntimeHookEndpoint implements PluginHookEndpoint {
         /// Cancels this exact callback and immediately revokes its issued dispatch token.
         @Override
         public void cancel() {
+            cancellationRequested.set(true);
             synchronized (authorityLock) {
                 InvocationState current = state.get();
                 if (current == InvocationState.CANCELLED || current == InvocationState.COMPLETED) {
@@ -266,7 +271,7 @@ public final class RuntimeHookEndpoint implements PluginHookEndpoint {
 
         /// Requires cancellation not to have won the current invocation race.
         private void requireRunning() {
-            if (state.get() != InvocationState.RUNNING) {
+            if (cancellationRequested.get() || state.get() != InvocationState.RUNNING) {
                 throw cancelled();
             }
         }
