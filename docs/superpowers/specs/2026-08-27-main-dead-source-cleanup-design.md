@@ -23,7 +23,7 @@ Delete these eight production source files:
 - `HMCLCore/src/main/java/org/jackhuang/hmcl/util/gson/JsonMap.java`
 - `HMCLCore/src/main/java/org/jackhuang/hmcl/util/javafx/PropertyUtils.java`
 
-The files contain 561 lines in total. Repository-wide exact type-name searches found no consumer
+The files contain 642 physical lines in total. Repository-wide exact type-name searches found no consumer
 outside each declaration. None is registered through `META-INF/services`, named in a Gradle task,
 loaded by a reflection path, or documented as part of the HMCL CE plugin contract.
 
