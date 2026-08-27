@@ -66,9 +66,9 @@ Windows PowerShell：
 
 ## 上游归属与致谢
 
-HMCL CE 基于 [HMCL-dev/HMCL](https://github.com/HMCL-dev/HMCL) 的代码开发，感谢上游维护者与所有贡献者提供的基础代码、设计和长期工作。
+HMCL CE 基于 [HMCL-dev/HMCL](https://github.com/HMCL-dev/HMCL) 继续开发，感谢上游维护者与所有贡献者提供的基础代码、设计和长期工作。本仓库的 Git 历史已连接至上游基线提交 [`5796dad`](https://github.com/HMCL-dev/HMCL/commit/5796dad18ca71f7fd1f13ad9297f34223ea54dbc)，并保留该提交及此前的原始作者和带 Pull Request 编号的提交记录。
 
-CE 的独立开发者与后续贡献记录可在 [本仓库贡献者页面](https://github.com/HMCL-Community/HMCL-CE/graphs/contributors) 查看。软件界面内保留上游作者、依赖项目及贡献者致谢信息。
+[本仓库贡献者页面](https://github.com/HMCL-Community/HMCL-CE/graphs/contributors) 同时列出上游与 CE 贡献者。原 Pull Request 的讨论和审查记录仍保留在 [HMCL 上游 Pull Requests](https://github.com/HMCL-dev/HMCL/pulls?q=is%3Apr+is%3Aclosed)，基线之后的上游提交只有在实际合并后才会进入 CE 历史。软件界面内继续保留上游作者、依赖项目及贡献者致谢信息。
 
 ## 开源许可与原声明
 
