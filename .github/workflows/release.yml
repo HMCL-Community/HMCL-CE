@@ -127,3 +127,16 @@ jobs:
             --title "$release_title" \
             --notes-file RELEASE_NOTE.md \
             "${flags[@]}"
+      - name: Queue ModelScope release mirror
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          if ! gh api \
+            --method POST \
+            "repos/$GITHUB_REPOSITORY/dispatches" \
+            -f event_type='mirror-modelscope-release' \
+            -f "client_payload[version]=$RELEASE_VERSION"; then
+            echo "::warning::GitHub Release was created, but the ModelScope mirror was not queued. Run the mirror workflow manually for $RELEASE_VERSION."
+          fi

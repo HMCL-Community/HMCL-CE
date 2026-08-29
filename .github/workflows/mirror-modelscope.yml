@@ -1,0 +1,154 @@
+name: Mirror Release to ModelScope
+
+on:
+  repository_dispatch:
+    types: [mirror-modelscope-release]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version without the leading v
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: modelscope-mirror-${{ github.event.client_payload.version || inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    if: github.repository == 'HMCL-Community/HMCL-CE'
+    runs-on: ubuntu-latest
+    env:
+      MODELSCOPE_DATASET: AnxunBCX/HMCL_CE
+      MODELSCOPE_BRANCH: master
+    steps:
+      - name: Resolve release version
+        shell: bash
+        env:
+          DISPATCH_VERSION: ${{ github.event.client_payload.version }}
+          MANUAL_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          release_version="${DISPATCH_VERSION:-${MANUAL_VERSION:-}}"
+          if [[ ! "$release_version" =~ ^[0-9]+(\.[0-9]+)+(-(release|beta|preview)\.[0-9]+)?$ ]]; then
+            echo "Invalid release version: $release_version" >&2
+            exit 1
+          fi
+          echo "RELEASE_VERSION=$release_version" >> "$GITHUB_ENV"
+
+      - name: Download GitHub Release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release_assets_dir="$RUNNER_TEMP/release-assets"
+          mkdir -p "$release_assets_dir"
+          gh release download "v$RELEASE_VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "HMCL-CE-$RELEASE_VERSION.*" \
+            --dir "$release_assets_dir" \
+            --clobber
+          gh release view "v$RELEASE_VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json body \
+            --jq '.body' > "$release_assets_dir/RELEASE_NOTE.md"
+          echo "RELEASE_ASSETS_DIR=$release_assets_dir" >> "$GITHUB_ENV"
+
+      - name: Verify release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RELEASE_ASSETS_DIR"
+          for extension in jar exe sh deb; do
+            file="HMCL-CE-$RELEASE_VERSION.$extension"
+            test -s "$file"
+            test -s "$file.sha256"
+            expected_hash="$(tr -d '\r\n' < "$file.sha256")"
+            if [[ ! "$expected_hash" =~ ^[[:xdigit:]]{64}$ ]]; then
+              echo "Invalid SHA-256 checksum in $file.sha256" >&2
+              exit 1
+            fi
+            printf '%s  %s\n' "$expected_hash" "$file" | sha256sum -c -
+          done
+
+      - name: Mirror release to ModelScope
+        shell: bash
+        env:
+          MODELSCOPE_TOKEN: ${{ secrets.MODELSCOPE_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MODELSCOPE_TOKEN:-}" ]; then
+            echo "MODELSCOPE_TOKEN is required" >&2
+            exit 1
+          fi
+
+          git lfs version
+
+          askpass="$RUNNER_TEMP/modelscope-askpass.sh"
+          mirror_dir="$RUNNER_TEMP/modelscope-release-mirror"
+          trap 'rm -f "$askpass"' EXIT
+          umask 077
+          cat > "$askpass" <<'EOF'
+          #!/usr/bin/env bash
+          case "$1" in
+            *Username*) printf '%s\n' 'oauth2' ;;
+            *Password*) printf '%s\n' "${MODELSCOPE_TOKEN:?}" ;;
+            *) exit 1 ;;
+          esac
+          EOF
+          chmod 700 "$askpass"
+
+          destination="releases/$RELEASE_VERSION"
+          export GIT_ASKPASS="$askpass"
+          export GIT_TERMINAL_PROMPT=0
+          export GIT_LFS_SKIP_SMUDGE=1
+          git clone --depth 1 --branch "$MODELSCOPE_BRANCH" \
+            "https://www.modelscope.cn/datasets/$MODELSCOPE_DATASET.git" \
+            "$mirror_dir"
+          git -C "$mirror_dir" lfs install --local
+          git -C "$mirror_dir" lfs pull --include "$destination/**"
+          git -C "$mirror_dir" lfs track '*.jar' '*.exe' '*.sh' '*.deb'
+
+          mkdir -p "$mirror_dir/$destination"
+          for extension in jar exe sh deb; do
+            for suffix in "$extension" "$extension.sha256"; do
+              source="$RELEASE_ASSETS_DIR/HMCL-CE-$RELEASE_VERSION.$suffix"
+              target="$mirror_dir/$destination/HMCL-CE-$RELEASE_VERSION.$suffix"
+              if [ -e "$target" ] && ! cmp -s "$source" "$target"; then
+                echo "Refusing to overwrite the existing release file: $destination/HMCL-CE-$RELEASE_VERSION.$suffix" >&2
+                exit 1
+              fi
+              cp -- "$source" "$target"
+            done
+          done
+          cp -- "$RELEASE_ASSETS_DIR/RELEASE_NOTE.md" "$mirror_dir/$destination/RELEASE_NOTE.md"
+
+          git -C "$mirror_dir" config user.name 'github-actions[bot]'
+          git -C "$mirror_dir" config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C "$mirror_dir" add .gitattributes "$destination"
+          if git -C "$mirror_dir" diff --cached --quiet; then
+            echo "ModelScope already contains release $RELEASE_VERSION."
+          else
+            git -C "$mirror_dir" commit -m "Mirror HMCL CE $RELEASE_VERSION"
+            for attempt in 1 2 3; do
+              if git -C "$mirror_dir" push origin "HEAD:$MODELSCOPE_BRANCH"; then
+                break
+              fi
+              if [ "$attempt" -eq 3 ]; then
+                echo 'Unable to push the ModelScope mirror after three attempts.' >&2
+                exit 1
+              fi
+              git -C "$mirror_dir" pull --rebase origin "$MODELSCOPE_BRANCH"
+            done
+          fi
+
+          modelscope_url="https://www.modelscope.cn/datasets/$MODELSCOPE_DATASET/tree/$MODELSCOPE_BRANCH/$destination"
+          {
+            echo '## ModelScope mirror'
+            echo
+            echo "Mirrored release $RELEASE_VERSION to [$MODELSCOPE_DATASET]($modelscope_url)."
+          } >> "$GITHUB_STEP_SUMMARY"
